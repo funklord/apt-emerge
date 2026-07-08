@@ -981,6 +981,124 @@ def print_search_hit(name, avail, inst, desc, size):
 # CLI
 # ---------------------------------------------------------------------------
 
+HELP = f"""
+Usage:
+   emerge [ options ] [ action ] [ package | @set ] [ ... ]
+   emerge [ options ] [ action ] < @system | @selected | @world >
+   emerge < --sync | --version >
+   emerge --help
+
+Help (this screen):
+   --help (-h)   Displays this help.
+
+Actions:
+   --depclean (-c)
+                 Cleans the system by removing packages that are not
+                 associated with explicitly merged packages. Depclean works
+                 by creating the full dependency tree from the @world set,
+                 then comparing it to installed packages. Packages installed,
+                 but not part of the dependency tree, will be uninstalled by
+                 depclean. Inspect the list with --pretend first. On the apt
+                 backend this delegates to `apt-get autoremove`, and apt's
+                 auto/manual-install marks are the source of truth; on the
+                 dpkg backend the world file is.
+
+   --search (-s) Searches for matches of the supplied string in the synced
+                 tree. The search string is a case-insensitive regular
+                 expression matched against package names.
+
+   --searchdesc (-S)
+                 Matches the search string against the description field as
+                 well as the package name.
+
+   --sync        Updates the package tree. On the apt backend this runs
+                 `apt-get update`. On the dpkg backend this downloads the
+                 Packages indexes named in /etc/apt/sources.list[.d] over
+                 http(s):// or file:// into {TREE_DIR}; a
+                 file:// flat entry pointing at a bare directory of .deb
+                 files (e.g. a USB stick) gets an index generated for it
+                 on the spot with dpkg-deb.
+
+   --unmerge (-C)
+                 WARNING: This action can remove important packages! Removes
+                 all matching packages. Essential and Priority: required
+                 packages are refused; on the dpkg backend, removals that
+                 would break reverse dependencies are refused unless --ask
+                 is given.
+
+   --version     Displays the version number of emerge and the active
+                 backend.
+
+Options:
+   --ask (-a)    Before performing the merge, display what packages will be
+                 installed, in the same format as when using --pretend; then
+                 ask whether to continue with the merge or abort.
+
+   --backend=<apt|dpkg>
+                 Force a backend. By default the apt backend is used when
+                 apt-get is present, otherwise the dpkg backend (intended
+                 for embedded systems that carry only dpkg). May also be
+                 set with the EMERGE_BACKEND environment variable.
+
+   --deep (-D)   This flag forces emerge to consider the entire dependency
+                 tree of packages, instead of checking only the immediate
+                 dependencies of the packages. Combined with --update and a
+                 set, the whole dependency closure of the set is checked
+                 for updates: `emerge -uD @world` is the full system
+                 upgrade, and on the apt backend it maps to
+                 `apt-get dist-upgrade`.
+
+   --fetchonly (-f)
+                 Instead of performing the merge, just perform the fetches
+                 for all packages (main package as well as all
+                 dependencies). On the dpkg backend downloads land in
+                 {DISTFILES} and are verified
+                 against the index's SHA256.
+
+   --oneshot (-1)
+                 Emerge as normal, but do not add the packages to the world
+                 file for later updating. (dpkg backend; the apt backend
+                 relies on apt's own manual-install marks.)
+
+   --pretend (-p)
+                 Instead of actually performing the merge, simply display
+                 what *would* have been installed if --pretend weren't
+                 used. In the printout:
+                 N = new (not yet installed)
+                 U = updating (to another version)
+                 D = downgrading (best version seems lower)
+                 R = replacing (remerging same version)
+
+   --update (-u) Updates packages to the best version available. Without
+                 --update, targets that are already installed and current
+                 are re-merged (reinstalled), as in Gentoo. Targets that
+                 are not yet installed are installed either way.
+
+   --verbose (-v)
+                 Expanded display: per-package download sizes and a total.
+
+Sets:
+   @world        @selected plus @system.
+   @selected     The world file ({WORLD}) on the dpkg
+                 backend; apt's manual-install marks (apt-mark showmanual)
+                 on the apt backend. Explicitly merged atoms are recorded
+                 here; set members and pulled-in dependencies are not.
+   @system       Debian's Essential and Priority: required base packages --
+                 the closest native equivalent of Gentoo's system set.
+                 The bare words `world` and `system` are accepted aliases.
+
+Debian notes:
+   Repository configuration is read from /etc/apt/sources.list and
+   /etc/apt/sources.list.d (both one-line and deb822 .sources formats).
+   On apt-less systems, simply create one by hand -- plain `deb` lines
+   work. The dpkg backend verifies the SHA256 of every fetched .deb
+   against the index but does not GPG-verify Release files; point it only
+   at mirrors you trust. --newuse (-N), --quiet (-q) and --tree (-t) are
+   accepted for muscle-memory compatibility and ignored.
+
+For more help consult the man page... which doesn't exist. This is it.
+"""
+
 LONG_FLAGS = {"--ask": "a", "--verbose": "v", "--pretend": "p", "--update": "u",
               "--deep": "D", "--newuse": "N", "--search": "s",
               "--searchdesc": "S", "--unmerge": "C", "--fetchonly": "f",
@@ -1004,7 +1122,7 @@ def main(argv):
                                "unmerge", "depclean", "sync")}
     pkgs, backend_flag = [], None
     if not argv:
-        print(__doc__); return
+        print(HELP); return
     for arg in argv:
         if arg.startswith("--backend="):
             backend_flag = arg.split("=", 1)[1]; continue
@@ -1013,7 +1131,7 @@ def main(argv):
         if arg == "--depclean":
             opts["depclean"] = True; continue
         if arg in ("--help", "-h"):
-            print(__doc__); return
+            print(HELP); return
         if arg == "--version":
             b = pick_backend(backend_flag)
             print(f"Portage 3.0.66-deb (python {sys.version.split()[0]}, "
@@ -1033,6 +1151,7 @@ def main(argv):
                 elif ch == "C": opts["unmerge"] = True
                 elif ch == "f": opts["fetchonly"] = True
                 elif ch == "1": opts["oneshot"] = True
+                elif ch == "c": opts["depclean"] = True
                 elif ch in "Nqt": pass
                 else:
                     eerror(f"unknown option: -{ch}"); sys.exit(1)
