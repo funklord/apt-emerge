@@ -1,60 +1,99 @@
 #!/usr/bin/env python3
 """
-emerge -- a Portage-flavoured front-end for apt on Debian/Ubuntu.
+emerge -- a Portage-flavoured front-end for Debian systems.
 
-Wraps apt-get / apt-cache / dpkg but speaks emerge's dialect and paints
-its output in Portage colours:
+One file, two backends, zero dependencies beyond the Python stdlib:
 
-    emerge --sync                  # apt-get update
-    emerge -av vim htop            # ask + verbose install
-    emerge -pv vim                 # pretend (simulate)
-    emerge -s python               # search package names
-    emerge -S "web server"         # search descriptions too
-    emerge -uDN @world             # full upgrade (dist-upgrade)
-    emerge -C vim                  # unmerge (remove)
-    emerge --depclean              # apt-get autoremove
-    emerge -f vim                  # fetch only (download)
+  apt backend   used automatically when apt-get is present. Thin wrapper:
+                apt resolves, downloads, verifies and installs; this script
+                translates the experience into emerge. depclean delegates
+                to `apt-get autoremove` (apt's auto/manual marks are the
+                source of truth).
 
-Run as root for anything that mutates the system, just like the real thing.
+  dpkg backend  used automatically when apt-get is absent (embedded boxes
+                with dpkg only). Implements the repository layer itself:
+                parses /etc/apt/sources.list and deb822 .sources files
+                (create one by hand on apt-less systems), syncs Packages
+                indexes over http(s):// or file://, resolves dependencies
+                natively (Depends, Pre-Depends, or-deps, Provides,
+                Conflicts/Breaks), verifies SHA256, drives dpkg directly,
+                and keeps a real world file for Portage-style --depclean.
+                A file:// flat source pointing at a bare directory of
+                .deb files (USB stick) works too: --sync generates the
+                missing Packages index with dpkg-deb.
+
+Force a backend with --backend=apt|dpkg or EMERGE_BACKEND=dpkg.
+
+Sets behave like Portage's: @world = @selected + @system, where
+@selected is the world file (dpkg backend) or apt's manual-install marks
+(apt backend), and @system is Debian's Essential/Priority:required base.
+Sets expand into targets, so they mix freely with atoms and each other.
+
+Flags compose like Gentoo's:
+
+    emerge cowsay              # installed and current? re-merge (reinstall)
+    emerge -u cowsay           # update only if outdated; install if missing
+    emerge -u @world           # update packages in the world set only
+    emerge -uD @world          # --deep: update the whole dependency tree
+    emerge @system -pv         # re-merge the base system (try with -p first!)
+    emerge --sync
+    emerge -s python           # -S searches descriptions too
+    emerge -C cowsay
+    emerge --depclean [-p]
+    emerge -f vim              # fetchonly
+    emerge -1 strace           # oneshot: don't record in world (dpkg backend)
+
+Paths (dpkg backend): tree /var/lib/emerge-dpkg/tree, world file
+/var/lib/emerge-dpkg/world, distfiles /var/cache/emerge-dpkg/distfiles.
 """
 
+import gzip
+import hashlib
 import os
 import re
 import shutil
 import subprocess
 import sys
-import time
+import urllib.request
+
+try:
+    import lzma                       # may be absent on minimal builds
+except ImportError:
+    lzma = None
 
 # ---------------------------------------------------------------------------
-# Portage colours
+# Paths & constants (dpkg backend)
+# ---------------------------------------------------------------------------
+
+LIB_DIR   = "/var/lib/emerge-dpkg"
+TREE_DIR  = os.path.join(LIB_DIR, "tree")
+WORLD     = os.path.join(LIB_DIR, "world")
+DISTFILES = "/var/cache/emerge-dpkg/distfiles"
+STATUS    = "/var/lib/dpkg/status"
+
+# ---------------------------------------------------------------------------
+# Portage colours & message helpers
 # ---------------------------------------------------------------------------
 
 USE_COLOR = sys.stdout.isatty()
+def c(code, s): return f"\033[{code}m{s}\033[0m" if USE_COLOR else s
+BOLD   = lambda s: c("1", s)
+GREEN  = lambda s: c("32", s)
+BGREEN = lambda s: c("1;32", s)
+BCYAN  = lambda s: c("1;36", s)
+BLUE   = lambda s: c("1;34", s)
+YELLOW = lambda s: c("1;33", s)
+RED    = lambda s: c("1;31", s)
+ARROW  = BGREEN(">>>")
 
-def c(code, s):
-    return f"\033[{code}m{s}\033[0m" if USE_COLOR else s
+def einfo(m):  print(f"{BGREEN(' * ')}{m}")
+def ewarn(m):  print(f"{YELLOW(' * ')}{m}")
+def eerror(m): print(f"{RED(' * ')}{m}", file=sys.stderr)
 
-BOLD      = lambda s: c("1", s)
-GREEN     = lambda s: c("32", s)
-BGREEN    = lambda s: c("1;32", s)
-CYAN      = lambda s: c("36", s)
-BCYAN     = lambda s: c("1;36", s)
-BLUE      = lambda s: c("1;34", s)
-YELLOW    = lambda s: c("1;33", s)
-RED       = lambda s: c("1;31", s)
-TEAL      = lambda s: c("0;36", s)
-
-STAR  = BGREEN(" * ")
-ARROW = BGREEN(">>>")
-
-def einfo(msg):  print(f"{STAR}{msg}")
-def ewarn(msg):  print(f"{YELLOW(' * ')}{msg}")
-def eerror(msg): print(f"{RED(' * ')}{msg}", file=sys.stderr)
-
-
-# ---------------------------------------------------------------------------
-# apt plumbing
-# ---------------------------------------------------------------------------
+def need_root():
+    if os.geteuid() != 0:
+        eerror("Superuser access is required... exiting.")
+        sys.exit(1)
 
 def run(cmd, **kw):
     return subprocess.run(cmd, text=True, **kw)
@@ -62,340 +101,925 @@ def run(cmd, **kw):
 def capture(cmd):
     return run(cmd, capture_output=True)
 
-def need_root():
-    if os.geteuid() != 0:
-        eerror("Superuser access is required... exiting.")
-        sys.exit(1)
-
-def installed_version(pkg):
-    r = capture(["dpkg-query", "-W", "-f=${Version} ${Status}", pkg])
-    if r.returncode != 0:
-        return None
-    parts = r.stdout.strip().rsplit(" ", 3)
-    if len(parts) == 4 and parts[3] == "installed":
-        return parts[0]
-    return None
-
-def candidate_version(pkg):
-    r = capture(["apt-cache", "policy", pkg])
-    m = re.search(r"Candidate:\s*(\S+)", r.stdout)
-    if m and m.group(1) != "(none)":
-        return m.group(1)
-    return None
-
-def pkg_size(pkg):
-    """Download size in a human string, best effort."""
-    r = capture(["apt-cache", "show", pkg])
-    m = re.search(r"^Size:\s*(\d+)", r.stdout, re.M)
-    if not m:
-        return ""
-    n = int(m.group(1))
-    for unit in ("B", "KiB", "MiB", "GiB"):
-        if n < 1024 or unit == "GiB":
-            return f"{n:,.0f} {unit}" if unit == "B" else f"{n:,.1f} {unit}"
-        n /= 1024
-    return ""
-
-
 # ---------------------------------------------------------------------------
-# Dependency resolution (apt-get simulation -> merge list)
+# Debian version comparison (policy 5.6.12), pure Python
 # ---------------------------------------------------------------------------
 
-def resolve(action_args):
-    """
-    Run `apt-get -s -qq <action>` and parse Inst/Remv lines into a merge list.
-    Returns (merges, removals, error_output)
-      merges:   list of (pkg, newver, oldver_or_None)
-      removals: list of (pkg, oldver)
-    """
-    r = capture(["apt-get", "-s", "-qq", "-o", "APT::Get::Show-User-Simulation-Note=0"]
-                + action_args)
-    if r.returncode != 0:
-        return None, None, (r.stderr or r.stdout).strip()
+def _order(ch):
+    if ch == "~": return -1
+    if ch.isdigit(): return 0
+    if ch.isalpha(): return ord(ch)
+    return ord(ch) + 256
 
-    merges, removals = [], []
-    for line in r.stdout.splitlines():
-        m = re.match(r"^Inst (\S+)(?: \[([^\]]+)\])? \((\S+) ", line)
-        if m:
-            merges.append((m.group(1), m.group(3), m.group(2)))
-            continue
-        m = re.match(r"^Remv (\S+)(?: \[([^\]]+)\])?", line)
-        if m:
-            removals.append((m.group(1), m.group(2) or installed_version(m.group(1)) or "?"))
-    return merges, removals, None
+def _verrevcmp(a, b):
+    i = j = 0
+    while i < len(a) or j < len(b):
+        while ((i < len(a) and not a[i].isdigit()) or
+               (j < len(b) and not b[j].isdigit())):
+            ac = _order(a[i]) if i < len(a) else 0
+            bc = _order(b[j]) if j < len(b) else 0
+            if ac != bc:
+                return ac - bc
+            i += 1; j += 1
+        while i < len(a) and a[i] == "0": i += 1
+        while j < len(b) and b[j] == "0": j += 1
+        first_diff = 0
+        while (i < len(a) and a[i].isdigit() and
+               j < len(b) and b[j].isdigit()):
+            if not first_diff:
+                first_diff = ord(a[i]) - ord(b[j])
+            i += 1; j += 1
+        if i < len(a) and a[i].isdigit(): return 1
+        if j < len(b) and b[j].isdigit(): return -1
+        if first_diff: return first_diff
+    return 0
 
+def vercmp(v1, v2):
+    def split(v):
+        epoch, _, rest = v.partition(":")
+        if not rest:
+            epoch, rest = "0", v
+        upstream, _, revision = rest.rpartition("-")
+        if not upstream:
+            upstream, revision = rest, ""
+        return int(epoch), upstream, revision
+    e1, u1, r1 = split(v1)
+    e2, u2, r2 = split(v2)
+    if e1 != e2: return e1 - e2
+    rc = _verrevcmp(u1, u2)
+    return rc if rc else _verrevcmp(r1, r2)
 
-def print_merge_list(merges, removals, verbose):
-    """Portage-style [ebuild ...] listing."""
-    counts = {"N": 0, "U": 0, "R": 0, "D": 0}
-    total_size = 0.0
+_OPS = {"<<": lambda r: r < 0, "<=": lambda r: r <= 0, "=": lambda r: r == 0,
+        ">=": lambda r: r >= 0, ">>": lambda r: r > 0,
+        "<":  lambda r: r <= 0, ">":  lambda r: r >= 0}
 
-    for pkg, newver, oldver in merges:
-        inst = installed_version(pkg)
-        if oldver or (inst and inst != newver):
-            old = oldver or inst
-            # crude up/downgrade detection via dpkg
-            cmp_ = capture(["dpkg", "--compare-versions", newver, "gt", old]).returncode
-            flag = "U" if cmp_ == 0 else "D"
-        elif inst == newver:
-            flag = "R"
+def meets(version, op, want):
+    return _OPS[op](vercmp(version, want))
+
+# ---------------------------------------------------------------------------
+# Control-file parsing
+# ---------------------------------------------------------------------------
+
+def parse_stanzas(text):
+    stanza, key = {}, None
+    for line in text.splitlines():
+        if not line.strip():
+            if stanza:
+                yield stanza
+            stanza, key = {}, None
+        elif line[0] in " \t":
+            if key:
+                stanza[key] += "\n" + line.strip()
         else:
-            flag = "N"
-        counts[flag] += 1
+            key, _, val = line.partition(":")
+            stanza[key] = val.strip()
+    if stanza:
+        yield stanza
 
-        flag_col = {"N": GREEN, "U": BCYAN, "R": YELLOW, "D": BLUE}[flag]
-        line = f"[{GREEN('ebuild')}  {flag_col(flag)}{' ' * 4}] {BGREEN(pkg + '-' + newver)}"
-        if flag in ("U", "D"):
-            line += f" [{BLUE(oldver or inst)}]"
-        if verbose:
-            sz = pkg_size(pkg)
-            if sz:
-                line += f" {sz}"
-                m = re.match(r"([\d,.]+) (\w+)", sz)
-                if m:
-                    v = float(m.group(1).replace(",", ""))
-                    total_size += v * {"B": 1, "KiB": 2**10, "MiB": 2**20, "GiB": 2**30}[m.group(2)]
+DEP_RE = re.compile(r"^\s*([a-z0-9][a-z0-9+.-]*)\s*(?::\s*\S+)?"
+                    r"(?:\s*\(\s*(<<|<=|=|>=|>>|<|>)\s*([^)]+?)\s*\))?"
+                    r"(?:\s*\[[^\]]*\])?\s*$")
+
+def parse_depends(field):
+    clauses = []
+    for clause in field.split(","):
+        alts = []
+        for alt in clause.split("|"):
+            m = DEP_RE.match(alt)
+            if m:
+                alts.append((m.group(1), m.group(2), m.group(3)))
+        if alts:
+            clauses.append(alts)
+    return clauses
+
+# ---------------------------------------------------------------------------
+# Shared display layer
+# ---------------------------------------------------------------------------
+
+def print_merge_list(merges, verbose):
+    """merges: [(name, newver, oldver|None, size_bytes|None)]"""
+    n_new = n_up = n_down = n_re = 0
+    dl = 0
+    for name, newver, oldver, size in merges:
+        if oldver is None:
+            flag, col = "N", GREEN; n_new += 1
+        else:
+            r = vercmp(newver, oldver)
+            if r > 0:   flag, col = "U", BCYAN; n_up += 1
+            elif r < 0: flag, col = "D", BLUE;  n_down += 1
+            else:       flag, col = "R", YELLOW; n_re += 1
+        line = (f"[{GREEN('ebuild')}  {col(flag)}    ] "
+                f"{BGREEN(name + '-' + newver)}")
+        if flag in "UD":
+            line += f" [{BLUE(oldver)}]"
+        if verbose and size:
+            dl += size
+            line += f" {size / 1024:,.1f} KiB"
         print(line)
-
-    for pkg, oldver in removals:
-        counts.setdefault("Rm", 0)
-        counts["Rm"] = counts.get("Rm", 0) + 1
-        print(f"[{RED('uninstall')}     ] {RED(pkg + '-' + oldver)}")
-
     print()
-    summary = (f"Total: {len(merges)} packages "
-               f"({counts['U']} upgrades, {counts['N']} new, "
-               f"{counts['R']} reinstalls")
-    if counts["D"]:
-        summary += f", {counts['D']} downgrades"
-    if removals:
-        summary += f", {len(removals)} uninstalls"
-    summary += ")"
-    if verbose and total_size:
-        summary += f", Size of downloads: {total_size / 2**20:,.1f} MiB"
-    print(summary)
+    s = f"Total: {len(merges)} packages ({n_up} upgrades, {n_new} new"
+    if n_re:   s += f", {n_re} reinstalls"
+    if n_down: s += f", {n_down} downgrades"
+    s += ")"
+    if verbose and dl:
+        s += f", Size of downloads: {dl / 2**20:,.1f} MiB"
+    print(s)
 
-
-def ask_continue(verb="merge"):
-    try:
-        ans = input(f"\nWould you like to {verb} these packages? [{GREEN('Yes')}/{RED('No')}] ")
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return False
-    return ans.strip().lower() in ("", "y", "yes")
-
-
-# ---------------------------------------------------------------------------
-# Actions
-# ---------------------------------------------------------------------------
-
-def do_sync():
-    need_root()
-    einfo("Starting rsync with apt mirrors...")
-    print(f"{ARROW} Starting retry 1 of 1 with apt-get update")
-    rc = run(["apt-get", "update"]).returncode
-    if rc == 0:
-        print(f"\n{ARROW} Sync completed with apt repositories")
-        einfo("In post-sync... " + GREEN("done!"))
-    else:
-        eerror("Sync failed.")
-    sys.exit(rc)
-
-
-def do_search(terms, desc=False):
-    for term in terms:
-        print(f"{BLUE('[ Results for search key : ')}{BOLD(term)}{BLUE(' ]')}")
-        r = capture(["apt-cache", "search"] + ([] if desc else ["--names-only"]) + [term])
-        results = [l for l in r.stdout.splitlines() if l.strip()]
-        print(f"{BLUE('[ Applications found : ')}{BOLD(str(len(results)))}{BLUE(' ]')}\n")
-        for line in results:
-            name, _, description = line.partition(" - ")
-            inst = installed_version(name)
-            cand = candidate_version(name) or "?"
-            print(f"{GREEN('*')}  {BGREEN(name)}" + ("" if not inst else ""))
-            print(f"      {GREEN('Latest version available:')} {cand}")
-            print(f"      {GREEN('Latest version installed:')} {inst or '[ Not Installed ]'}")
-            print(f"      {GREEN('Description:')}   {description}")
-            print()
-    sys.exit(0)
-
-
-def stream_apt(cmd, merges):
-    """Run apt-get for real, translating its chatter into emerge-speak."""
-    total = len(merges)
-    order = {pkg: i + 1 for i, (pkg, _, _) in enumerate(merges)}
-    vers  = {pkg: ver for pkg, ver, _ in merges}
-
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1,
-                            env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"})
-    for line in proc.stdout:
-        line = line.rstrip("\n")
-        m = re.match(r"^(Unpacking|Setting up) (\S+?)(?::\S+)? ", line)
-        if m:
-            verb, pkg = m.groups()
-            i = order.get(pkg)
-            pv = f"{pkg}-{vers.get(pkg, installed_version(pkg) or '')}".rstrip("-")
-            if verb == "Unpacking" and i:
-                print(f"{ARROW} Emerging ({i} of {total}) {BGREEN(pv)}")
-            elif verb == "Setting up" and i:
-                print(f"{ARROW} Installing ({i} of {total}) {BGREEN(pv)}")
-                print(f"{ARROW} Completed ({i} of {total}) {BGREEN(pv)}")
-        elif re.match(r"^(Get:|Fetched|Removing|Purging)", line):
-            print(line)
-        elif line.startswith(("E:", "W:")):
-            print(line)
-    return proc.wait()
-
-
-def do_merge(pkgs, opts):
-    if not pkgs and not (opts["update"] and opts["world"]):
-        eerror("no targets given.")
-        sys.exit(1)
-
-    print(f"Calculating dependencies... ", end="", flush=True)
-
-    if opts["world"]:
-        apt_action = ["dist-upgrade"] if opts["deep"] else ["upgrade"]
-    else:
-        apt_action = ["install"] + (["--only-upgrade"] if opts["update"] else []) + pkgs
-
-    merges, removals, err = resolve(apt_action)
-    if err is not None:
-        print(RED("failed!"))
-        for l in err.splitlines():
-            eerror(l.replace("E: ", ""))
-        print(f"\n{RED('!!!')} {BOLD('Error: The above package list contains packages which cannot be')}")
-        print(f"{RED('!!!')} {BOLD('satisfied from your configured apt repositories.')}")
-        sys.exit(1)
-    print(GREEN("done!"))
-
-    if not merges and not removals:
-        einfo("No outdated packages were found on your system." if opts["world"]
-              else "Nothing to merge; all targets are already up to date.")
-        sys.exit(0)
-
-    if opts["pretend"] or opts["ask"] or opts["verbose"]:
-        print("\nThese are the packages that would be merged, in order:\n")
-        print_merge_list(merges, removals, opts["verbose"])
-
-    if opts["pretend"]:
-        sys.exit(0)
-    if opts["ask"] and not ask_continue():
-        print("\nQuitting.")
-        sys.exit(1)
-
-    need_root()
-    print()
-    if opts["fetchonly"]:
-        rc = run(["apt-get", "-y", "-d"] + apt_action).returncode
-        if rc == 0:
-            einfo("Fetch complete.")
-        sys.exit(rc)
-
-    rc = stream_apt(["apt-get", "-y"] + apt_action, merges)
-    print()
-    if rc == 0:
-        print(f"{ARROW} Recording targets in \"world\" favorites file (/var/lib/apt/extended_states)")
-        print(f"{ARROW} {BGREEN('Auto-cleaning packages...')}")
-        print(f"\n{ARROW} No outdated packages were found on your system.\n")
-        einfo("GNU info directory index is up-to-date.")
-    else:
-        print(f"{RED('!!!')} {BOLD('emerge failed; see the output above for details.')}")
-    sys.exit(rc)
-
-
-def do_unmerge(pkgs, opts, depclean=False):
-    if depclean:
-        print("Calculating dependencies... ", end="", flush=True)
-        merges, removals, err = resolve(["autoremove"])
-        print(GREEN("done!"))
-        if not removals:
-            print(f"\n{ARROW} No packages selected for removal by depclean")
-            sys.exit(0)
-        apt_cmd = ["apt-get", "-y", "autoremove"]
-    else:
-        if not pkgs:
-            eerror("no targets given.")
-            sys.exit(1)
-        removals = []
-        for p in pkgs:
-            v = installed_version(p)
-            if v is None:
-                ewarn(f"{p} is not installed; skipping.")
-            else:
-                removals.append((p, v))
-        if not removals:
-            sys.exit(1)
-        apt_cmd = ["apt-get", "-y", "remove"] + [p for p, _ in removals]
-
+def print_unmerge_list(removals):
     print(f"\n{BGREEN(' These are the packages that would be unmerged:')}\n")
     for pkg, ver in removals:
         print(f" {BGREEN(pkg)}")
         print(f"    {GREEN('selected:')} {ver}")
         print(f"   {GREEN('protected:')} none")
         print(f"     {GREEN('omitted:')} none\n")
-    print(f"All selected packages: " +
+    print("All selected packages: " +
           " ".join(f"{p}-{v}" for p, v in removals) + "\n")
     ewarn("'Selected' packages are slated for removal.")
     ewarn("'Protected' and 'omitted' packages will not be removed.\n")
 
-    if opts["pretend"]:
-        sys.exit(0)
-    if opts["ask"] and not ask_continue("unmerge"):
-        print("\nQuitting.")
-        sys.exit(1)
+def ask_continue(verb="merge"):
+    try:
+        ans = input(f"\nWould you like to {verb} these packages? "
+                    f"[{GREEN('Yes')}/{RED('No')}] ")
+    except (EOFError, KeyboardInterrupt):
+        print(); return False
+    return ans.strip().lower() in ("", "y", "yes")
 
-    need_root()
-    total = len(removals)
-    proc = subprocess.Popen(apt_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1,
-                            env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"})
-    i = 0
-    for line in proc.stdout:
-        m = re.match(r"^Removing (\S+?)(?::\S+)? \(([^)]+)\)", line)
-        if m:
-            i += 1
-            print(f"{ARROW} Unmerging ({i} of {total}) {RED(m.group(1) + '-' + m.group(2))}...")
-    rc = proc.wait()
-    if rc == 0:
+def calc_deps_start():
+    print("Calculating dependencies... ", end="", flush=True)
+
+def calc_deps_done(ok=True):
+    print(GREEN("done!") if ok else RED("failed!"))
+
+# ---------------------------------------------------------------------------
+# Shared: installed state from dpkg's status file (no subprocesses)
+# ---------------------------------------------------------------------------
+
+def installed_state():
+    """{name: stanza} of installed packages, parsed from dpkg status."""
+    inst = {}
+    with open(STATUS, errors="replace") as f:
+        for st in parse_stanzas(f.read()):
+            status = st.get("Status", "")
+            if "installed" in status and "not-installed" not in status:
+                inst[st["Package"]] = st
+    return inst
+
+def is_protected(st):
+    return (st.get("Essential", "no") == "yes"
+            or st.get("Priority") == "required")
+
+def system_set(inst):
+    """Debian's equivalent of Gentoo's @system: Essential + required."""
+    return {n for n, st in inst.items() if is_protected(st)}
+
+# ---------------------------------------------------------------------------
+# Sources: /etc/apt/sources.list + deb822 *.sources (http, https, file)
+# ---------------------------------------------------------------------------
+
+def read_sources():
+    """Return [(base_url, suite, [components])]. suite ending in '/' = flat."""
+    entries = []
+    def one_line(line):
+        line = re.sub(r"\[.*?\]", "", line)
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == "deb":
+            entries.append((parts[1].rstrip("/"), parts[2], parts[3:] or ["main"]))
+    files = ["/etc/apt/sources.list"]
+    d = "/etc/apt/sources.list.d"
+    if os.path.isdir(d):
+        files += [os.path.join(d, f) for f in sorted(os.listdir(d))]
+    for path in files:
+        if not os.path.isfile(path):
+            continue
+        text = open(path).read()
+        if path.endswith(".sources"):
+            for st in parse_stanzas(text):
+                if "deb" not in st.get("Types", ""):
+                    continue
+                for uri in st.get("URIs", "").split():
+                    for suite in st.get("Suites", "").split():
+                        entries.append((uri.rstrip("/"), suite,
+                                        st.get("Components", "main").split()))
+        elif path.endswith((".list", "sources.list")):
+            for line in text.splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    one_line(line)
+    return entries
+
+def fetch(url, timeout=60):
+    """http(s):// and file:// both via urllib; bare paths become file://."""
+    if url.startswith("/"):
+        url = "file://" + url
+    req = urllib.request.Request(url, headers={"User-Agent": "emerge/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+# ---------------------------------------------------------------------------
+# dpkg backend
+# ---------------------------------------------------------------------------
+
+class DpkgBackend:
+    name = "dpkg"
+
+    def __init__(self):
+        self.pkgs = {}        # name -> best index stanza
+        self.provides = {}    # virtual -> [(provider, version|None)]
+        self._plan = []       # resolver output stanzas, kept for merge()
+        self._seed_world()
+
+    # -- world file ---------------------------------------------------------
+
+    def _seed_world(self):
+        if os.path.exists(WORLD) or os.geteuid() != 0:
+            return
+        os.makedirs(LIB_DIR, exist_ok=True)
+        inst = installed_state()
+        with open(WORLD, "w") as f:
+            f.write("\n".join(sorted(inst)) + "\n")
+        einfo(f"Seeded world file with {len(inst)} currently installed packages.")
+
+    def _read_world(self):
+        if not os.path.exists(WORLD):
+            return set()
+        return {l.strip() for l in open(WORLD) if l.strip()}
+
+    def _write_world(self, names):
+        os.makedirs(LIB_DIR, exist_ok=True)
+        with open(WORLD, "w") as f:
+            f.write("\n".join(sorted(names)) + "\n")
+
+    # -- sync ---------------------------------------------------------------
+
+    @staticmethod
+    def _tree_file(base, suite, comp):
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", f"{base}_{suite}_{comp}")
+        return os.path.join(TREE_DIR, safe + "_Packages")
+
+    @staticmethod
+    def _scan_deb_dir(directory, base):
+        """Generate a Packages index from a bare directory of .deb files."""
+        out = []
+        for fn in sorted(os.listdir(directory)):
+            if not fn.endswith(".deb"):
+                continue
+            path = os.path.join(directory, fn)
+            r = capture(["dpkg-deb", "-f", path])
+            if r.returncode != 0:
+                ewarn(f"skipping unreadable {fn}")
+                continue
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            fields = r.stdout.rstrip("\n")
+            fields += (f"\nFilename: {fn}"
+                       f"\nSize: {os.path.getsize(path)}"
+                       f"\nSHA256: {h.hexdigest()}")
+            out.append(fields)
+        return ("\n\n".join(out) + "\n").encode()
+
+    def sync(self):
+        need_root()
+        os.makedirs(TREE_DIR, exist_ok=True)
+        a = capture(["dpkg", "--print-architecture"]).stdout.strip()
+        sources = read_sources()
+        if not sources:
+            eerror("No sources found in /etc/apt/sources.list[.d]. "
+                   "On apt-less systems, create one (plain `deb` lines work).")
+            sys.exit(1)
+        einfo(f"Syncing {len(sources)} repository entries...")
+        ok = 0
+        for base, suite, comps in sources:
+            flat = suite.endswith("/")
+            for comp in comps:
+                if flat:
+                    stem = f"{base}/{suite}Packages".replace("/./", "/")
+                else:
+                    stem = f"{base}/dists/{suite}/{comp}/binary-{a}/Packages"
+                print(f"{ARROW} Fetching {BLUE(f'{base} {suite}/{comp}')} ...",
+                      end=" ", flush=True)
+                data = None
+                attempts = [(".gz", gzip.decompress), ("", lambda b: b)]
+                if lzma:
+                    attempts.insert(0, (".xz", lzma.decompress))
+                for ext, dec in attempts:
+                    try:
+                        data = dec(fetch(stem + ext))
+                        break
+                    except Exception:
+                        continue
+                if data is None and flat and base.startswith("file://"):
+                    directory = base[len("file://"):]
+                    if os.path.isdir(directory):
+                        data = self._scan_deb_dir(directory, base)
+                        print(GREEN("indexed") +
+                              f" ({data.count(b'Package:')} debs scanned)")
+                if data is None:
+                    print(RED("failed"))
+                    continue
+                else:
+                    if not (flat and base.startswith("file://")
+                            and not os.path.exists(stem)):
+                        print(GREEN("done") + f" ({len(data) / 2**20:,.1f} MiB)")
+                with open(self._tree_file(base, suite, comp), "wb") as f:
+                    f.write(data)
+                ok += 1
+                if flat:
+                    break
+        print(f"\n{ARROW} Sync completed: {ok} indexes in {TREE_DIR}")
+        einfo("In post-sync... " + GREEN("done!"))
+
+    # -- index --------------------------------------------------------------
+
+    def _load_index(self):
+        if self.pkgs:
+            return
+        if not os.path.isdir(TREE_DIR) or not os.listdir(TREE_DIR):
+            eerror("No package tree found. Run `emerge --sync` first.")
+            sys.exit(1)
+        for fn in os.listdir(TREE_DIR):
+            with open(os.path.join(TREE_DIR, fn), errors="replace") as f:
+                for st in parse_stanzas(f.read()):
+                    name = st.get("Package")
+                    if not name or "Version" not in st:
+                        continue
+                    cur = self.pkgs.get(name)
+                    if cur is None or vercmp(st["Version"], cur["Version"]) > 0:
+                        self.pkgs[name] = st
+        for name, st in self.pkgs.items():
+            for clauses in parse_depends(st.get("Provides", "")):
+                for (v, _, ver) in clauses:
+                    self.provides.setdefault(v, []).append((name, ver))
+
+    @staticmethod
+    def _inst_provides(inst):
+        m = {}
+        for name, st in inst.items():
+            for clauses in parse_depends(st.get("Provides", "")):
+                for (v, _, pver) in clauses:
+                    m.setdefault(v, []).append((name, pver))
+        return m
+
+    # -- resolver -----------------------------------------------------------
+
+    def expand_sets(self, targets):
+        """Split targets into explicit atoms and set-derived member names."""
+        atoms, members = [], set()
+        inst = installed_state()
+        for t in targets:
+            if t == "@world":
+                members |= (self._read_world() & set(inst)) | system_set(inst)
+            elif t == "@selected":
+                members |= self._read_world() & set(inst)
+            elif t == "@system":
+                members |= system_set(inst)
+            else:
+                atoms.append(t)
+        return atoms, sorted(members)
+
+    @staticmethod
+    def _dep_closure(inst, seed):
+        """Closure of seed over installed Depends/Pre-Depends/Recommends."""
+        iprov = DpkgBackend._inst_provides(inst)
+        keep, stack = set(seed), list(seed)
+        while stack:
+            st = inst.get(stack.pop())
+            if not st:
+                continue
+            for field in ("Depends", "Pre-Depends", "Recommends"):
+                for alts in parse_depends(st.get(field, "")):
+                    for (dn, _, _) in alts:
+                        hits = [dn] if dn in inst else \
+                               [p for p, _ in iprov.get(dn, [])]
+                        for h in hits:
+                            if h not in keep:
+                                keep.add(h); stack.append(h)
+        return keep
+
+    def resolve(self, targets, update=False, deep=False):
+        self._load_index()
+        inst = installed_state()
+        iprov = self._inst_provides(inst)
+        selected, order = {}, []
+        pending, reinstalls = set(), set()
+
+        atoms, set_members = self.expand_sets(targets)
+        self._atoms = list(atoms)          # only these get world-file entries
+        worklist = atoms + set_members
+        if deep and update and set_members:
+            # --deep widens the update scope from the set members to the
+            # full dependency closure of the sets (Gentoo -uD @world)
+            worklist = atoms + sorted(self._dep_closure(inst, set(set_members)))
+
+        def dep_satisfied(name, op, ver):
+            if name in selected:
+                return op is None or meets(selected[name]["Version"], op, ver)
+            if name in inst and name not in pending:
+                if op is None or meets(inst[name]["Version"], op, ver):
+                    return True
+            if op is None:
+                if name in iprov:
+                    return True
+                if any(p in selected for p, _ in self.provides.get(name, [])):
+                    return True
+            else:
+                cands = iprov.get(name, []) + \
+                        [(p, pv) for p, pv in self.provides.get(name, [])
+                         if p in selected]
+                for _, pv in cands:
+                    if pv and meets(pv, op, ver):
+                        return True
+            return False
+
+        def select(name, why):
+            st = self.pkgs.get(name)
+            if st is None:
+                provs = self.provides.get(name, [])
+                if provs:
+                    return select(provs[0][0], why)
+                raise RuntimeError(f'there are no packages to satisfy "{name}" '
+                                   f"(required by {why})")
+            if name in selected:
+                return
+            selected[name] = st
+            order.append(name)
+            for field in ("Pre-Depends", "Depends"):
+                for alts in parse_depends(st.get(field, "")):
+                    if any(dep_satisfied(*a) for a in alts):
+                        continue
+                    for (dn, op, dv) in alts:
+                        cand = self.pkgs.get(dn)
+                        if cand and (op is None
+                                     or meets(cand["Version"], op, dv)):
+                            select(dn, name)
+                            break
+                        if op and dn in self.provides:
+                            hit = next((p for p, pv in self.provides[dn]
+                                        if pv and meets(pv, op, dv)), None)
+                            if hit:
+                                select(hit, name)
+                                break
+                    else:
+                        pretty = " | ".join(a[0] for a in alts)
+                        raise RuntimeError(f'cannot satisfy dependency '
+                                           f'"{pretty}" of {name}')
+
+        for t in worklist:
+            st = self.pkgs.get(t)
+            if st is None and t not in self.provides:
+                if t in atoms:
+                    raise RuntimeError(f'there are no packages to satisfy "{t}"')
+                continue                    # set member no longer in repos
+            iv = inst.get(t, {}).get("Version")
+            if iv and st is not None:
+                r = vercmp(st["Version"], iv)
+                if r < 0:
+                    continue                # repo older than installed
+                if r == 0:
+                    if update:              # -u: skip up-to-date
+                        continue
+                    reinstalls.add(t)       # no -u: re-merge, like Gentoo
+                pending.add(t)
+            select(t, "argument")
+
+        plan, merges = [], []
+        for name in order:
+            st = selected[name]
+            old = inst.get(name, {}).get("Version")
+            if old and vercmp(st["Version"], old) == 0 \
+               and name not in reinstalls:
+                continue
+            plan.append(st)
+            merges.append((name, st["Version"], old, int(st.get("Size", 0))))
+
+        for st in plan:
+            for field in ("Conflicts", "Breaks"):
+                for alts in parse_depends(st.get(field, "")):
+                    for (cn, op, cv) in alts:
+                        vv = None
+                        if cn in selected and cn != st["Package"]:
+                            vv = selected[cn]["Version"]
+                        elif cn in inst and cn not in selected:
+                            vv = inst[cn]["Version"]
+                        if vv and (op is None or meets(vv, op, cv)):
+                            raise RuntimeError(
+                                f"{st['Package']} {field.lower()} with {cn} "
+                                f"-- blocked; unmerge it first")
+        self._plan = plan
+        return merges
+
+    # -- fetch & install ----------------------------------------------------
+
+    def _download(self):
+        os.makedirs(DISTFILES, exist_ok=True)
+        bases = [b for b, _, _ in read_sources()]
+        paths, total = [], len(self._plan)
+        for i, st in enumerate(self._plan, 1):
+            fname = os.path.basename(st["Filename"])
+            dest = os.path.join(DISTFILES, fname)
+            pv = f"{st['Package']}-{st['Version']}"
+            if os.path.exists(dest) and self._sha256(dest) == st.get("SHA256"):
+                print(f"{ARROW} Reusing distfile ({i} of {total}) {BGREEN(pv)}")
+                paths.append(dest); continue
+            print(f"{ARROW} Fetching ({i} of {total}) {BGREEN(pv)} ...",
+                  end=" ", flush=True)
+            data = None
+            for base in bases:
+                try:
+                    data = fetch(f"{base}/{st['Filename']}")
+                    break
+                except Exception:
+                    continue
+            if data is None:
+                print(RED("failed"))
+                raise RuntimeError(f"could not fetch {st['Filename']}")
+            if st.get("SHA256") and \
+               hashlib.sha256(data).hexdigest() != st["SHA256"]:
+                print(RED("checksum mismatch!"))
+                raise RuntimeError(f"SHA256 verification failed for {fname}")
+            with open(dest, "wb") as f:
+                f.write(data)
+            print(GREEN("ok") + f" [{GREEN('sha256 ✓')}]")
+            paths.append(dest)
+        return paths
+
+    @staticmethod
+    def _sha256(path):
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def merge(self, merges, targets, opts):
+        need_root()
+        print()
+        try:
+            debs = self._download()
+        except RuntimeError as e:
+            print(f"{RED('!!!')} {BOLD(str(e))}"); sys.exit(1)
+        if opts["fetchonly"]:
+            einfo("Fetch complete."); return
+        print()
+        total = len(self._plan)
+        # deps were appended after their dependents: unpack in reverse
+        for i, (st, deb) in enumerate(
+                reversed(list(zip(self._plan, debs))), 1):
+            pv = f"{st['Package']}-{st['Version']}"
+            print(f"{ARROW} Emerging ({total - i + 1} of {total}) {BGREEN(pv)}")
+            r = capture(["dpkg", "--unpack", "--auto-deconfigure", deb])
+            if r.returncode != 0:
+                print(r.stderr, file=sys.stderr)
+                print(f"{RED('!!!')} unpack failed for {pv}"); sys.exit(1)
+        r = capture(["dpkg", "--configure", "-a"])
+        if r.returncode != 0:
+            print(r.stderr, file=sys.stderr)
+            print(f"{RED('!!!')} configure phase failed"); sys.exit(1)
+        for i, st in enumerate(self._plan, 1):
+            pv = f"{st['Package']}-{st['Version']}"
+            print(f"{ARROW} Installing ({i} of {total}) {BGREEN(pv)}")
+            print(f"{ARROW} Completed ({i} of {total}) {BGREEN(pv)}")
+        atoms = getattr(self, "_atoms", [])
+        if not opts["oneshot"] and atoms:
+            w = self._read_world() | set(atoms)
+            self._write_world(w)
+            print(f"\n{ARROW} Recording targets in \"world\" favorites file "
+                  f"({WORLD})")
+        print(f"{ARROW} {BGREEN('Auto-cleaning packages...')}\n")
+        einfo("GNU info directory index is up-to-date.")
+
+    # -- unmerge & depclean --------------------------------------------------
+
+    def _reverse_deps(self, inst, victims):
+        rdeps = {}
+        for name, st in inst.items():
+            if name in victims:
+                continue
+            for field in ("Depends", "Pre-Depends"):
+                for alts in parse_depends(st.get(field, "")):
+                    names = [a[0] for a in alts]
+                    if any(n in victims for n in names) and \
+                       all(n in victims or n not in inst for n in names):
+                        for v in set(names) & victims:
+                            rdeps.setdefault(v, []).append(name)
+        return rdeps
+
+    def unmerge_candidates(self, targets, opts):
+        inst = installed_state()
+        removals = []
+        for t in targets:
+            if t not in inst:
+                ewarn(f"{t} is not installed; skipping."); continue
+            if is_protected(inst[t]):
+                eerror(f"{t} is Essential/required; refusing to unmerge.")
+                sys.exit(1)
+            removals.append((t, inst[t]["Version"]))
+        rdeps = self._reverse_deps(inst, {p for p, _ in removals})
+        for victim, users in rdeps.items():
+            ewarn(f"{victim} is required by: {', '.join(users[:6])}"
+                  + (" ..." if len(users) > 6 else ""))
+        if rdeps and not opts["ask"] and not opts["pretend"]:
+            eerror("Unmerging would break reverse dependencies "
+                   "(use -a to override).")
+            sys.exit(1)
+        return removals
+
+    def depclean_candidates(self):
+        self._load_index()
+        inst = installed_state()
+        seed = system_set(inst) | (self._read_world() & set(inst))
+        keep = self._dep_closure(inst, seed)
+        return [(v, inst[v]["Version"]) for v in sorted(set(inst) - keep)]
+
+    def unmerge(self, removals):
+        need_root()
+        total = len(removals)
+        for i, (pkg, ver) in enumerate(removals, 1):
+            print(f"{ARROW} Unmerging ({i} of {total}) "
+                  f"{RED(pkg + '-' + ver)}...")
+            r = capture(["dpkg", "-r", pkg])
+            if r.returncode != 0:
+                print(r.stderr, file=sys.stderr)
+                print(f"{RED('!!!')} unmerge failed for {pkg}"); sys.exit(1)
+        self._write_world(self._read_world() - {p for p, _ in removals})
         print(f"\n{ARROW} {BGREEN('Auto-cleaning packages...')}")
         einfo("GNU info directory index is up-to-date.")
-    sys.exit(rc)
 
+    # -- search ---------------------------------------------------------------
+
+    def search(self, terms, desc):
+        self._load_index()
+        inst = installed_state()
+        for term in terms:
+            rx = re.compile(term, re.I)
+            hits = [st for name, st in sorted(self.pkgs.items())
+                    if rx.search(name)
+                    or (desc and rx.search(st.get("Description", "")))]
+            print_search_header(term, len(hits))
+            for st in hits:
+                name = st["Package"]
+                iv = inst.get(name, {}).get("Version", "[ Not Installed ]")
+                print_search_hit(name, st["Version"], iv,
+                                 st.get("Description", "").splitlines()[0],
+                                 int(st.get("Size", 0)))
 
 # ---------------------------------------------------------------------------
-# Argument parsing (emerge-style)
+# apt backend
 # ---------------------------------------------------------------------------
 
-LONG_FLAGS = {
-    "--ask": "a", "--verbose": "v", "--pretend": "p", "--update": "u",
-    "--deep": "D", "--newuse": "N", "--search": "s", "--searchdesc": "S",
-    "--unmerge": "C", "--fetchonly": "f", "--oneshot": "1", "--quiet": "q",
-}
+class AptBackend:
+    name = "apt"
+
+    def __init__(self):
+        self._action = None    # remembered apt-get action for merge()
+        self._merges = []
+
+    def sync(self):
+        need_root()
+        einfo("Starting rsync with apt mirrors...")
+        print(f"{ARROW} Starting retry 1 of 1 with apt-get update")
+        rc = run(["apt-get", "update"]).returncode
+        if rc == 0:
+            print(f"\n{ARROW} Sync completed with apt repositories")
+            einfo("In post-sync... " + GREEN("done!"))
+        else:
+            eerror("Sync failed.")
+        sys.exit(rc)
+
+    @staticmethod
+    def _installed_version(pkg):
+        r = capture(["dpkg-query", "-W", "-f=${Version} ${Status}", pkg])
+        if r.returncode != 0:
+            return None
+        parts = r.stdout.strip().rsplit(" ", 3)
+        if len(parts) == 4 and parts[3] == "installed":
+            return parts[0]
+        return None
+
+    @staticmethod
+    def _sizes(names):
+        sizes = {}
+        for i in range(0, len(names), 200):
+            r = capture(["apt-cache", "show"] + names[i:i + 200])
+            for st in parse_stanzas(r.stdout):
+                p = st.get("Package")
+                if p and "Size" in st and p not in sizes:
+                    sizes[p] = int(st["Size"])
+        return sizes
+
+    def expand_sets(self, targets):
+        atoms, members, had_world = [], set(), False
+        for t in targets:
+            if t in ("@world", "@selected"):
+                r = capture(["apt-mark", "showmanual"])
+                members |= {l.strip() for l in r.stdout.splitlines()
+                            if l.strip()}
+                if t == "@world":
+                    had_world = True
+                    members |= system_set(installed_state())
+            elif t == "@system":
+                members |= system_set(installed_state())
+            else:
+                atoms.append(t)
+        return atoms, sorted(members), had_world
+
+    def resolve(self, targets, update=False, deep=False):
+        atoms, members, had_world = self.expand_sets(targets)
+        if had_world and update and deep:
+            # emerge -uD @world: the full-tree upgrade apt's solver owns
+            self._action = ["dist-upgrade"]
+        elif update:
+            # -u: upgrade if outdated, install if missing, never reinstall
+            # current versions -- exactly apt-get install's semantics
+            self._action = ["install"] + atoms + members
+        else:
+            # no -u: re-merge like Gentoo (reinstall current versions too)
+            self._action = ["install", "--reinstall"] + atoms + members
+        r = capture(["apt-get", "-s", "-qq",
+                     "-o", "APT::Get::Show-User-Simulation-Note=0"]
+                    + self._action)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout).strip()
+                               .replace("E: ", ""))
+        raw = []
+        for line in r.stdout.splitlines():
+            m = re.match(r"^Inst (\S+)(?: \[([^\]]+)\])? \((\S+) ", line)
+            if m:
+                name, old, new = m.group(1), m.group(2), m.group(3)
+                if old is None:
+                    old = self._installed_version(name)
+                raw.append((name, new, old))
+        sizes = self._sizes([n for n, _, _ in raw])
+        merges = [(n, new, old, sizes.get(n, 0)) for n, new, old in raw]
+        self._merges = merges
+        return merges
+
+    def merge(self, merges, targets, opts):
+        need_root()
+        print()
+        if opts["fetchonly"]:
+            rc = run(["apt-get", "-y", "-d"] + self._action).returncode
+            if rc == 0:
+                einfo("Fetch complete.")
+            sys.exit(rc)
+        total = len(merges)
+        order = {name: i + 1 for i, (name, _, _, _) in enumerate(merges)}
+        vers  = {name: v for name, v, _, _ in merges}
+        proc = subprocess.Popen(
+            ["apt-get", "-y"] + self._action,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+            env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"})
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            m = re.match(r"^(Unpacking|Setting up) (\S+?)(?::\S+)? ", line)
+            if m:
+                verb, pkg = m.groups()
+                i = order.get(pkg)
+                if not i:
+                    continue
+                pv = f"{pkg}-{vers[pkg]}"
+                if verb == "Unpacking":
+                    print(f"{ARROW} Emerging ({i} of {total}) {BGREEN(pv)}")
+                else:
+                    print(f"{ARROW} Installing ({i} of {total}) {BGREEN(pv)}")
+                    print(f"{ARROW} Completed ({i} of {total}) {BGREEN(pv)}")
+            elif re.match(r"^(Get:|Fetched|Removing|E:|W:)", line):
+                print(line)
+        rc = proc.wait()
+        print()
+        if rc == 0:
+            print(f"{ARROW} Recording targets in \"world\" favorites file "
+                  f"(apt manual-install marks)")
+            print(f"{ARROW} {BGREEN('Auto-cleaning packages...')}\n")
+            einfo("GNU info directory index is up-to-date.")
+        else:
+            print(f"{RED('!!!')} {BOLD('emerge failed; see output above.')}")
+            sys.exit(rc)
+
+    def unmerge_candidates(self, targets, opts):
+        removals = []
+        for t in targets:
+            v = self._installed_version(t)
+            if v is None:
+                ewarn(f"{t} is not installed; skipping.")
+            else:
+                removals.append((t, v))
+        return removals
+
+    def depclean_candidates(self):
+        r = capture(["apt-get", "-s", "-qq", "autoremove"])
+        removals = []
+        for line in r.stdout.splitlines():
+            m = re.match(r"^Remv (\S+)(?: \[([^\]]+)\])?", line)
+            if m:
+                removals.append((m.group(1),
+                                 m.group(2) or self._installed_version(m.group(1))
+                                 or "?"))
+        self._depclean = True
+        return removals
+
+    def unmerge(self, removals):
+        need_root()
+        cmd = (["apt-get", "-y", "autoremove"]
+               if getattr(self, "_depclean", False)
+               else ["apt-get", "-y", "remove"] + [p for p, _ in removals])
+        total = len(removals)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                env={**os.environ,
+                                     "DEBIAN_FRONTEND": "noninteractive"})
+        i = 0
+        for line in proc.stdout:
+            m = re.match(r"^Removing (\S+?)(?::\S+)? \(([^)]+)\)", line)
+            if m:
+                i += 1
+                print(f"{ARROW} Unmerging ({i} of {total}) "
+                      f"{RED(m.group(1) + '-' + m.group(2))}...")
+        rc = proc.wait()
+        if rc != 0:
+            print(f"{RED('!!!')} unmerge failed."); sys.exit(rc)
+        print(f"\n{ARROW} {BGREEN('Auto-cleaning packages...')}")
+        einfo("GNU info directory index is up-to-date.")
+
+    def search(self, terms, desc):
+        for term in terms:
+            r = capture(["apt-cache", "search"]
+                        + ([] if desc else ["--names-only"]) + [term])
+            results = [l for l in r.stdout.splitlines() if l.strip()]
+            print_search_header(term, len(results))
+            for line in results:
+                name, _, description = line.partition(" - ")
+                iv = self._installed_version(name) or "[ Not Installed ]"
+                cand = "?"
+                p = capture(["apt-cache", "policy", name])
+                m = re.search(r"Candidate:\s*(\S+)", p.stdout)
+                if m:
+                    cand = m.group(1)
+                print_search_hit(name, cand, iv, description, 0)
+
+# ---------------------------------------------------------------------------
+# Shared search formatting
+# ---------------------------------------------------------------------------
+
+def print_search_header(term, n):
+    print(f"{BLUE('[ Results for search key : ')}{BOLD(term)}{BLUE(' ]')}")
+    print(f"{BLUE('[ Applications found : ')}{BOLD(str(n))}{BLUE(' ]')}\n")
+
+def print_search_hit(name, avail, inst, desc, size):
+    print(f"{GREEN('*')}  {BGREEN(name)}")
+    print(f"      {GREEN('Latest version available:')} {avail}")
+    print(f"      {GREEN('Latest version installed:')} {inst}")
+    if size:
+        print(f"      {GREEN('Size of files:')} {size / 1024:,.1f} KiB")
+    print(f"      {GREEN('Description:')}   {desc}")
+    print()
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+LONG_FLAGS = {"--ask": "a", "--verbose": "v", "--pretend": "p", "--update": "u",
+              "--deep": "D", "--newuse": "N", "--search": "s",
+              "--searchdesc": "S", "--unmerge": "C", "--fetchonly": "f",
+              "--oneshot": "1", "--quiet": "q"}
+
+def pick_backend(forced):
+    choice = forced or os.environ.get("EMERGE_BACKEND")
+    if choice == "apt":
+        if not shutil.which("apt-get"):
+            eerror("apt backend requested but apt-get not found."); sys.exit(1)
+        return AptBackend()
+    if choice == "dpkg":
+        return DpkgBackend()
+    if choice:
+        eerror(f"unknown backend '{choice}' (use apt or dpkg)"); sys.exit(1)
+    return AptBackend() if shutil.which("apt-get") else DpkgBackend()
 
 def main(argv):
-    opts = {k: False for k in
-            ("ask", "verbose", "pretend", "update", "deep", "search",
-             "searchdesc", "unmerge", "fetchonly", "world", "depclean")}
-    pkgs = []
-
+    opts = {k: False for k in ("ask", "verbose", "pretend", "update", "deep",
+                               "fetchonly", "oneshot", "search", "searchdesc",
+                               "unmerge", "depclean", "sync")}
+    pkgs, backend_flag = [], None
     if not argv:
-        print(__doc__)
-        sys.exit(0)
-
+        print(__doc__); return
     for arg in argv:
-        if arg in ("--sync",):
-            do_sync()
-        elif arg == "--depclean":
-            opts["depclean"] = True
-        elif arg in ("--help", "-h"):
-            print(__doc__)
-            sys.exit(0)
-        elif arg in ("--version",):
-            print("Portage 3.0.66-apt (python " + sys.version.split()[0] + ")")
-            sys.exit(0)
-        elif arg in LONG_FLAGS:
+        if arg.startswith("--backend="):
+            backend_flag = arg.split("=", 1)[1]; continue
+        if arg == "--sync":
+            opts["sync"] = True; continue
+        if arg == "--depclean":
+            opts["depclean"] = True; continue
+        if arg in ("--help", "-h"):
+            print(__doc__); return
+        if arg == "--version":
+            b = pick_backend(backend_flag)
+            print(f"Portage 3.0.66-deb (python {sys.version.split()[0]}, "
+                  f"{b.name} backend)")
+            return
+        if arg in LONG_FLAGS:
             arg = "-" + LONG_FLAGS[arg]
         if arg.startswith("-") and not arg.startswith("--"):
             for ch in arg[1:]:
@@ -408,30 +1032,83 @@ def main(argv):
                 elif ch == "S": opts["searchdesc"] = True
                 elif ch == "C": opts["unmerge"] = True
                 elif ch == "f": opts["fetchonly"] = True
-                elif ch in ("N", "1", "q", "t"): pass  # accepted, no-op
+                elif ch == "1": opts["oneshot"] = True
+                elif ch in "Nqt": pass
                 else:
-                    eerror(f"unknown option: -{ch}")
-                    sys.exit(1)
+                    eerror(f"unknown option: -{ch}"); sys.exit(1)
         elif not arg.startswith("-"):
-            if arg in ("world", "@world", "system", "@system"):
-                opts["world"] = True
+            if arg in ("world", "@world"):
+                pkgs.append("@world")
+            elif arg in ("system", "@system"):
+                pkgs.append("@system")
+            elif arg == "@selected":
+                pkgs.append("@selected")
             else:
                 pkgs.append(arg)
 
-    if opts["searchdesc"]:
-        do_search(pkgs, desc=True)
-    if opts["search"]:
-        do_search(pkgs, desc=False)
-    if opts["depclean"]:
-        do_unmerge(pkgs, opts, depclean=True)
-    if opts["unmerge"]:
-        do_unmerge(pkgs, opts)
-    do_merge(pkgs, opts)
+    be = pick_backend(backend_flag)
 
+    if opts["sync"]:
+        be.sync(); return
+    if opts["searchdesc"] or opts["search"]:
+        if not pkgs:
+            eerror("no search terms given."); sys.exit(1)
+        be.search(pkgs, opts["searchdesc"]); return
+
+    if opts["depclean"]:
+        calc_deps_start()
+        removals = be.depclean_candidates()
+        calc_deps_done()
+        if not removals:
+            print(f"\n{ARROW} No packages selected for removal by depclean")
+            return
+        print_unmerge_list(removals)
+        if opts["pretend"]:
+            return
+        if opts["ask"] and not ask_continue("unmerge"):
+            print("\nQuitting."); sys.exit(1)
+        be.unmerge(removals); return
+
+    if opts["unmerge"]:
+        if not pkgs:
+            eerror("no targets given."); sys.exit(1)
+        removals = be.unmerge_candidates(pkgs, opts)
+        if not removals:
+            sys.exit(1)
+        print_unmerge_list(removals)
+        if opts["pretend"]:
+            return
+        if opts["ask"] and not ask_continue("unmerge"):
+            print("\nQuitting."); sys.exit(1)
+        be.unmerge(removals); return
+
+    # merge
+    if not pkgs:
+        eerror("no targets given."); sys.exit(1)
+    calc_deps_start()
+    try:
+        merges = be.resolve(pkgs, update=opts["update"], deep=opts["deep"])
+    except RuntimeError as e:
+        calc_deps_done(ok=False)
+        print(f"\n{RED('!!!')} {BOLD(str(e))}")
+        sys.exit(1)
+    calc_deps_done()
+    if not merges:
+        einfo("No outdated packages were found on your system."
+              if any(p.startswith("@") for p in pkgs) else
+              "Nothing to merge; all targets are already up to date.")
+        return
+    if opts["pretend"] or opts["ask"] or opts["verbose"]:
+        print("\nThese are the packages that would be merged, in order:\n")
+        print_merge_list(merges, opts["verbose"])
+    if opts["pretend"]:
+        return
+    if opts["ask"] and not ask_continue():
+        print("\nQuitting."); sys.exit(1)
+    be.merge(merges, pkgs, opts)
 
 if __name__ == "__main__":
     try:
         main(sys.argv[1:])
     except KeyboardInterrupt:
-        print(f"\n\n{RED('!!!')} Interrupted.")
-        sys.exit(130)
+        print(f"\n\n{RED('!!!')} Interrupted."); sys.exit(130)
