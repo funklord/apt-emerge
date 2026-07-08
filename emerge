@@ -47,6 +47,7 @@ Paths (dpkg backend): tree /var/lib/emerge-dpkg/tree, world file
 /var/lib/emerge-dpkg/world, distfiles /var/cache/emerge-dpkg/distfiles.
 """
 
+import email.utils
 import gzip
 import hashlib
 import os
@@ -69,6 +70,7 @@ LIB_DIR   = "/var/lib/emerge-dpkg"
 TREE_DIR  = os.path.join(LIB_DIR, "tree")
 WORLD     = os.path.join(LIB_DIR, "world")
 DISTFILES = "/var/cache/emerge-dpkg/distfiles"
+BINPKGS   = "/var/cache/emerge-dpkg/binpkgs"      # PKGDIR for -b/-B products
 STATUS    = "/var/lib/dpkg/status"
 
 # ---------------------------------------------------------------------------
@@ -197,10 +199,11 @@ def parse_depends(field):
 # ---------------------------------------------------------------------------
 
 def print_merge_list(merges, verbose):
-    """merges: [(name, newver, oldver|None, size_bytes|None)]"""
+    """merges: [(name, newver, oldver|None, size_bytes, kind, use)]
+    kind: 'ebuild' (source build / normal merge) | 'binary' (dep .deb)"""
     n_new = n_up = n_down = n_re = 0
     dl = 0
-    for name, newver, oldver, size in merges:
+    for name, newver, oldver, size, kind, use in merges:
         if oldver is None:
             flag, col = "N", GREEN; n_new += 1
         else:
@@ -208,10 +211,13 @@ def print_merge_list(merges, verbose):
             if r > 0:   flag, col = "U", BCYAN; n_up += 1
             elif r < 0: flag, col = "D", BLUE;  n_down += 1
             else:       flag, col = "R", YELLOW; n_re += 1
-        line = (f"[{GREEN('ebuild')}  {col(flag)}    ] "
+        label = GREEN("ebuild") if kind == "ebuild" else BLUE("binary")
+        line = (f"[{label}  {col(flag)}    ] "
                 f"{BGREEN(name + '-' + newver)}")
         if flag in "UD":
             line += f" [{BLUE(oldver)}]"
+        if use:
+            line += f' USE="{RED(use)}"'
         if verbose and size:
             dl += size
             line += f" {size / 1024:,.1f} KiB"
@@ -592,7 +598,8 @@ class DpkgBackend:
                and name not in reinstalls:
                 continue
             plan.append(st)
-            merges.append((name, st["Version"], old, int(st.get("Size", 0))))
+            merges.append((name, st["Version"], old,
+                           int(st.get("Size", 0)), "ebuild", ""))
 
         for st in plan:
             for field in ("Conflicts", "Breaks"):
@@ -852,7 +859,8 @@ class AptBackend:
                     old = self._installed_version(name)
                 raw.append((name, new, old))
         sizes = self._sizes([n for n, _, _ in raw])
-        merges = [(n, new, old, sizes.get(n, 0)) for n, new, old in raw]
+        merges = [(n, new, old, sizes.get(n, 0), "ebuild", "")
+                  for n, new, old in raw]
         self._merges = merges
         return merges
 
@@ -865,8 +873,8 @@ class AptBackend:
                 einfo("Fetch complete.")
             sys.exit(rc)
         total = len(merges)
-        order = {name: i + 1 for i, (name, _, _, _) in enumerate(merges)}
-        vers  = {name: v for name, v, _, _ in merges}
+        order = {m[0]: i + 1 for i, m in enumerate(merges)}
+        vers  = {m[0]: m[1] for m in merges}
         proc = subprocess.Popen(
             ["apt-get", "-y"] + self._action,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -942,6 +950,145 @@ class AptBackend:
         if rc != 0:
             print(f"{RED('!!!')} unmerge failed."); sys.exit(rc)
         print(f"\n{ARROW} {BGREEN('Auto-cleaning packages...')}")
+        einfo("GNU info directory index is up-to-date.")
+
+    # -- source builds (-b / --buildpkg, -B / --buildpkgonly) ----------------
+
+    @staticmethod
+    def _build_use():
+        """DEB_BUILD_OPTIONS is the closest thing Debian has to USE flags."""
+        return os.environ.get("DEB_BUILD_OPTIONS",
+                              f"nocheck parallel={os.cpu_count()}")
+
+    def _src_version(self, pkg):
+        r = capture(["apt-cache", "showsrc", pkg])
+        best = None
+        for st in parse_stanzas(r.stdout):
+            v = st.get("Version")
+            if v and (best is None or vercmp(v, best) > 0):
+                best = v
+        return best
+
+    def resolve_source(self, atoms, opts):
+        merges, self._src_plan = [], []
+        use = self._build_use()
+        for a in atoms:
+            sv = self._src_version(a)
+            if sv is None:
+                raise RuntimeError(
+                    f'there are no ebuilds to satisfy "{a}" -- no source '
+                    f"package found. Your tree may lack deb-src entries; "
+                    f"add them to /etc/apt/sources.list and `emerge --sync`.")
+            newver = sv + "+local1"
+            self._src_plan.append((a, sv, newver))
+            merges.append((a, newver, self._installed_version(a),
+                           0, "ebuild", use))
+        # build dependencies appear as [binary], the way Portage shows binpkgs
+        seen = {m[0] for m in merges}
+        for a in atoms:
+            r = capture(["apt-get", "-s", "-qq", "build-dep", a])
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or r.stdout).strip()
+                                   .replace("E: ", ""))
+            for line in r.stdout.splitlines():
+                m = re.match(r"^Inst (\S+)(?: \[([^\]]+)\])? \((\S+) ", line)
+                if m and m.group(1) not in seen:
+                    seen.add(m.group(1))
+                    merges.append((m.group(1), m.group(3), m.group(2),
+                                   0, "binary", ""))
+        sizes = self._sizes(sorted(seen))
+        return [(n, nv, ov, sizes.get(n, 0) if k == "binary" else 0, k, u)
+                for n, nv, ov, _, k, u in merges]
+
+    @staticmethod
+    def _bump_changelog(srcdir, newver):
+        """Prepend a changelog entry so the build carries +local1 --
+        higher than the repo version, so @world upgrades won't clobber it."""
+        cl = os.path.join(srcdir, "debian", "changelog")
+        with open(cl) as f:
+            old = f.read()
+        m = re.match(r"^(\S+) \(([^)]+)\)", old)
+        entry = (f"{m.group(1)} ({newver}) unstable; urgency=medium\n\n"
+                 f"  * Local rebuild by emerge.\n\n"
+                 f" -- emerge <root@localhost>  "
+                 f"{email.utils.formatdate(localtime=True)}\n\n")
+        with open(cl, "w") as f:
+            f.write(entry + old)
+
+    def build(self, opts):
+        need_root()
+        os.makedirs(BINPKGS, exist_ok=True)
+        use = self._build_use()
+        env = {**os.environ, "DEB_BUILD_OPTIONS": use,
+               "DEBIAN_FRONTEND": "noninteractive"}
+        total = len(self._src_plan)
+        for i, (atom, srcver, newver) in enumerate(self._src_plan, 1):
+            pv = f"{atom}-{newver}"
+            print(f"\n{ARROW} Emerging ({i} of {total}) {BGREEN(pv)}")
+            einfo(f"Installing build dependencies for {atom} "
+                  f"(oneshot: --depclean removes them again)...")
+            r = capture(["apt-get", "-y", "build-dep", atom])
+            if r.returncode != 0:
+                print(r.stderr, file=sys.stderr)
+                print(f"{RED('!!!')} build-dep failed for {atom}")
+                sys.exit(1)
+            portage_dir = f"/var/tmp/portage/{atom}-{srcver}"
+            workdir = os.path.join(portage_dir, "work")
+            shutil.rmtree(portage_dir, ignore_errors=True)
+            os.makedirs(workdir)
+            print(f"{ARROW} Unpacking source...")
+            r = run(["apt-get", "source", atom], cwd=workdir,
+                    capture_output=True)
+            if r.returncode != 0:
+                print(r.stderr, file=sys.stderr)
+                print(f"{RED('!!!')} fetching source failed for {atom}")
+                sys.exit(1)
+            srcdir = next(os.path.join(workdir, d)
+                          for d in sorted(os.listdir(workdir))
+                          if os.path.isdir(os.path.join(workdir, d)))
+            print(f"{ARROW} Source unpacked in {srcdir}")
+            self._bump_changelog(srcdir, newver)
+            print(f"{ARROW} Compiling source in {BOLD(srcdir)} ...")
+            proc = subprocess.Popen(
+                ["dpkg-buildpackage", "-b", "-uc", "-us"],
+                cwd=srcdir, env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, bufsize=1)
+            for line in proc.stdout:
+                print(line, end="")
+            if proc.wait() != 0:
+                print(f"\n{RED('!!!')} {BOLD(f'compile failed for {atom}')}")
+                sys.exit(1)
+            print(f"{ARROW} Source compiled.")
+            if "nocheck" in use.split():
+                print(f"{ARROW} Test phase [not enabled]: {atom} "
+                      f"(DEB_BUILD_OPTIONS did not request tests)")
+            else:
+                print(f"{ARROW} Test phase completed: {atom}")
+            debs = sorted(f for f in os.listdir(workdir)
+                          if f.endswith(".deb"))
+            for d in debs:
+                shutil.copy2(os.path.join(workdir, d), BINPKGS)
+            print(f"{ARROW} Merging {len(debs)} binary package(s) to PKGDIR "
+                  f"({BINPKGS}):")
+            for d in debs:
+                print(f"    {GREEN(d)}")
+            if opts["buildpkgonly"]:
+                continue
+            noepoch = newver.split(":", 1)[-1]
+            target = next((d for d in debs
+                           if d.startswith(f"{atom}_{noepoch}_")), None)
+            if target is None:
+                print(f"{RED('!!!')} no .deb named {atom} among the products")
+                sys.exit(1)
+            r = capture(["apt-get", "-y", "install",
+                         os.path.join(BINPKGS, target)])
+            if r.returncode != 0:
+                print(r.stderr, file=sys.stderr)
+                print(f"{RED('!!!')} install failed for {atom}")
+                sys.exit(1)
+            print(f"{ARROW} Installing ({i} of {total}) {BGREEN(pv)}")
+            print(f"{ARROW} Completed ({i} of {total}) {BGREEN(pv)}")
+        print()
         einfo("GNU info directory index is up-to-date.")
 
     def search(self, terms, desc):
@@ -1040,6 +1187,23 @@ Options:
                  for embedded systems that carry only dpkg). May also be
                  set with the EMERGE_BACKEND environment variable.
 
+   --buildpkg (-b)
+                 Build the target from its Debian source package and
+                 install the result. Build dependencies are installed as
+                 apt auto-installed packages, so a later --depclean removes
+                 them again (Gentoo's --with-bdeps=n behaviour). The built
+                 version is suffixed +local1 so that @world upgrades will
+                 not silently clobber your build. DEB_BUILD_OPTIONS is
+                 honoured and shown as USE flags in the merge list
+                 (default: nocheck parallel=<nproc>). Requires deb-src
+                 entries in the tree and the apt backend plus dpkg-dev /
+                 build-essential; the dpkg backend is binary-only.
+
+   --buildpkgonly (-B)
+                 Build, but do not install. Products are kept in PKGDIR
+                 ({BINPKGS}) -- e.g. for feeding a
+                 file:// source consumed by dpkg-only boxes.
+
    --deep (-D)   This flag forces emerge to consider the entire dependency
                  tree of packages, instead of checking only the immediate
                  dependencies of the packages. Combined with --update and a
@@ -1068,6 +1232,8 @@ Options:
                  U = updating (to another version)
                  D = downgrading (best version seems lower)
                  R = replacing (remerging same version)
+                 Source builds (-b/-B) are listed as [ebuild]; pre-built
+                 repository packages alongside them appear as [binary].
 
    --update (-u) Updates packages to the best version available. Without
                  --update, targets that are already installed and current
@@ -1102,7 +1268,8 @@ For more help consult the man page... which doesn't exist. This is it.
 LONG_FLAGS = {"--ask": "a", "--verbose": "v", "--pretend": "p", "--update": "u",
               "--deep": "D", "--newuse": "N", "--search": "s",
               "--searchdesc": "S", "--unmerge": "C", "--fetchonly": "f",
-              "--oneshot": "1", "--quiet": "q"}
+              "--oneshot": "1", "--quiet": "q",
+              "--buildpkg": "b", "--buildpkgonly": "B"}
 
 def pick_backend(forced):
     choice = forced or os.environ.get("EMERGE_BACKEND")
@@ -1119,7 +1286,8 @@ def pick_backend(forced):
 def main(argv):
     opts = {k: False for k in ("ask", "verbose", "pretend", "update", "deep",
                                "fetchonly", "oneshot", "search", "searchdesc",
-                               "unmerge", "depclean", "sync")}
+                               "unmerge", "depclean", "sync",
+                               "buildpkg", "buildpkgonly")}
     pkgs, backend_flag = [], None
     if not argv:
         print(HELP); return
@@ -1152,6 +1320,8 @@ def main(argv):
                 elif ch == "f": opts["fetchonly"] = True
                 elif ch == "1": opts["oneshot"] = True
                 elif ch == "c": opts["depclean"] = True
+                elif ch == "b": opts["buildpkg"] = True
+                elif ch == "B": opts["buildpkgonly"] = True
                 elif ch in "Nqt": pass
                 else:
                     eerror(f"unknown option: -{ch}"); sys.exit(1)
@@ -1200,6 +1370,37 @@ def main(argv):
         if opts["ask"] and not ask_continue("unmerge"):
             print("\nQuitting."); sys.exit(1)
         be.unmerge(removals); return
+
+    # source builds (-b / -B): apt backend only, by design
+    if opts["buildpkg"] or opts["buildpkgonly"]:
+        if be.name != "apt":
+            eerror("Source builds require the apt backend; the dpkg backend "
+                   "is binary-only by design (a build system that large "
+                   "deserves real apt).")
+            eerror("Build on a host with -B and feed the .debs to a file:// "
+                   "source instead.")
+            sys.exit(1)
+        if not pkgs or any(p.startswith("@") for p in pkgs):
+            eerror("source builds take explicit package atoms, not sets.")
+            sys.exit(1)
+        calc_deps_start()
+        try:
+            merges = be.resolve_source(pkgs, opts)
+        except RuntimeError as e:
+            calc_deps_done(ok=False)
+            print(f"\n{RED('!!!')} {BOLD(str(e))}")
+            sys.exit(1)
+        calc_deps_done()
+        if opts["pretend"] or opts["ask"] or opts["verbose"]:
+            print("\nThese are the packages that would be merged, "
+                  "in order:\n")
+            print_merge_list(merges, opts["verbose"])
+        if opts["pretend"]:
+            return
+        if opts["ask"] and not ask_continue():
+            print("\nQuitting."); sys.exit(1)
+        be.build(opts)
+        return
 
     # merge
     if not pkgs:
