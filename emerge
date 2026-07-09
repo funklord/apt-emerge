@@ -103,6 +103,26 @@ def run(cmd, **kw):
 def capture(cmd):
     return run(cmd, capture_output=True)
 
+def stream_lines(pipe):
+    """Yield clean lines from a binary pipe, splitting on both \\n and \\r.
+    apt and dpkg emit carriage-return progress (padded overwrite lines)
+    that would otherwise get embedded in our output and mangle the
+    terminal -- the cause of run-together, space-padded lines."""
+    buf = b""
+    while True:
+        chunk = pipe.read1(4096)
+        if not chunk:
+            break
+        buf += chunk
+        *lines, buf = re.split(rb"[\r\n]", buf)
+        for l in lines:
+            s = l.decode(errors="replace").rstrip()
+            if s:
+                yield s
+    tail = buf.decode(errors="replace").strip()
+    if tail:
+        yield tail
+
 # ---------------------------------------------------------------------------
 # Debian version comparison (policy 5.6.12), pure Python
 # ---------------------------------------------------------------------------
@@ -876,12 +896,10 @@ class AptBackend:
         order = {m[0]: i + 1 for i, m in enumerate(merges)}
         vers  = {m[0]: m[1] for m in merges}
         proc = subprocess.Popen(
-            ["apt-get", "-y"] + self._action,
+            ["apt-get", "-y", "-q", "-o", "Dpkg::Use-Pty=0"] + self._action,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
             env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"})
-        for line in proc.stdout:
-            line = line.rstrip("\n")
+        for line in stream_lines(proc.stdout):
             m = re.match(r"^(Unpacking|Setting up) (\S+?)(?::\S+)? ", line)
             if m:
                 verb, pkg = m.groups()
@@ -931,16 +949,17 @@ class AptBackend:
 
     def unmerge(self, removals):
         need_root()
-        cmd = (["apt-get", "-y", "autoremove"]
+        cmd = (["apt-get", "-y", "-q", "-o", "Dpkg::Use-Pty=0", "autoremove"]
                if getattr(self, "_depclean", False)
-               else ["apt-get", "-y", "remove"] + [p for p, _ in removals])
+               else ["apt-get", "-y", "-q", "-o", "Dpkg::Use-Pty=0",
+                     "remove"] + [p for p, _ in removals])
         total = len(removals)
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                stderr=subprocess.STDOUT,
                                 env={**os.environ,
                                      "DEBIAN_FRONTEND": "noninteractive"})
         i = 0
-        for line in proc.stdout:
+        for line in stream_lines(proc.stdout):
             m = re.match(r"^Removing (\S+?)(?::\S+)? \(([^)]+)\)", line)
             if m:
                 i += 1
@@ -1052,9 +1071,9 @@ class AptBackend:
             proc = subprocess.Popen(
                 ["dpkg-buildpackage", "-b", "-uc", "-us"],
                 cwd=srcdir, env=env, stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, text=True, bufsize=1)
-            for line in proc.stdout:
-                print(line, end="")
+                stderr=subprocess.STDOUT)
+            for line in stream_lines(proc.stdout):
+                print(line)
             if proc.wait() != 0:
                 print(f"\n{RED('!!!')} {BOLD(f'compile failed for {atom}')}")
                 sys.exit(1)
