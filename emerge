@@ -47,14 +47,17 @@ Paths (dpkg backend): tree /var/lib/emerge-dpkg/tree, world file
 /var/lib/emerge-dpkg/world, distfiles /var/cache/emerge-dpkg/distfiles.
 """
 
+import difflib
 import email.utils
 import gzip
 import hashlib
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.request
 
 try:
@@ -689,6 +692,8 @@ class DpkgBackend:
             print(f"{RED('!!!')} {BOLD(str(e))}"); sys.exit(1)
         if opts["fetchonly"]:
             einfo("Fetch complete."); return
+        conf = load_conf()
+        archive_from_debs(conf, debs)
         print()
         total = len(self._plan)
         # deps were appended after their dependents: unpack in reverse
@@ -696,11 +701,13 @@ class DpkgBackend:
                 reversed(list(zip(self._plan, debs))), 1):
             pv = f"{st['Package']}-{st['Version']}"
             print(f"{ARROW} Emerging ({total - i + 1} of {total}) {BGREEN(pv)}")
-            r = capture(["dpkg", "--unpack", "--auto-deconfigure", deb])
+            r = capture(["dpkg", "--force-confold", "--force-confdef",
+                         "--unpack", "--auto-deconfigure", deb])
             if r.returncode != 0:
                 print(r.stderr, file=sys.stderr)
                 print(f"{RED('!!!')} unpack failed for {pv}"); sys.exit(1)
-        r = capture(["dpkg", "--configure", "-a"])
+        r = capture(["dpkg", "--force-confold", "--force-confdef",
+                     "--configure", "-a"])
         if r.returncode != 0:
             print(r.stderr, file=sys.stderr)
             print(f"{RED('!!!')} configure phase failed"); sys.exit(1)
@@ -716,6 +723,7 @@ class DpkgBackend:
                   f"({WORLD})")
         print(f"{ARROW} {BGREEN('Auto-cleaning packages...')}\n")
         einfo("GNU info directory index is up-to-date.")
+        pending_notice(conf)
 
     # -- unmerge & depclean --------------------------------------------------
 
@@ -887,16 +895,30 @@ class AptBackend:
     def merge(self, merges, targets, opts):
         need_root()
         print()
+        conf = load_conf()
         if opts["fetchonly"]:
             rc = run(["apt-get", "-y", "-d"] + self._action).returncode
             if rc == 0:
                 einfo("Fetch complete.")
             sys.exit(rc)
+        # fetch first so the as-shipped config files can be archived before
+        # dpkg touches /etc -- these become the ancestor for the next upgrade
+        r = capture(["apt-get", "-y", "-q", "-d"] + self._action)
+        if r.returncode == 0:
+            debs = [os.path.join("/var/cache/apt/archives", f)
+                    for f in os.listdir("/var/cache/apt/archives")
+                    if f.endswith(".deb")]
+            names = {m[0] for m in merges}
+            archive_from_debs(conf, [d for d in debs
+                                     if os.path.basename(d).split("_")[0]
+                                     in names])
         total = len(merges)
         order = {m[0]: i + 1 for i, m in enumerate(merges)}
         vers  = {m[0]: m[1] for m in merges}
         proc = subprocess.Popen(
-            ["apt-get", "-y", "-q", "-o", "Dpkg::Use-Pty=0"] + self._action,
+            ["apt-get", "-y", "-q", "-o", "Dpkg::Use-Pty=0",
+             "-o", "Dpkg::Options::=--force-confold",
+             "-o", "Dpkg::Options::=--force-confdef"] + self._action,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"})
         for line in stream_lines(proc.stdout):
@@ -921,6 +943,7 @@ class AptBackend:
                   f"(apt manual-install marks)")
             print(f"{ARROW} {BGREEN('Auto-cleaning packages...')}\n")
             einfo("GNU info directory index is up-to-date.")
+            pending_notice(conf)
         else:
             print(f"{RED('!!!')} {BOLD('emerge failed; see output above.')}")
             sys.exit(rc)
@@ -1109,6 +1132,7 @@ class AptBackend:
             print(f"{ARROW} Completed ({i} of {total}) {BGREEN(pv)}")
         print()
         einfo("GNU info directory index is up-to-date.")
+        pending_notice(load_conf())
 
     def search(self, terms, desc):
         for term in terms:
@@ -1144,6 +1168,412 @@ def print_search_hit(name, avail, inst, desc, size):
     print()
 
 # ---------------------------------------------------------------------------
+# CONFIG_PROTECT / dispatch-conf: deferred config-file merging
+# ---------------------------------------------------------------------------
+#
+# Debian already parks updated config files beside the originals -- dpkg
+# writes <file>.dpkg-dist, ucf writes <file>.ucf-dist -- which is exactly
+# Portage's ._cfg0000_<file> mechanism under a different name. What Debian
+# lacks is (a) a batched review tool, (b) an archive of the *previously
+# shipped* version, and therefore (c) any hunk-level merging: dpkg can only
+# offer whole-file choices.
+#
+# So: force dpkg to always defer (--force-confold --force-confdef), archive
+# each package's as-shipped config files at merge time, and use last time's
+# archive as the common ancestor for a real 3-way merge next time.
+
+CONF_FILE      = "/etc/emerge/dispatch-conf.conf"
+CONF_FILE_ALT  = "/etc/dispatch-conf.conf"
+ARCHIVE_DIR    = "/var/lib/emerge/config-archive"
+UCF_CACHE      = "/var/lib/ucf/cache"
+
+DEFAULT_CONF = {
+    "archive-dir":          ARCHIVE_DIR,
+    "config-protect":       "/etc",
+    "config-protect-mask":  "",
+    "frozen-files":         "",
+    "automerge":            "yes",   # apply conflict-free 3-way merges
+    "replace-unmodified":   "yes",   # you never touched it -> take theirs
+    "replace-wscomments":   "yes",   # only comments/whitespace differ
+    "mergetool":            "",      # e.g. "meld {mine} {base} {theirs} -o {output}"
+    "merge":                "",      # dispatch-conf compat: "cmd '%s' '%s' '%s'"
+    "diff":                 "",      # external diff for display; empty = built-in
+}
+
+PENDING_SUFFIXES = (".dpkg-dist", ".dpkg-new", ".ucf-dist", ".ucf-new")
+CFG_RE = re.compile(r"^\._cfg\d{4}_(?P<name>.+)$")
+
+def load_conf():
+    conf = dict(DEFAULT_CONF)
+    for path in (CONF_FILE_ALT, CONF_FILE):        # /etc/emerge wins
+        if not os.path.isfile(path):
+            continue
+        for line in open(path, errors="replace"):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            k, v = k.strip(), v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1]
+            if k in conf:
+                conf[k] = v
+    return conf
+
+def conf_yes(conf, key):
+    return conf.get(key, "no").lower() in ("yes", "true", "1", "on")
+
+# -- pure-Python 3-way merge (diff3 -m equivalent) --------------------------
+
+def _sync_regions(base, mine, theirs):
+    """Regions where all three sequences agree, in ascending order."""
+    ma = difflib.SequenceMatcher(None, base, mine,
+                                 autojunk=False).get_matching_blocks()
+    mb = difflib.SequenceMatcher(None, base, theirs,
+                                 autojunk=False).get_matching_blocks()
+    cand = []
+    for ba, ja, na in ma:
+        for bb, jb, nb in mb:
+            lo, hi = max(ba, bb), min(ba + na, bb + nb)
+            if hi > lo:
+                cand.append((lo, hi, ja + (lo - ba), jb + (lo - bb)))
+    cand.sort()
+    out, lb, lm, lt = [], 0, 0, 0
+    for lo, hi, m0, t0 in cand:
+        if lo >= lb and m0 >= lm and t0 >= lt:
+            out.append((lo, hi, m0, t0))
+            lb, lm, lt = hi, m0 + (hi - lo), t0 + (hi - lo)
+    return out
+
+def merge3(base, mine, theirs, labels=("current", "as-shipped", "new")):
+    """Three-way line merge. Returns (merged_lines, conflict_count).
+
+    Equivalent to `diff3 -m` / `git merge-file`: regions changed on only
+    one side are taken from that side, identical changes on both sides are
+    taken once, and genuine divergence is emitted with conflict markers."""
+    regions = _sync_regions(base, mine, theirs)
+    regions.append((len(base), len(base), len(mine), len(theirs)))
+    out, conflicts = [], 0
+    bi = mi = ti = 0
+    for lo, hi, m0, t0 in regions:
+        b, m, t = base[bi:lo], mine[mi:m0], theirs[ti:t0]
+        if m == b:
+            out.extend(t)                     # only they changed it
+        elif t == b:
+            out.extend(m)                     # only you changed it
+        elif m == t:
+            out.extend(m)                     # both made the same change
+        elif not (b or m or t):
+            pass
+        else:
+            conflicts += 1
+            out.append(f"<<<<<<< {labels[0]}\n")
+            out.extend(m)
+            out.append(f"||||||| {labels[1]}\n")
+            out.extend(b)
+            out.append("=======\n")
+            out.extend(t)
+            out.append(f">>>>>>> {labels[2]}\n")
+        out.extend(base[lo:hi])
+        bi, mi, ti = hi, m0 + (hi - lo), t0 + (hi - lo)
+    return out, conflicts
+
+def _significant(lines):
+    """Lines with comments and whitespace noise removed, for comparison."""
+    out = []
+    for l in lines:
+        s = l.strip()
+        if not s or s[0] in "#;" or s.startswith("//"):
+            continue
+        out.append(" ".join(s.split()))
+    return out
+
+def read_lines(path):
+    try:
+        with open(path, errors="replace") as f:
+            return f.readlines()
+    except OSError:
+        return None
+
+def color_diff(a, b, fromfile, tofile):
+    for line in difflib.unified_diff(a, b, fromfile, tofile, lineterm="\n"):
+        line = line.rstrip("\n")
+        if line.startswith("+"):   print(GREEN(line))
+        elif line.startswith("-"): print(RED(line))
+        elif line.startswith("@"): print(BCYAN(line))
+        else:                      print(line)
+
+# -- archive of as-shipped versions (the ancestor) --------------------------
+
+def archive_path(conf, path):
+    return os.path.join(conf["archive-dir"], path.lstrip("/"))
+
+def deb_conffiles(deb):
+    r = capture(["dpkg-deb", "-I", deb, "conffiles"])
+    if r.returncode != 0:
+        return []
+    return [l.strip() for l in r.stdout.splitlines()
+            if l.strip().startswith("/")]
+
+def archive_from_debs(conf, debs):
+    """Store each .deb's as-shipped config files -- next upgrade's ancestor."""
+    stored = 0
+    for deb in debs:
+        members = deb_conffiles(deb)
+        if not members:
+            continue
+        with tempfile.TemporaryDirectory() as td:
+            tar = subprocess.Popen(["dpkg-deb", "--fsys-tarfile", deb],
+                                   stdout=subprocess.PIPE)
+            subprocess.run(["tar", "-x", "-C", td]
+                           + ["." + m for m in members],
+                           stdin=tar.stdout, capture_output=True)
+            tar.stdout.close(); tar.wait()
+            for m in members:
+                src = os.path.join(td, m.lstrip("/"))
+                if not os.path.isfile(src):
+                    continue
+                dest = archive_path(conf, m)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.copy2(src, dest)
+                stored += 1
+    return stored
+
+def ancestor_for(conf, path):
+    """Previously shipped content: our archive, else ucf's cache."""
+    a = archive_path(conf, path)
+    lines = read_lines(a)
+    if lines is not None:
+        return lines, "archive"
+    lines = read_lines(os.path.join(UCF_CACHE, path.replace("/", ":")))
+    if lines is not None:
+        return lines, "ucf cache"
+    return None, None
+
+# -- scanning ---------------------------------------------------------------
+
+def protected_dirs(conf):
+    mask = conf["config-protect-mask"].split()
+    return [d for d in conf["config-protect"].split()
+            if os.path.isdir(d)], mask
+
+def masked(path, mask):
+    return any(path == m or path.startswith(m.rstrip("/") + "/") for m in mask)
+
+def scan_pending(conf):
+    """[(target_path, pending_path)] awaiting review."""
+    dirs, mask = protected_dirs(conf)
+    found = []
+    for root_dir in dirs:
+        for root, _, files in os.walk(root_dir):
+            for fn in files:
+                full = os.path.join(root, fn)
+                target = None
+                for suf in PENDING_SUFFIXES:
+                    if fn.endswith(suf):
+                        target = full[:-len(suf)]
+                        break
+                m = CFG_RE.match(fn)
+                if m:
+                    target = os.path.join(root, m.group("name"))
+                if target and not masked(target, mask) \
+                   and os.path.isfile(target):
+                    found.append((target, full))
+    return sorted(set(found))
+
+def pending_notice(conf):
+    pend = scan_pending(conf)
+    if not pend:
+        return
+    dirs = ", ".join(sorted({os.path.dirname(t) or "/" for t, _ in pend})[:3])
+    print()
+    ewarn(f"IMPORTANT: {len(pend)} config files in '{dirs}' need updating.")
+    ewarn("Type `emerge --dispatch-conf` to merge these files.")
+
+# -- the review workflow ----------------------------------------------------
+
+def run_mergetool(conf, base, mine, theirs, output):
+    """Hand off to a user-configured tool. Supports named placeholders and
+    dispatch-conf's positional '%s' order (output, mine, theirs)."""
+    tmpl = conf["mergetool"] or conf["merge"]
+    if not tmpl:
+        return False
+    if "{" in tmpl:
+        cmd = tmpl.format(base=shlex.quote(base or "/dev/null"),
+                          mine=shlex.quote(mine),
+                          theirs=shlex.quote(theirs),
+                          output=shlex.quote(output))
+    else:
+        cmd = tmpl % (output, mine, theirs)
+    return subprocess.call(cmd, shell=True) == 0
+
+def _write(path, lines):
+    """Replace in place, preserving mode/owner of the existing file."""
+    st = os.stat(path)
+    tmp = path + ".emerge-tmp"
+    with open(tmp, "w") as f:
+        f.writelines(lines)
+    os.chmod(tmp, st.st_mode)
+    try:
+        os.chown(tmp, st.st_uid, st.st_gid)
+    except PermissionError:
+        pass
+    os.replace(tmp, path)
+
+def _accept(target, pending, lines):
+    _write(target, lines)
+    os.unlink(pending)
+    einfo(f"Updated {BGREEN(target)}")
+
+def dispatch_conf(opts):
+    need_root()
+    conf = load_conf()
+    frozen = conf["frozen-files"].split()
+    pend = scan_pending(conf)
+    if not pend:
+        einfo("Nothing to merge; all config files are up to date.")
+        return
+    print(f"{BGREEN(' * ')}{len(pend)} config file(s) awaiting review.\n")
+    auto = skipped = 0
+
+    for target, pending in pend:
+        mine = read_lines(target)
+        theirs = read_lines(pending)
+        if mine is None or theirs is None:
+            continue
+
+        if mine == theirs:
+            os.unlink(pending)
+            auto += 1
+            continue
+        if target in frozen:
+            os.unlink(pending)
+            ewarn(f"{target} is frozen; update discarded.")
+            auto += 1
+            continue
+
+        base, src = ancestor_for(conf, target)
+
+        if base is not None and mine == base and conf_yes(conf,
+                                                          "replace-unmodified"):
+            _accept(target, pending, theirs)
+            print(f"    {GREEN('unmodified locally -- took the new version')}")
+            auto += 1
+            continue
+
+        if conf_yes(conf, "replace-wscomments") and \
+           _significant(mine) == _significant(theirs):
+            _accept(target, pending, theirs)
+            print(f"    {GREEN('comments/whitespace only -- auto-applied')}")
+            auto += 1
+            continue
+
+        merged, conflicts = (None, 0)
+        if base is not None:
+            merged, conflicts = merge3(base, mine, theirs)
+            if conflicts == 0 and conf_yes(conf, "automerge"):
+                _accept(target, pending, merged)
+                print(f"    {GREEN('3-way merge clean -- auto-merged')} "
+                      f"(ancestor: {src})")
+                auto += 1
+                continue
+
+        # interactive
+        print(f"\n{BLUE('=' * 72)}")
+        print(f"{BOLD(target)}")
+        if base is None:
+            ewarn("no archived ancestor yet -- 2-way review only "
+                  "(3-way merging starts from the next upgrade)")
+        elif conflicts:
+            ewarn(f"3-way merge against {src}: "
+                  f"{RED(str(conflicts))} conflict(s) need a decision")
+        print(f"{BLUE('=' * 72)}")
+        color_diff(mine, theirs, target, pending)
+
+        while True:
+            print(f"\n{BGREEN(' * ')}File: {BOLD(target)}")
+            opts_txt = [
+                f"  {GREEN('1)')} keep your current version (discard update)",
+                f"  {GREEN('2)')} use the new version (overwrite yours)",
+            ]
+            if merged is not None:
+                opts_txt.append(f"  {GREEN('3)')} use the merged version"
+                                + (f" ({RED('has conflict markers')})"
+                                   if conflicts else ""))
+                opts_txt.append(f"  {GREEN('4)')} edit the merged version "
+                                f"($EDITOR)")
+            opts_txt.append(f"  {GREEN('5)')} launch mergetool")
+            opts_txt.append(f"  {GREEN('6)')} show the diff again")
+            opts_txt.append(f"  {GREEN('s)')} skip this file")
+            opts_txt.append(f"  {GREEN('q)')} quit")
+            print("\n".join(opts_txt))
+            try:
+                choice = input("Action: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print(); choice = "q"
+
+            if choice == "1":
+                os.unlink(pending)
+                einfo(f"Kept {target}")
+                break
+            if choice == "2":
+                _accept(target, pending, theirs)
+                break
+            if choice == "3" and merged is not None:
+                _accept(target, pending, merged)
+                break
+            if choice == "4" and merged is not None:
+                editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") \
+                         or "vi"
+                with tempfile.NamedTemporaryFile("w", suffix=".merge",
+                                                 delete=False) as tf:
+                    tf.writelines(merged)
+                    tmp = tf.name
+                subprocess.call([editor, tmp])
+                edited = read_lines(tmp)
+                os.unlink(tmp)
+                if edited:
+                    _accept(target, pending, edited)
+                    break
+            elif choice == "5":
+                if not (conf["mergetool"] or conf["merge"]):
+                    eerror("no mergetool configured; set mergetool= in "
+                           f"{CONF_FILE}")
+                    continue
+                with tempfile.TemporaryDirectory() as td:
+                    bfile = os.path.join(td, "base")
+                    out = os.path.join(td, "out")
+                    if base is not None:
+                        open(bfile, "w").writelines(base)
+                    else:
+                        bfile = None
+                    shutil.copy2(target, out)
+                    if run_mergetool(conf, bfile, target, pending, out):
+                        res = read_lines(out)
+                        if res:
+                            _accept(target, pending, res)
+                            break
+                    eerror("mergetool did not produce a result.")
+            elif choice == "6":
+                color_diff(mine, theirs, target, pending)
+            elif choice == "s":
+                skipped += 1
+                break
+            elif choice == "q":
+                print()
+                einfo(f"{auto} file(s) handled automatically, "
+                      f"{skipped} skipped; the rest remain pending.")
+                return
+
+    print()
+    einfo(f"{auto} file(s) handled automatically, {skipped} skipped.")
+    left = len(scan_pending(conf))
+    if left:
+        ewarn(f"{left} config file(s) still need attention.")
+    else:
+        einfo("All config files are up to date.")
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1168,6 +1598,30 @@ Actions:
                  backend this delegates to `apt-get autoremove`, and apt's
                  auto/manual-install marks are the source of truth; on the
                  dpkg backend the world file is.
+
+   --dispatch-conf
+                 Reviews and merges config files left pending by a merge.
+                 Debian parks updated config files beside the originals
+                 (<file>.dpkg-dist from dpkg, <file>.ucf-dist from ucf) --
+                 the same idea as Portage's ._cfg0000_<file>, which is also
+                 recognised. emerge archives each package's as-shipped
+                 config files at merge time, so the previously shipped
+                 version serves as the common ancestor for a true 3-way
+                 merge of your edits against the new upstream version.
+                 Files you never modified, differences that are only
+                 comments or whitespace, and conflict-free merges are
+                 applied automatically; only genuine conflicts are put to
+                 you, with keep / replace / merged / $EDITOR / mergetool
+                 choices. Also reachable as `etc-update`, and by symlinking
+                 this script to dispatch-conf or etc-update.
+                 Configured by {CONF_FILE} (or
+                 {CONF_FILE_ALT}), keys:
+                 archive-dir, config-protect, config-protect-mask,
+                 frozen-files, automerge, replace-unmodified,
+                 replace-wscomments, and mergetool -- e.g.
+                 mergetool="meld {{mine}} {{base}} {{theirs}} -o {{output}}"
+                 or dispatch-conf's own positional form
+                 merge="sdiff --suppress-common-lines --output='%s' '%s' '%s'"
 
    --search (-s) Searches for matches of the supplied string in the synced
                  tree. The search string is a case-insensitive regular
@@ -1306,7 +1760,7 @@ def main(argv):
     opts = {k: False for k in ("ask", "verbose", "pretend", "update", "deep",
                                "fetchonly", "oneshot", "search", "searchdesc",
                                "unmerge", "depclean", "sync",
-                               "buildpkg", "buildpkgonly")}
+                               "buildpkg", "buildpkgonly", "dispatch")}
     pkgs, backend_flag = [], None
     if not argv:
         print(HELP); return
@@ -1317,6 +1771,8 @@ def main(argv):
             opts["sync"] = True; continue
         if arg == "--depclean":
             opts["depclean"] = True; continue
+        if arg in ("--dispatch-conf", "--etc-update", "--config-update"):
+            opts["dispatch"] = True; continue
         if arg in ("--help", "-h"):
             print(HELP); return
         if arg == "--version":
@@ -1353,6 +1809,9 @@ def main(argv):
                 pkgs.append("@selected")
             else:
                 pkgs.append(arg)
+
+    if opts["dispatch"]:
+        dispatch_conf(opts); return
 
     be = pick_backend(backend_flag)
 
@@ -1448,6 +1907,11 @@ def main(argv):
 
 if __name__ == "__main__":
     try:
-        main(sys.argv[1:])
+        # `ln -s emerge /usr/sbin/dispatch-conf` (or etc-update) just works
+        _self = os.path.basename(sys.argv[0])
+        _args = sys.argv[1:]
+        if _self in ("dispatch-conf", "etc-update"):
+            _args = ["--dispatch-conf"] + _args
+        main(_args)
     except KeyboardInterrupt:
         print(f"\n\n{RED('!!!')} Interrupted."); sys.exit(130)
