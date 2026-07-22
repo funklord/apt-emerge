@@ -693,7 +693,6 @@ class DpkgBackend:
         if opts["fetchonly"]:
             einfo("Fetch complete."); return
         conf = load_conf()
-        archive_from_debs(conf, debs)
         print()
         total = len(self._plan)
         # deps were appended after their dependents: unpack in reverse
@@ -715,6 +714,7 @@ class DpkgBackend:
             pv = f"{st['Package']}-{st['Version']}"
             print(f"{ARROW} Installing ({i} of {total}) {BGREEN(pv)}")
             print(f"{ARROW} Completed ({i} of {total}) {BGREEN(pv)}")
+        archive_settled(conf, [st["Package"] for st in self._plan])
         atoms = getattr(self, "_atoms", [])
         if not opts["oneshot"] and atoms:
             w = self._read_world() | set(atoms)
@@ -901,17 +901,6 @@ class AptBackend:
             if rc == 0:
                 einfo("Fetch complete.")
             sys.exit(rc)
-        # fetch first so the as-shipped config files can be archived before
-        # dpkg touches /etc -- these become the ancestor for the next upgrade
-        r = capture(["apt-get", "-y", "-q", "-d"] + self._action)
-        if r.returncode == 0:
-            debs = [os.path.join("/var/cache/apt/archives", f)
-                    for f in os.listdir("/var/cache/apt/archives")
-                    if f.endswith(".deb")]
-            names = {m[0] for m in merges}
-            archive_from_debs(conf, [d for d in debs
-                                     if os.path.basename(d).split("_")[0]
-                                     in names])
         total = len(merges)
         order = {m[0]: i + 1 for i, m in enumerate(merges)}
         vers  = {m[0]: m[1] for m in merges}
@@ -943,6 +932,7 @@ class AptBackend:
                   f"(apt manual-install marks)")
             print(f"{ARROW} {BGREEN('Auto-cleaning packages...')}\n")
             einfo("GNU info directory index is up-to-date.")
+            archive_settled(conf, [m[0] for m in merges])
             pending_notice(conf)
         else:
             print(f"{RED('!!!')} {BOLD('emerge failed; see output above.')}")
@@ -1308,36 +1298,38 @@ def color_diff(a, b, fromfile, tofile):
 def archive_path(conf, path):
     return os.path.join(conf["archive-dir"], path.lstrip("/"))
 
-def deb_conffiles(deb):
-    r = capture(["dpkg-deb", "-I", deb, "conffiles"])
-    if r.returncode != 0:
-        return []
-    return [l.strip() for l in r.stdout.splitlines()
-            if l.strip().startswith("/")]
+def pkg_conffiles(pkg):
+    """Config files dpkg tracks for an installed package."""
+    r = capture(["dpkg-query", "-W", "-f=${Conffiles}\n", pkg])
+    out = []
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if parts and parts[0].startswith("/") and "obsolete" not in parts[-1:]:
+            out.append(parts[0])
+    return out
 
-def archive_from_debs(conf, debs):
-    """Store each .deb's as-shipped config files -- next upgrade's ancestor."""
-    stored = 0
-    for deb in debs:
-        members = deb_conffiles(deb)
-        if not members:
-            continue
-        with tempfile.TemporaryDirectory() as td:
-            tar = subprocess.Popen(["dpkg-deb", "--fsys-tarfile", deb],
-                                   stdout=subprocess.PIPE)
-            subprocess.run(["tar", "-x", "-C", td]
-                           + ["." + m for m in members],
-                           stdin=tar.stdout, capture_output=True)
-            tar.stdout.close(); tar.wait()
-            for m in members:
-                src = os.path.join(td, m.lstrip("/"))
-                if not os.path.isfile(src):
-                    continue
-                dest = archive_path(conf, m)
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
-                shutil.copy2(src, dest)
-                stored += 1
-    return stored
+def _store_ancestor(conf, target, source):
+    dest = archive_path(conf, target)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copy2(source, dest)
+
+def archive_settled(conf, packages):
+    """Record the as-shipped state of config files AFTER a merge.
+
+    Timing matters: only files dpkg installed without parking (i.e. you had
+    not modified them, so on-disk == as-shipped) are archived here. Files
+    that were parked deliberately keep their older archive entry -- that is
+    precisely the ancestor dispatch-conf needs -- and are re-archived from
+    the parked copy once resolved."""
+    n = 0
+    for pkg in packages:
+        for path in pkg_conffiles(pkg):
+            if any(os.path.exists(path + s) for s in PENDING_SUFFIXES):
+                continue
+            if os.path.isfile(path):
+                _store_ancestor(conf, path, path)
+                n += 1
+    return n
 
 def ancestor_for(conf, path):
     """Previously shipped content: our archive, else ucf's cache."""
@@ -1420,9 +1412,15 @@ def _write(path, lines):
         pass
     os.replace(tmp, path)
 
-def _accept(target, pending, lines):
-    _write(target, lines)
+def _retire(conf, target, pending):
+    """The parked file is what the package now ships: it becomes the ancestor
+    for the next upgrade, whatever the user decided to keep on disk."""
+    _store_ancestor(conf, target, pending)
     os.unlink(pending)
+
+def _accept(conf, target, pending, lines):
+    _write(target, lines)
+    _retire(conf, target, pending)
     einfo(f"Updated {BGREEN(target)}")
 
 def dispatch_conf(opts):
@@ -1443,11 +1441,11 @@ def dispatch_conf(opts):
             continue
 
         if mine == theirs:
-            os.unlink(pending)
+            _retire(conf, target, pending)
             auto += 1
             continue
         if target in frozen:
-            os.unlink(pending)
+            _retire(conf, target, pending)
             ewarn(f"{target} is frozen; update discarded.")
             auto += 1
             continue
@@ -1456,14 +1454,14 @@ def dispatch_conf(opts):
 
         if base is not None and mine == base and conf_yes(conf,
                                                           "replace-unmodified"):
-            _accept(target, pending, theirs)
+            _accept(conf, target, pending, theirs)
             print(f"    {GREEN('unmodified locally -- took the new version')}")
             auto += 1
             continue
 
         if conf_yes(conf, "replace-wscomments") and \
            _significant(mine) == _significant(theirs):
-            _accept(target, pending, theirs)
+            _accept(conf, target, pending, theirs)
             print(f"    {GREEN('comments/whitespace only -- auto-applied')}")
             auto += 1
             continue
@@ -1472,7 +1470,7 @@ def dispatch_conf(opts):
         if base is not None:
             merged, conflicts = merge3(base, mine, theirs)
             if conflicts == 0 and conf_yes(conf, "automerge"):
-                _accept(target, pending, merged)
+                _accept(conf, target, pending, merged)
                 print(f"    {GREEN('3-way merge clean -- auto-merged')} "
                       f"(ancestor: {src})")
                 auto += 1
@@ -1513,14 +1511,14 @@ def dispatch_conf(opts):
                 print(); choice = "q"
 
             if choice == "1":
-                os.unlink(pending)
+                _retire(conf, target, pending)
                 einfo(f"Kept {target}")
                 break
             if choice == "2":
-                _accept(target, pending, theirs)
+                _accept(conf, target, pending, theirs)
                 break
             if choice == "3" and merged is not None:
-                _accept(target, pending, merged)
+                _accept(conf, target, pending, merged)
                 break
             if choice == "4" and merged is not None:
                 editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") \
@@ -1533,7 +1531,7 @@ def dispatch_conf(opts):
                 edited = read_lines(tmp)
                 os.unlink(tmp)
                 if edited:
-                    _accept(target, pending, edited)
+                    _accept(conf, target, pending, edited)
                     break
             elif choice == "5":
                 if not (conf["mergetool"] or conf["merge"]):
@@ -1551,7 +1549,7 @@ def dispatch_conf(opts):
                     if run_mergetool(conf, bfile, target, pending, out):
                         res = read_lines(out)
                         if res:
-                            _accept(target, pending, res)
+                            _accept(conf, target, pending, res)
                             break
                     eerror("mergetool did not produce a result.")
             elif choice == "6":
