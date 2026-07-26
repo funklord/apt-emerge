@@ -96,6 +96,13 @@ DISTFILES = "/var/cache/emerge-dpkg/distfiles"
 BINPKGS   = "/var/cache/emerge-dpkg/binpkgs"      # PKGDIR for -b/-B products
 STATUS    = "/var/lib/dpkg/status"
 
+# Single source of truth for what -V prints; the notice at the top of this
+# file is a comment and cannot be shared with it, so keep the two in step.
+VERSION   = "3.0.66-deb"
+AUTHOR    = "Nabeel Sowan <nabeel@vibes.se>"
+COPYRIGHT = "Copyright (C) 2026 " + AUTHOR
+LICENCE   = "GPL-2.0-or-later"
+
 # ---------------------------------------------------------------------------
 # Portage colours & message helpers
 # ---------------------------------------------------------------------------
@@ -3056,8 +3063,9 @@ Actions:
                  would break reverse dependencies are refused unless --ask
                  is given.
 
-   --version     Displays the version number of emerge and the active
-                 backend.
+   --version (-V)
+                 Displays the version number of emerge, the active backend,
+                 and the copyright and licence.
 
 Options:
    --ask (-a)    Before performing the merge, display what packages will be
@@ -3248,10 +3256,14 @@ def main(argv):
             continue
         if arg in ("--help", "-h"):
             print(HELP); return
-        if arg == "--version":
+        if arg in ("--version", "-V"):
             b = pick_backend(backend_flag)
-            print(f"Portage 3.0.66-deb (python {sys.version.split()[0]}, "
+            print(f"Portage {VERSION} (python {sys.version.split()[0]}, "
                   f"{b.name} backend)")
+            print(f"emerge for Debian -- {COPYRIGHT}")
+            print(f"Licence {LICENCE}: GNU GPL version 2 or later. This is "
+                  f"free software;")
+            print("there is NO WARRANTY, to the extent permitted by law.")
             return
         if arg in LONG_FLAGS:
             arg = "-" + LONG_FLAGS[arg]

@@ -132,11 +132,15 @@ covered:
 `project.md` carries the design notes, the reasoning behind the parts that
 went through several revisions, and the mistakes worth not repeating.
 
+## Author
+
+Nabeel Sowan <nabeel@vibes.se>
+
 ## Licence
 
-GPL-2.0-or-later. See [LICENSE](LICENSE).
+GPL-2.0-or-later — see [LICENSE](LICENSE).
 
-Copyright (C) 2026 Nabeel Sowan &lt;nabeel@vibes.se&gt;
+Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>
 
 This program is free software; you can redistribute it and/or modify it
 under the terms of the GNU General Public License as published by the Free

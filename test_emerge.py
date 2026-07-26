@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import tokenize
+import types
 import unittest
 import urllib.error
 
@@ -1376,6 +1377,51 @@ class TestArgParsing(unittest.TestCase):
             with self.subTest(name=name):
                 self.setUp()
                 self.assertAccepted(["-u", name])
+
+    # -- version ------------------------------------------------------------
+
+    def version_output(self, argv):
+        self.mod.pick_backend = lambda _f: types.SimpleNamespace(name="apt")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.mod.main(argv)
+        return buf.getvalue()
+
+    def test_dash_capital_v_is_accepted(self):
+        """Portage spells it -V; -v is verbose and must stay that way."""
+        self.assertIn("Portage", self.version_output(["-V"]))
+
+    def test_long_and_short_version_agree(self):
+        self.assertEqual(self.version_output(["-V"]),
+                         self.version_output(["--version"]))
+
+    def test_version_names_the_author(self):
+        out = self.version_output(["-V"])
+        self.assertIn(em.AUTHOR, out)
+        self.assertIn("@", em.AUTHOR, "the author line should carry an email")
+
+    def test_version_states_copyright_and_licence(self):
+        out = self.version_output(["-V"])
+        self.assertIn(em.COPYRIGHT, out)
+        self.assertIn(em.LICENCE, out)
+        self.assertIn("NO WARRANTY", out)
+
+    def test_version_reports_the_backend_and_interpreter(self):
+        out = self.version_output(["-V"])
+        self.assertIn("apt backend", out)
+        self.assertIn(sys.version.split()[0], out)
+
+    def test_the_file_header_and_version_output_agree(self):
+        """The notice at the top of emerge is a comment and cannot share the
+        constant, so check the two have not drifted apart."""
+        with open(os.path.join(HERE, "emerge")) as f:
+            header = "".join(f.readline() for _ in range(25))
+        self.assertIn(em.AUTHOR, header)
+        self.assertIn(em.COPYRIGHT, header)
+        self.assertIn(em.LICENCE, header)
+
+    def test_lowercase_v_is_still_verbose(self):
+        self.assertAccepted(["-v", "nano"])
 
     def test_help_returns_without_building_a_backend(self):
         out = self.parse(["--help"])
