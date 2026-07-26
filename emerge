@@ -168,6 +168,10 @@ def stream_apt(proc, handler, keep=400):
         buffered.append(line)
         if len(buffered) > keep:
             del buffered[0]
+    try:
+        proc.stdout.close()          # we read it to EOF; don't leak the pipe
+    except OSError:
+        pass
     rc = proc.wait()
     if rc != 0 and buffered:
         print()
@@ -1034,7 +1038,8 @@ def read_sources():
     for path in files:
         if not os.path.isfile(path):
             continue
-        text = open(path).read()
+        with open(path, errors="replace") as f:
+            text = f.read()
         if path.endswith(".sources"):
             for st in parse_stanzas(text):
                 if "deb" not in st.get("Types", ""):
@@ -1331,7 +1336,8 @@ class DpkgBackend:
     def _read_world(self):
         if not os.path.exists(WORLD):
             return set()
-        return {l.strip() for l in open(WORLD) if l.strip()}
+        with open(WORLD) as f:
+            return {l.strip() for l in f if l.strip()}
 
     def _write_world(self, names):
         os.makedirs(LIB_DIR, exist_ok=True)
@@ -2348,6 +2354,10 @@ class AptBackend:
                 stderr=subprocess.STDOUT)
             for line in stream_lines(proc.stdout):
                 print(line)
+            try:
+                proc.stdout.close()      # read to EOF; don't leak the pipe
+            except OSError:
+                pass
             if proc.wait() != 0:
                 print(f"\n{RED('!!!')} {BOLD(f'compile failed for {atom}')}")
                 sys.exit(1)
@@ -2521,7 +2531,9 @@ def load_conf():
     for path in (CONF_FILE_ALT, CONF_FILE):        # /etc/emerge wins
         if not os.path.isfile(path):
             continue
-        for line in open(path, errors="replace"):
+        with open(path, errors="replace") as f:
+            lines = f.readlines()
+        for line in lines:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue

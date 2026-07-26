@@ -452,10 +452,18 @@ Always `python3 -m py_compile emerge` after edits.
 ~0.7s.
 
 `test_integration.py` is the end-to-end half: real `.debs` built with
-`dpkg-deb`, a real `file://` repository, a real dpkg install, and the real
-resolver deciding what to do. It is the **only** place `merge`, `unmerge`,
-`depclean` and the download/SHA256 path actually execute — everything else
-uses fakes. It needs no privileges: `dpkg --root=<scratch> --force-not-root`
+`dpkg-deb`, a real `file://` repository, real installs, and the real resolver
+deciding what to do. It is the **only** place `merge`, `unmerge`, `depclean`,
+the download/SHA256 path and `--oneshot` actually execute — everything else
+uses fakes. It covers *both* backends:
+
+- **dpkg** — `dpkg --root=<scratch> --force-not-root`.
+- **apt** — every piece of apt state redirected (`Dir::State::status`,
+  `::lists`, `::extended_states`, `Dir::Cache`, `Dir::Log`, `Dir::Etc::*`)
+  plus `DPkg::Options::=--root=...`, so a real `apt-get install` runs
+  unprivileged into a scratch tree. That is how `--oneshot` was finally
+  verified end to end, including that it does not evict a package already in
+  `@world`. It needs no privileges: `dpkg --root=<scratch> --force-not-root`
 unpacks into a tree you own, and every path constant in the module is
 repointed under a temp directory. The file skips itself if that does not
 work. Two things it gets right that are easy to get wrong when extending it:
@@ -541,16 +549,11 @@ write surface ever needs testing.
    `--with`, unmerge, depclean), so what remains untested is only the
    genuinely hardware-specific part: a box with no `apt-get` at all, and
    sync over real http rather than `file://`.
-8. **`-1`/`--oneshot` cannot work on the apt backend as things stand.**
-   `@selected` *is* `apt-mark showmanual`, and `apt-get install` writes that
-   mark itself, so the only way to honour the flag is `apt-mark auto` after
-   the install — which hard rule 3 ("the only apt-mark call anywhere is
-   showmanual") forbids. It currently warns that the flag has no effect and
-   prints the `apt-mark auto` command to run by hand. **This needs an owner
-   decision:** relax the rule (the rule's stated purpose is avoiding version
-   *pins*, and the auto/manual flag is set membership, not a pin — a crash
-   before it leaves the package in `@world`, which is the default anyway), or
-   accept the flag as apt-only-unsupported and say so in `--help`.
+8. ~~`-1`/`--oneshot` on the apt backend~~ — **done**. The owner relaxed hard
+   rule 3 (see it: the version-pin ban is intact, only the blanket `apt-mark`
+   ban was too broad). `--oneshot` now marks the newly-added atoms back to
+   auto after the install, never touching one that was already in `@world`.
+   Verified end to end in `test_integration.py` against a real apt install.
 
 ---
 
