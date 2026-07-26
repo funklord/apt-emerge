@@ -1138,6 +1138,80 @@ class TestPolicyBatch(unittest.TestCase):
         self.assertNotIn("nosuchpkg", got)
 
 
+class TestPrompts(unittest.TestCase):
+    """The two confirmation prompts default in opposite directions on
+    purpose, and both are the last thing standing between a user and an
+    irreversible action. A future edit flipping either would silently
+    auto-confirm things like an 868-package unmerge, so pin them."""
+
+    def setUp(self):
+        self.mod = load()
+
+    def answer(self, text):
+        self.mod.input = lambda prompt="": text
+
+    def refuse(self, exc):
+        def boom(prompt=""):
+            raise exc
+        self.mod.input = boom
+
+    def ask_continue(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return self.mod.ask_continue()
+
+    def ask_yesno(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return self.mod.ask_yesno("risky?")
+
+    # -- ask_continue: proceeding is the default, as in Portage -------------
+
+    def test_continue_defaults_to_yes_on_a_bare_return(self):
+        self.answer("")
+        self.assertTrue(self.ask_continue())
+
+    def test_continue_accepts_the_usual_spellings(self):
+        for text in ("y", "Y", "yes", "YES", " yes "):
+            with self.subTest(text=text):
+                self.answer(text)
+                self.assertTrue(self.ask_continue())
+
+    def test_continue_treats_anything_else_as_no(self):
+        for text in ("n", "no", "q", "yeah", "later"):
+            with self.subTest(text=text):
+                self.answer(text)
+                self.assertFalse(self.ask_continue())
+
+    # -- ask_yesno: declining is the default, for risky confirmations -------
+
+    def test_yesno_defaults_to_no_on_a_bare_return(self):
+        """Used to allow session-critical packages to move. Silence must
+        never be consent here."""
+        self.answer("")
+        self.assertFalse(self.ask_yesno())
+
+    def test_yesno_needs_an_explicit_yes(self):
+        for text in ("y", "Y", "yes", " YES "):
+            with self.subTest(text=text):
+                self.answer(text)
+                self.assertTrue(self.ask_yesno())
+
+    def test_yesno_rejects_everything_else(self):
+        for text in ("n", "no", "sure", "ok", "1"):
+            with self.subTest(text=text):
+                self.answer(text)
+                self.assertFalse(self.ask_yesno())
+
+    # -- neither may proceed when there is nobody to ask --------------------
+
+    def test_both_decline_at_end_of_input(self):
+        for exc in (EOFError, KeyboardInterrupt):
+            with self.subTest(exc=exc.__name__):
+                self.refuse(exc)
+                self.assertFalse(self.ask_continue())
+                self.refuse(exc)
+                self.assertFalse(self.ask_yesno())
+
+
 class TestPortability(unittest.TestCase):
     """emerge is stdlib-only so it can be scp'd onto whatever a target box
     runs, which is not necessarily a current Python. Syntax that only a new

@@ -487,6 +487,22 @@ both reimplement something with an existing reference — keep them that way:
 
 Both skip themselves if the tool is missing, so the suite runs off a Debian box.
 
+**Run the CI matrix locally before pushing.** `uv` fetches real
+interpreters in seconds, which is the only honest way to check portability:
+
+```sh
+uv python install 3.9 3.11
+for v in 3.9 3.11 3.13; do
+    "$(uv python find $v)" -m unittest test_emerge test_integration
+done
+LC_ALL=C python3 -m unittest test_emerge test_integration   # C locale
+python3 -W error::ResourceWarning -m unittest test_emerge test_integration
+```
+
+That covers everything CI does except the `debian:trixie` container, which
+runs as **root** — the one condition not reproducible here, and the one that
+caught a test reading real `/proc`.
+
 **Tests must not depend on the machine they run on.** Two escaped review
 and were caught only by CI, both passing here for reasons that had nothing
 to do with what they claimed to check:
