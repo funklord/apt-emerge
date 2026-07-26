@@ -96,6 +96,12 @@ def einfo(m):  print(f"{BGREEN(' * ')}{m}")
 def ewarn(m):  print(f"{YELLOW(' * ')}{m}")
 def eerror(m): print(f"{RED(' * ')}{m}", file=sys.stderr)
 
+def eblock(msg):
+    """Print a (possibly multi-line) error with !!! on every line, so a
+    wrapped list stays readable and no line looks unmarked."""
+    for line in str(msg).split("\n"):
+        print(f"{RED('!!!')} {line}")
+
 def need_root():
     if os.geteuid() != 0:
         eerror("Superuser access is required... exiting.")
@@ -181,6 +187,39 @@ _OPS = {"<<": lambda r: r < 0, "<=": lambda r: r <= 0, "=": lambda r: r == 0,
 
 def meets(version, op, want):
     return _OPS[op](vercmp(version, want))
+
+def _dep_ok(alt, inst, chosen, iprov, prov_index):
+    """Is a single dependency alternative (name, op, ver) already satisfied
+    by an installed or already-chosen package (or a Provides of one)?"""
+    name, op, ver = alt
+    if name in chosen:
+        return op is None or meets(chosen[name]["Version"], op, ver)
+    if name in inst:
+        if op is None or meets(inst[name]["Version"], op, ver):
+            return True
+    if op is None:
+        if name in iprov:
+            return True
+        if any(p in chosen for p, _ in prov_index.get(name, [])):
+            return True
+    else:
+        for _, pv in iprov.get(name, []):
+            if pv and meets(pv, op, ver):
+                return True
+    return False
+
+def _ndu_blocker(name, iv, why, cons):
+    consread = ", ".join(f"{op} {v}" for op, v in cons if op) or "any"
+    tail = f" (pulled in by {why})" if why else ""
+    if iv and iv != "?":
+        return (f"--no-dep-upgrade: {BOLD(name)} is installed at {iv} but "
+                f"a dependency needs {consread}{tail}.\n"
+                f"    keeping it would break the dependency; upgrading it is "
+                f"what --no-dep-upgrade is avoiding.")
+    return (f"--no-dep-upgrade: no version of {BOLD(name)}{tail} avoids "
+            f"upgrading an already-installed package.\n"
+            f"    every version new enough to satisfy {consread} pulls an "
+            f"installed dependency up.")
 
 # ---------------------------------------------------------------------------
 # Control-file parsing
@@ -694,58 +733,185 @@ class DpkgBackend:
                 if old is not None and vercmp(newv, old) > 0]
 
     def _resolve_no_upgrade(self, worklist, atoms, inst, iprov, update):
-        """Find, per target, the newest version whose full closure upgrades
-        nothing already installed. Backtracks through older versions of each
-        target independently; a target that must upgrade a dep at every
-        version is reported as the blocker."""
-        pins = {}
-        # Resolve targets one at a time so each can be downgraded in isolation
-        # while seeing the pins already chosen for earlier targets.
-        real_targets = [t for t in worklist
-                        if t in self.versions or t in self.pkgs
-                        or t in self.provides]
-        blockers = []
-        for t in real_targets:
-            versions = self.versions.get(t)
-            if not versions:
-                continue
-            iv = inst.get(t, {}).get("Version")
-            chosen = None
-            last_bad = None
-            for st in versions:                    # newest first
-                if iv and vercmp(st["Version"], iv) < 0:
-                    break                          # don't downgrade below inst
-                trial = dict(pins); trial[t] = st
-                try:
-                    merges = self._resolve_inner(
-                        [t], atoms, inst, iprov, update, trial)
-                except RuntimeError:
-                    continue                       # this version won't resolve
-                ups = [u for u in self._upgrades_in(merges, inst) if u != t]
-                if not ups:
-                    chosen = st
-                    break
-                last_bad = (st["Version"], ups)
-            if chosen is None:
-                if last_bad:
-                    blockers.append((t, last_bad[0], last_bad[1]))
-                else:
-                    blockers.append((t, iv or "?", ["(no satisfiable version)"]))
-            else:
-                pins[t] = chosen
+        """Portage-style downgrade search over the WHOLE closure, not just
+        the targets. For every package that must be selected -- target or
+        dependency -- choose the LOWEST version that satisfies the
+        constraints gathered so far and is not older than any installed
+        copy, preferring the installed version itself when it qualifies.
 
-        if blockers:
-            lines = ["--no-dep-upgrade: no version avoids upgrading "
-                     "installed dependencies:"]
-            for t, ver, ups in blockers:
-                shown = ", ".join(sorted(set(ups))[:8])
-                lines.append(f"      {BOLD(t)} (best: {ver}) would need to "
-                             f"upgrade: {shown}")
+        A package is therefore upgraded only when some constraint genuinely
+        forces it past the installed version; if an older version of an
+        intermediate dependency keeps the graph on already-installed
+        versions, that older one is taken. When a newly discovered
+        constraint rules out an earlier greedy pick, the offending package
+        is re-selected upward and its subtree recomputed. If a package is
+        driven above its installed version with no way down, it is a
+        genuine blocker and reported."""
+        versions = self.versions          # name -> [stanza] newest-first
+
+        def all_versions(name):
+            v = versions.get(name)
+            if v is not None:
+                return v
+            st = self.pkgs.get(name)
+            return [st] if st else []
+
+        # constraints[name] = list of (op, ver) that must all hold
+        constraints = {}
+        chosen = {}                       # name -> stanza
+        forced = {}                       # name -> why (for blocker report)
+
+        def satisfies(ver, cons):
+            return all(meets(ver, op, v) for op, v in cons if op)
+
+        rejected = {}     # name -> set of versions ruled out (force upgrades)
+        clash_blame = {}  # not-installed name -> installed pkg it keeps hitting
+
+        def pick(name):
+            """The no-dep-upgrade version rule:
+              * installed & satisfies the constraints -> keep exactly the
+                installed version (never version-searched);
+              * installed & does NOT satisfy -> None (a genuine wall);
+              * not installed -> newest satisfying version not yet rejected
+                for forcing an installed upgrade; the loop rejects and
+                re-picks downward as it discovers such conflicts."""
+            cons = constraints.get(name, [])
+            iv = inst.get(name, {}).get("Version")
+            if iv is not None:
+                if satisfies(iv, cons):
+                    return {"Package": name, "Version": iv, "_installed": True}
+                return None
+            bad = rejected.get(name, set())
+            cands = [s for s in all_versions(name)
+                     if satisfies(s["Version"], cons)
+                     and s["Version"] not in bad]
+            if not cands:
+                return None
+            return cands[0]      # all_versions is newest-first
+
+        def forces_installed_upgrade(st):
+            """If choosing st requires upgrading an installed package, return
+            (installed_pkg, op, ver) for the constraint that forces it, else
+            None."""
+            for field in ("Pre-Depends", "Depends"):
+                for alts in parse_depends(st.get(field, "")):
+                    if any(_dep_ok(a, inst, chosen, iprov, self.provides)
+                           for a in alts):
+                        continue
+                    dn, op, dv = alts[0]
+                    if op and dn in inst and not meets(inst[dn]["Version"],
+                                                       op, dv):
+                        return (dn, op, dv)
+            return None
+
+        # worklist of packages to (re)select
+        stack = list(dict.fromkeys(worklist))
+        guard = 0
+        while stack:
+            guard += 1
+            if guard > 200000:
+                raise RuntimeError("--no-dep-upgrade: resolution did not "
+                                   "converge (dependency cycle?)")
+            name = stack.pop(0)
+            if name not in self.pkgs and name not in versions:
+                if name in atoms:
+                    raise RuntimeError(f'there are no packages to satisfy '
+                                       f'"{name}"')
+                continue
+            st = pick(name)
+            if st is None:
+                iv = inst.get(name, {}).get("Version", "?")
+                # if this package bottomed out because every version forces
+                # an installed package up, name that installed package
+                blame = clash_blame.get(name)
+                if blame and iv in ("?", None):
+                    biv = inst.get(blame, {}).get("Version", "?")
+                    raise RuntimeError(_ndu_blocker(
+                        blame, biv, name, constraints.get(blame, [])))
+                raise RuntimeError(_ndu_blocker(name, iv, forced.get(name),
+                                                constraints.get(name, [])))
+
+            # For a NOT-installed package, if this version would force an
+            # installed package to upgrade, reject it and step to an older
+            # version instead (the core of --no-dep-upgrade).
+            if "_installed" not in st and name not in inst:
+                clash = forces_installed_upgrade(st)
+                if clash is not None:
+                    cn, cop, cv = clash
+                    rejected.setdefault(name, set()).add(st["Version"])
+                    clash_blame[name] = cn
+                    forced[cn] = name
+                    # record the constraint so the blocker message is precise
+                    cons = constraints.setdefault(cn, [])
+                    if (cop, cv) not in cons:
+                        cons.append((cop, cv))
+                    # drop anything we'd chosen under the rejected version and
+                    # re-pick this package from its next-older candidate
+                    chosen.pop(name, None)
+                    stack.insert(0, name)
+                    continue
+
+            if chosen.get(name) is st:
+                continue
+            chosen[name] = st
+            for field in ("Pre-Depends", "Depends"):
+                for alts in parse_depends(st.get(field, "")):
+                    if any(_dep_ok(a, inst, chosen, iprov, self.provides)
+                           for a in alts):
+                        continue
+                    dn, op, dv = alts[0]
+                    real = dn
+                    if dn not in self.pkgs and dn not in versions:
+                        prov = self.provides.get(dn)
+                        if prov:
+                            real = prov[0][0]
+                        else:
+                            raise RuntimeError(f'cannot satisfy "{dn}" '
+                                               f'(required by {name})')
+                    if op:
+                        prev = constraints.setdefault(real, [])
+                        if (op, dv) not in prev:
+                            prev.append((op, dv))
+                            forced[real] = name
+                            if real in chosen:
+                                del chosen[real]
+                    if real not in chosen and real not in stack:
+                        stack.append(real)
+
+        # Build the merge plan from chosen versions, excluding no-ops
+        plan, merges = [], []
+        # deterministic order: targets first, then deps, matching install need
+        ordered = list(dict.fromkeys(
+            list(worklist) + [n for n in chosen if n not in worklist]))
+        for name in ordered:
+            st = chosen.get(name)
+            if st is None:
+                continue
+            old = inst.get(name, {}).get("Version")
+            if old and vercmp(st["Version"], old) == 0:
+                if not (name in atoms and not update):
+                    continue              # already satisfied; skip unless remerge
+            plan.append(st)
+            merges.append((name, st["Version"], old,
+                           int(st.get("Size", 0)), "ebuild", ""))
+
+        # Safety net: assert we truly upgrade nothing installed
+        ups = [n for n, nv, old, *_ in merges
+               if old is not None and vercmp(nv, old) > 0]
+        if ups:
+            # a constraint forced an unavoidable upgrade after all
+            details = {}
+            for n in ups:
+                details[n] = forced.get(n, "dependency")
+            lines = ["--no-dep-upgrade: no available version avoids "
+                     "upgrading already-installed dependencies."]
+            for n in sorted(set(ups)):
+                lines.append(f"    {BOLD(n)} must upgrade "
+                             f"(required by {details[n]})")
             raise RuntimeError("\n".join(lines))
 
-        # Final resolve with all target pins in place, so shared deps and
-        # ordering are computed once against the chosen set.
-        return self._resolve_inner(worklist, atoms, inst, iprov, update, pins)
+        self._plan = plan
+        return merges
 
     # -- fetch & install ----------------------------------------------------
 
@@ -995,8 +1161,15 @@ class AptBackend:
         return ups, None
 
     def _resolve_no_upgrade(self, atoms, members, update):
-        """Pick, per target, the newest version whose install upgrades no
-        already-installed package. Uses apt simulation per candidate."""
+        """Choose versions so nothing already installed is upgraded.
+
+        Per target, walk versions newest-first. For each candidate, if the
+        simulation would upgrade installed packages, retry with those held
+        at their installed versions (pkg=installed_ver) -- this lets apt
+        step an intermediate dependency DOWN to an older version that keeps
+        the graph on installed libs, the same search the dpkg backend does
+        over the whole closure. Only if apt cannot satisfy the target with
+        the offending packages held is it a genuine wall."""
         pins, blockers = [], []
         for t in atoms + members:
             iv = self._installed_version(t)
@@ -1008,32 +1181,58 @@ class AptBackend:
             chosen, last_bad = None, None
             for v in versions:
                 if iv and vercmp(v, iv) < 0:
-                    break                              # don't downgrade
+                    break                              # don't downgrade target
                 if iv and vercmp(v, iv) == 0 and update:
                     chosen = None                      # already current, -u
                     break
-                ups, err = self._simulate(pins + [f"{t}={v}"])
-                if err is not None:
-                    continue
-                ups = [u for u in ups if u != t]
-                if not ups:
-                    chosen = f"{t}={v}"
+                # iteratively hold whatever this candidate tries to upgrade
+                held = {}
+                spec = [f"{t}={v}"]
+                for _ in range(40):                    # bounded refinement
+                    ups, err = self._simulate(pins + spec
+                                              + [f"{h}={hv}"
+                                                 for h, hv in held.items()])
+                    if err is not None:
+                        break                          # holds made it unsat
+                    ups = [u for u in ups if u != t and u not in held]
+                    if not ups:
+                        chosen = spec + [f"{h}={hv}"
+                                         for h, hv in held.items()]
+                        break
+                    # hold each newly-upgraded installed package at its
+                    # current version and re-simulate
+                    progressed = False
+                    for u in ups:
+                        uiv = self._installed_version(u)
+                        if uiv and u not in held:
+                            held[u] = uiv; progressed = True
+                    if not progressed:
+                        last_bad = (v, ups)
+                        break
+                if chosen:
                     break
-                last_bad = (v, ups)
+                if last_bad is None:
+                    last_bad = (v, ["(unsatisfiable with deps held)"])
             if chosen:
-                pins.append(chosen)
+                pins.extend(chosen)
             elif last_bad:
                 blockers.append((t, last_bad[0], last_bad[1]))
         if blockers:
-            lines = ["--no-dep-upgrade: no version avoids upgrading "
-                     "installed dependencies:"]
+            lines = ["--no-dep-upgrade: no available version avoids "
+                     "upgrading already-installed dependencies."]
             for t, ver, ups in blockers:
-                shown = ", ".join(sorted(set(ups))[:8])
-                lines.append(f"      {BOLD(t)} (best: {ver}) would need to "
-                             f"upgrade: {shown}")
+                ups = sorted(set(ups))
+                lines.append(f"    {BOLD(t)} (newest tried: {ver}) could not "
+                             f"be installed while holding:")
+                for u in ups:
+                    lines.append(f"        {u}")
             raise RuntimeError("\n".join(lines))
-        self._action = ["install"] + pins
-        return pins
+        # de-dup pins (a held dep may recur across targets), last wins
+        seen = {}
+        for p in pins:
+            seen[p.split("=")[0]] = p
+        self._action = ["install"] + list(seen.values())
+        return list(seen.values())
 
     def resolve(self, targets, update=False, deep=False,
                 no_dep_upgrade=False):
@@ -2059,7 +2258,8 @@ def main(argv):
             merges = be.resolve_source(pkgs, opts)
         except RuntimeError as e:
             calc_deps_done(ok=False)
-            print(f"\n{RED('!!!')} {BOLD(str(e))}")
+            print()
+            eblock(str(e))
             sys.exit(1)
         calc_deps_done()
         if opts["pretend"] or opts["ask"] or opts["verbose"]:
@@ -2082,7 +2282,8 @@ def main(argv):
                             no_dep_upgrade=opts["no_dep_upgrade"])
     except RuntimeError as e:
         calc_deps_done(ok=False)
-        print(f"\n{RED('!!!')} {BOLD(str(e))}")
+        print()
+        eblock(str(e))
         sys.exit(1)
     calc_deps_done()
     if not merges:
