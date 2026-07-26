@@ -457,21 +457,25 @@ def same_upstream(v1, v2):
     return (upstream_version(v1) == upstream_version(v2)
             and vercmp(v1, v2) != 0)
 
-# Packages whose rebuild can restart the display server / session even
-# though it is not a reboot-class change. A same-upstream bump here is the
-# dangerous kind: allowing it may kill X/Wayland and every GUI app running.
 # --- session-critical detection ---------------------------------------------
 #
 # A package is "session-critical" if rebuilding it could restart the running
-# display server / compositor / desktop and take your GUI apps with it. Rather
-# than trust a hand-maintained list, we derive the set from the live system:
-# find the processes that ARE the graphical session, see which shared
-# libraries they have mapped, and map those files back to packages. That set
-# is exactly "code the session is currently running", per-machine and self-
-# updating. On a headless box no session is found, so nothing is critical.
+# display server / compositor / desktop and take your GUI apps with it. A
+# same-upstream bump here is the dangerous kind: it looks like a harmless
+# rebuild, and no reboot is involved, so an exclude-reboot filter would not
+# help either.
 #
-# The static set below is a fallback for when /proc can't be introspected
-# (unusual), and a fast-path recogniser.
+# Rather than trust a hand-maintained list, we derive the set from the live
+# system: find the processes that ARE the graphical session, see which
+# binaries and shared libraries they are running, and map those files back to
+# packages. That set is exactly "code the session is currently running",
+# per-machine and self-updating. On a headless box no session is found, so
+# nothing is critical.
+#
+# The static set below sits underneath that as a floor, not as an either/or
+# fallback. The live scan cannot see leaders we may not read (a hardened
+# compositor is root-only) and cannot see code the session dlopen()s later,
+# so on a running session both sets apply.
 
 _SESSION_CRITICAL_EXACT = {
     "libgl1", "libglx-mesa0", "libglapi-mesa", "libgbm1", "libegl1",

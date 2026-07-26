@@ -4,10 +4,14 @@ A Gentoo Portage–flavoured package manager for Debian/Ubuntu, implemented as a
 single stdlib-only Python 3 script. It speaks emerge's CLI dialect and paints
 Portage-style output, but drives real Debian tooling underneath.
 
-The current artifact is one file: `emerge` (~2600 lines). It has been developed
-and tested chat-side without persistent system access, which is why we're moving
-to Claude Code — several remaining tasks need a real Debian box, a session, and
-multi-version repos to test against.
+The current artifact is one file: `emerge` (~2900 lines), plus `test_emerge.py`
+(a dev-only test suite — not shipped, and it loads `emerge` by path rather than
+importing it, so the single-file rule is intact).
+
+Originally developed and tested chat-side without system access. It has since
+been run against a real Debian 13 (trixie) desktop with `trixie-updates` and
+`trixie-security` pockets, a live KDE Plasma Wayland session on sddm, and
+`gpgv` present — which is what the remaining tasks had been waiting for.
 
 ---
 
@@ -52,8 +56,9 @@ multi-version repos to test against.
 
 ## File layout (single file, top to bottom)
 
-Line numbers are approximate (as of ~2619 lines); use them as a map, re-grep
-after edits.
+Line numbers below are from the ~2619-line version and have all shifted by a
+few hundred since (the file is ~2900 lines now). Treat the *order* as the map
+and re-grep for anything specific.
 
 - **Imports + path constants** (~11–39): stdlib only; `lzma` is optional
   (minimal builds strip it — code falls back to `.gz`/plain). Paths:
@@ -184,6 +189,21 @@ atoms, update, allow)` over an abstract index with `all_versions(name)` /
   offering to allow just the listed movers and re-resolve. `NduWall.movers`
   carries the structured data driving both.
 
+**The guarantee is enforced on apt's plan, not just the solver's.** On the apt
+backend `resolve()` runs the solver, turns its choices into `pkg=version` pins,
+and then *re-simulates through `apt-get -s`* — and it is apt's plan that gets
+executed. Pinning the packages the solver chose does not stop apt from
+upgrading installed ones it was never told about, so `_wall_from_merges()` is
+applied to apt's simulation as well. Do not remove that second check: without
+it the flag silently did nothing on lockstep stacks (see below).
+
+**Virtual dependencies:** provider substitution triggers on "this name has no
+versions of its own", NOT on `index.has()`. `has()` is *true* for a virtual
+name precisely because something provides it, so testing it never fires and the
+virtual name lands on the stack as if real. Also note `_AptIndex.provides_of()`
+leaves an empty list behind as a "already probed" marker — `has()` must test
+`bool(self._provides.get(name))`, not key presence.
+
 **Known limitation (state honestly, don't claim completeness):** greedy with
 single-package backtracking, NOT a complete SAT solver. A graph solvable only
 by a non-obvious *combination* of older versions across two independent deps can
@@ -192,6 +212,31 @@ handing the whole constraint set to an external solver.
 
 **Scope/perf:** works on atoms and `@world`; per-target search, so large sets
 run many simulations and can be slow (accepted).
+
+### Validated against the live trixie tree (the libsdl3-dev case)
+
+`libsdl3-dev` is not installed on trixie and pulls the Mesa stack from
+`25.0.7-2` to `25.0.7-2+deb13u1` — 9 upgrades, 7 of them session-critical. This
+reproduces the originally reported failure exactly, and running it turned up
+three bugs, all now fixed and regression-tested:
+
+1. **apt's extra upgrades went unchecked** (the serious one). The
+   `no_dep_upgrade` branch of `AptBackend.resolve()` did not return; it fell
+   through to the apt simulation, which rebuilt the merge list from apt's
+   answer and overwrote the solver's. `--no-dep-upgrade --with libgbm1,
+   mesa-libgallium libsdl3-dev` therefore produced *exactly* the no-flag plan:
+   9 upgrades, none of them permitted, no warning.
+2. **Virtual packages became inescapable walls.** `gir1.2-gio-2.0-dev` (a pure
+   virtual provided by `gir1.2-glib-2.0-dev`) was reported as an installed
+   package that had to move. It is not installed, so `--with` could never
+   release it — the wall repeated forever.
+3. **The suggested `--with` dropped earlier grants**, so following the hint
+   bounced you back to the previous wall. `_with_arg()` now merges the
+   accumulated allow-set in.
+
+Current behaviour: the wall reports the whole Mesa block at once with the full
+`--with` line, and converges in two steps. Lockstep stacks genuinely move
+together — that is the archive's doing, not a solver defect.
 
 ---
 
@@ -205,30 +250,59 @@ running GUI apps — the one class where "same-upstream, harmless" is false
 **Mechanism (derived, not a hardcoded list):**
 1. `_find_session_leaders()` — scan `/proc/*/comm` for names in
    `_SESSION_LEADER_COMMS` (Xorg/Xwayland, gnome-shell/kwin/sway/weston/
-   plasmashell/mutter/... , gdm/sddm/lightdm/greetd/...).
-2. `_proc_mapped_libs(pid)` — read `/proc/PID/maps`, collect mapped `.so`s.
+   plasmashell/mutter/... , gdm/sddm/lightdm/greetd/...). Returns
+   `(pid, comm)` pairs, or **None** if `/proc` could not be scanned at all —
+   "we cannot tell" is a different answer from "nothing is running".
+2. `_proc_mapped_code(pid, comm)` — the session's *code*: `/proc/PID/exe` plus
+   every mapping from `/proc/PID/maps` that carries the execute bit or is named
+   `.so`. Data mappings (fonts, icon caches) are skipped.
 3. `compute_session_critical_packages()` — one **batched** `dpkg-query -S` maps
-   those libs → packages (batched is ~8x faster than per-lib). Cached per
+   those paths → packages (batched is ~8x faster than per-file). Cached per
    process.
-4. `is_session_critical(name)` — membership in the live set; if no session was
-   found, fall back to the static `_SESSION_CRITICAL_EXACT`/`_PREFIX` sets.
+4. `is_session_critical(name)` — the live set, with the static
+   `_SESSION_CRITICAL_EXACT`/`_PREFIX` sets as a **floor underneath it**
+   whenever a session exists. No session and we could look → nothing is
+   critical. Could not look (`_session_blind`) → static set only.
 
-**Measured cost:** ~200ms once on a desktop (dominated by the single
+**Two permission traps this had to be fixed for** (both real, both found on the
+trixie desktop — don't reintroduce them):
+- **Collect the executable, not just libraries.** Matching only `.so` meant the
+  packages shipping the running compositor, X server and display manager were
+  never flagged: `kwin-wayland`, `xwayland`, `sddm`, `xserver-xorg-core` all
+  came back false. `plasma-workspace` was flagged only by accident, because it
+  happens to ship a library `plasmashell` maps.
+- **Hardened leaders are opaque to non-root.** A setcap'd compositor runs with
+  `dumpable=0`, so `/proc/PID/{maps,exe}` is root-only — as a normal user,
+  `kwin_wayland`, `Xorg` and `sddm` (three of five leaders here) contribute
+  nothing, and `emerge -p` is usually run unprivileged. When `exe` is
+  unreadable the leader's `comm` is resolved on `PATH` instead, which still
+  names the binary.
+
+**Measured cost:** ~120ms once on this desktop (dominated by the single
 `dpkg-query -S`), ~2ms and empty on headless. Cached to 0ms after. Independent
 of package count → cheap enough that it runs on **every** `-a/-p/-v` merge list,
 not just `--no-dep-upgrade` walls: session-in-use upgrades get an inline
 `(session)` marker + a summary warning.
 
-**Remaining maintenance surface / gaps (test on a real desktop):**
-- The maintained thing is now `_SESSION_LEADER_COMMS` (process names), much
+**Verified on the target desktop:** all five leaders (`sddm`, `Xorg`,
+`kwin_wayland`, `Xwayland`, `plasmashell`) are matched with no `comm`
+truncation problems, so the 15-char audit is clean for KDE/sddm at least. GNOME
+and the greeter entries (`gdm-session-wor`, `lightdm-gtk-gre`) are still
+unverified against a real session.
+
+**Remaining gaps:**
+- The maintained thing is `_SESSION_LEADER_COMMS` (process names), much
   shorter/slower-changing than a library list. An exotic compositor not in it
-  falls back to the static list.
-- Only sees *currently mapped* libs; a lib the session `dlopen`s on demand
+  falls back to the static floor.
+- Only sees *currently mapped* code; a lib the session `dlopen`s on demand
   (some driver plugins) may be missed at scan time.
-- `comm` truncates at 15 chars (kernel limit) — some names in the set are
-  already truncated (`gdm-session-wor`, `lightdm-gtk-gre`, `sddm-greeter` ok).
-  **Verify these against real `/proc/*/comm` on target desktops** — this is a
-  prime thing to check with system access.
+- **The derived set is broad and will cry wolf.** 428 packages here, because
+  anything `plasmashell`/`kwin` has mapped counts — including `libacl1`,
+  `libaom3`, `ark`. Upgrading those will not close anyone's session, so
+  `(session)` overstates the risk on a KDE box. Left as-is deliberately: the
+  claim "in use by your graphical session" is literally true, and narrowing it
+  means guessing which libraries a restart actually depends on. Worth
+  revisiting if the warning proves noisy in practice.
 
 ---
 
@@ -262,6 +336,43 @@ Debian already parks updated conffiles as `.dpkg-dist`/`.ucf-dist` (== Portage's
 
 ---
 
+## Repository signature verification (dpkg backend)
+
+The backend always checked each `.deb`'s SHA256 against the index; nothing
+vouched for the *index*, so the chain was anchored in attacker-suppliable
+bytes. `--sync` now verifies the archive signature over Release, then checks
+each downloaded index against the hashes inside that verified Release.
+
+- **`gpgv` is the only new dependency** — one verify-only binary from gnupg,
+  not apt, so an apt-less box can still have it. Stdlib-only still holds.
+- **`dearmor()`** unwraps armoured `.asc` keyrings with `base64` from the
+  stdlib. Necessary because gpgv reads *binary* keyrings only and Debian ships
+  its archive keys armoured; shelling to `gpg(1)` to convert would pull in the
+  exact dependency this backend exists to avoid.
+- **Keys are merged into one keyring per source.** A Debian InRelease carries
+  several signatures and gpgv fails the whole file if it cannot check even one,
+  so passing keyrings one at a time does not work — this was measured, not
+  assumed.
+- **Trust follows apt's model**, not "any key in the store will do":
+  `[signed-by=...]` on one-line entries and `Signed-By:` in deb822 stanzas both
+  pin the keyring for that source (inline key material supported).
+  `read_sources()` therefore returns **4-tuples** now — `(base, suite, comps,
+  signed_by)`.
+- InRelease preferred, falling back to detached `Release` + `Release.gpg`. The
+  clearsigned payload is extracted with `clearsigned_payload()`, covering only
+  the region gpgv verified. Getting that extraction wrong can only cause a hash
+  mismatch, never a silent pass — it is fail-safe by construction.
+- **Failure is fatal; inability to check is not.** No gpgv, no keys, or no
+  Release at all (a USB-stick repo has none) warn and continue, so enabling
+  this cannot break a working setup. `--no-verify` skips it.
+- Release is fetched and verified *before* the progress line is opened, so
+  warnings and failure reports don't land mid-line.
+
+Verified against the live archive: real InRelease and detached Release both
+verify; the extracted payload is byte-identical to the detached Release; a
+tampered index, a forged InRelease, and a source pinned to the wrong keyring
+are all refused.
+
 ## Crash-safety
 
 - No persistent pins (see hard rule 3). Interrupted installs recover with the
@@ -276,16 +387,21 @@ Debian already parks updated conffiles as `.dpkg-dist`/`.ucf-dist` (== Portage's
 Chat-side testing used synthetic `Packages` trees under `TREE_DIR` and mocked
 `apt-cache` output. What genuinely needs Claude Code + a real system:
 
-- **Real multi-version repos.** The container's Ubuntu mirror kept only newest
-  per package, so `--no-dep-upgrade` step-back and the deb13u1 wall were proven
-  on synthetic trees + a `file://` local repo, not against a live mirror with
-  `-updates`/`-security` pockets. `libsdl3-dev` doesn't exist in Ubuntu 24.04 —
-  the reported failures came from a real Debian 13 box.
-- **A graphical session** to validate session-critical detection end-to-end and
-  to check `_SESSION_LEADER_COMMS` against actual `/proc/*/comm`.
-- **apt-less embedded box** to validate the dpkg backend for real (sync over
-  http and USB `file://`, install, depclean world-closure).
-- **Config merging** against real package upgrades that ship conffile changes.
+- ~~**Real multi-version repos.**~~ Done: validated against a live trixie
+  mirror with `-updates`/`-security` pockets. The `libsdl3-dev` deb13u1 wall
+  reproduces exactly, and doing so found three bugs (see that section).
+- ~~**A graphical session.**~~ Done on KDE Plasma Wayland + sddm; found and
+  fixed the two permission traps in session detection. GNOME/gdm still unseen.
+- **apt-less embedded box** — still outstanding, and now the biggest untested
+  area. The dpkg backend's sync (including signature verification) was
+  exercised against real archives and a synthetic USB `file://` repo using a
+  throwaway `TREE_DIR`, but install / depclean world-closure have never run on
+  hardware without `apt-get`.
+- **Config merging** against real package upgrades that ship conffile changes —
+  still outstanding. Needs a real install, not a pretend run.
+- **Anything requiring a real install.** Everything validated so far has been
+  read-only (`-p`) or written to a throwaway root; `merge`, `unmerge` and
+  `dispatch_conf` have not been run against live system state on this box.
 
 Handy synthetic-test pattern used so far: write a `Packages` stanza file into
 `/var/lib/emerge-dpkg/tree/`, `dpkg -i` a hand-built `.deb` to simulate an
@@ -293,8 +409,36 @@ installed base, then run `--backend=dpkg -p ...`. For apt-path unit tests,
 monkeypatch the module-global `capture` to return canned `apt-cache show`
 output and call `ndu_solve` directly.
 
-Always `python3 -m py_compile emerge` after edits. There's no test suite yet —
-adding one is a natural first Claude Code task (see below).
+Always `python3 -m py_compile emerge` after edits.
+
+## The test suite
+
+`python3 -m unittest test_emerge` — 147 tests, stdlib only, ~0.1s. Covers
+`vercmp`, `meets`, `parse_depends`, `parse_stanzas`, `merge3`, `_significant`,
+`_dep_ok`, `ndu_solve`, `_wall_from_merges`, `_with_arg`, `_AptIndex.has`, the
+signature-verification code, and session detection.
+
+Two suites are **differential** rather than hand-written expectations, because
+both reimplement something with an existing reference — keep them that way:
+- `vercmp` is Debian policy 5.6.12 in Python, so every pair in the table is
+  also run through `dpkg --compare-versions` and must agree.
+- `merge3` claims `diff3 -m` equivalence, so its output is compared
+  byte-for-byte against `diff3` on cases that merge cleanly.
+
+Both skip themselves if the tool is missing, so the suite runs off a Debian box.
+
+**Test the tests by mutation, not by watching them pass.** Everything here was
+checked by deliberately breaking `emerge` and confirming the suite fails —
+that is how three tests that never actually exercised their target were found
+(the fakes were too kind: `FakeIndex.has()` returned False for virtual names,
+where the real `_AptIndex.has()` returns True, which is precisely the bug).
+Copy `emerge` + `test_emerge.py` to a scratch dir, apply a one-line breakage,
+run the suite, restore.
+
+Useful patterns already in the file: patch `mod.open` for a fake `/proc` or
+`/etc/apt`; patch `mod.capture` / `mod.fetch` for canned tool output; force
+`_session_critical_cache` and `_session_blind` to pin session state; stub
+`Verifier._gpgv` to test the decisions around gpgv without invoking it.
 
 ---
 
@@ -308,15 +452,20 @@ adding one is a natural first Claude Code task (see below).
    `debian/` + `dpkg-buildpackage`, or `dpkg-deb --build` from a staging dir.
    Skip `zipapp` — a `.pyz` isn't `vi`-able on an embedded box, which defeats
    the single-file purpose.
-2. **A real test suite** — unit tests for `vercmp`, `parse_depends`, `merge3`,
-   and `ndu_solve` (the merge engine has real algorithmic content and deserves
-   coverage). This is the natural first thing to do with a repo + CI.
-3. **`ndu_solve` completeness** — the greedy false-wall limitation above.
-4. **GPG verification** — the dpkg backend verifies each `.deb`'s SHA256 against
-   the index but does NOT verify Release signatures. For a real apt-less system
-   this is the one thing worth adding (shell to `gpgv`, which isn't "apt").
-5. **`_SESSION_LEADER_COMMS` truncation audit** — verify 15-char `comm` names on
-   real desktops.
+2. ~~A real test suite~~ — **done**, see above. No CI wired up yet; that and a
+   `make test` target are the obvious next step (item 1 covers the Makefile).
+3. **`ndu_solve` completeness** — the greedy false-wall limitation above. Still
+   open, and still the main known correctness gap in the solver.
+4. ~~GPG verification~~ — **done**, see the verification section.
+5. ~~`_SESSION_LEADER_COMMS` truncation audit~~ — done for KDE Plasma/sddm.
+   Still unverified on GNOME/gdm and the greeter entries.
+6. **Session-critical noise** — the derived set is broad (see that section).
+   Decide whether `(session)` should mean "mapped by the session" (today) or
+   the narrower "a restart actually depends on this".
+7. **The dpkg backend is still untested on a real apt-less box.** Everything
+   above was validated on a machine that has apt; `--backend=dpkg` paths were
+   exercised with a throwaway `TREE_DIR` and a synthetic USB repo, not on
+   hardware that lacks `apt-get`.
 
 ---
 
@@ -333,6 +482,18 @@ adding one is a natural first Claude Code task (see below).
   dispatch-conf exists.
 - Version comparison must be native `vercmp` (policy 5.6.12), not string compare
   and not thousands of `dpkg --compare-versions` shell-outs.
+- `index.has()` is true for a *virtual* package name — it answers "is this name
+  satisfiable", not "is there a real package here". Using it to decide provider
+  substitution silently breaks every virtual dependency.
+- On the apt backend, the solver's plan is advisory: `resolve()` re-simulates
+  through `apt-get -s` and *that* is what runs. Any guarantee the solver makes
+  has to be re-checked against apt's answer.
+- Session detection runs unprivileged most of the time (`emerge -p`). Hardened
+  processes hide `/proc/PID/{maps,exe}` from non-root, so anything that reads
+  only those will silently see a fraction of the session.
+- gpgv reads binary keyrings only, and rejects armoured `.asc` outright
+  (`invalid packet (ctb=2d)` — that's the leading `-`). It also fails a file
+  whose signatures it cannot *all* check, so keys must be presented together.
 
 ---
 
@@ -345,3 +506,8 @@ corrected to whole-closure w/ installed-pins → shared `ndu_solve` for both
 backends + `_AptIndex` → `_dep_ok`/provides_of callable fix → same-upstream
 escape hatch (`--with` + interactive + session flag) → world-file atomic write
 → live session-critical detection applied to all `-a/-p` merges.
+
+First pass on a real Debian 13 box: session detection reads binaries and
+survives hardened processes → unit test suite (147 tests, differential against
+dpkg and diff3) → three `--no-dep-upgrade` fixes found by running the real
+libsdl3-dev case → gpgv Release verification on the dpkg backend.
