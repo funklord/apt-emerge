@@ -1312,6 +1312,62 @@ class TestMergeAftermath(unittest.TestCase):
         self.assertIn("Recording targets", out)
 
 
+class TestRunMergetool(unittest.TestCase):
+    """Two template styles with deliberately different quoting rules."""
+
+    def setUp(self):
+        self.mod = load()
+        self.cmds = []
+        self.mod.subprocess.call = lambda cmd, shell=False: (
+            self.cmds.append(cmd), 0)[1]
+        self.addCleanup(setattr, self.mod.subprocess, "call", subprocess.call)
+
+    def conf(self, **kw):
+        c = {"mergetool": "", "merge": ""}
+        c.update(kw)
+        return c
+
+    def test_no_tool_configured_is_a_no_op(self):
+        self.assertFalse(self.mod.run_mergetool(
+            self.conf(), "b", "m", "t", "o"))
+        self.assertEqual(self.cmds, [])
+
+    def test_named_placeholders_are_quoted(self):
+        self.mod.run_mergetool(
+            self.conf(mergetool="meld {mine} {base} {theirs} -o {output}"),
+            "/b", "/etc/my file", "/t", "/o")
+        self.assertIn("'/etc/my file'", self.cmds[0])
+
+    def test_named_form_substitutes_dev_null_for_a_missing_base(self):
+        self.mod.run_mergetool(self.conf(mergetool="x {base}"),
+                               None, "m", "t", "o")
+        self.assertIn("/dev/null", self.cmds[0])
+
+    def test_positional_form_is_not_quoted_again(self):
+        """dispatch-conf templates quote %s themselves. Quoting here too
+        nests the quotes and splits a path with a space into two arguments."""
+        self.mod.run_mergetool(
+            self.conf(merge="sdiff --output='%s' '%s' '%s'"),
+            "/b", "/etc/my file", "/t", "/o")
+        self.assertEqual(self.cmds[0],
+                         "sdiff --output='/o' '/etc/my file' '/t'")
+
+    def test_positional_argument_order_is_output_mine_theirs(self):
+        self.mod.run_mergetool(self.conf(merge="tool %s %s %s"),
+                               "/b", "/mine", "/theirs", "/out")
+        self.assertEqual(self.cmds[0], "tool /out /mine /theirs")
+
+    def test_mergetool_takes_precedence_over_merge(self):
+        self.mod.run_mergetool(self.conf(mergetool="A {mine}", merge="B %s"),
+                               "/b", "/m", "/t", "/o")
+        self.assertTrue(self.cmds[0].startswith("A "))
+
+    def test_failure_is_reported(self):
+        self.mod.subprocess.call = lambda cmd, shell=False: 1
+        self.assertFalse(self.mod.run_mergetool(
+            self.conf(mergetool="x {mine}"), "/b", "/m", "/t", "/o"))
+
+
 class TestConfigWrite(unittest.TestCase):
     """_write installs a merged file into /etc, so it has to be atomic,
     durable, and leave nothing behind when it fails."""

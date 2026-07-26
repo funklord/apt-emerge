@@ -438,9 +438,11 @@ Always `python3 -m py_compile emerge` after edits.
 
 ## The test suite
 
-`python3 -m unittest test_emerge` — 147 tests, stdlib only, ~0.1s. Covers
+`python3 -m unittest test_emerge` — 214 tests, stdlib only, ~0.2s. Covers
 `vercmp`, `meets`, `parse_depends`, `parse_stanzas`, `merge3`, `_significant`,
-`_dep_ok`, `ndu_solve`, `_wall_from_merges`, `_with_arg`, `_AptIndex.has`, the
+`_dep_ok`, `ndu_solve`, `_wall_from_merges`, `_with_arg`, `_AptIndex.has`,
+`_policy_batch`, `stream_apt`, `run_mergetool`, `_write`, the apt backend's
+`unmerge_candidates` and `merge` aftermath, `print_unmerge_list`, the
 signature-verification code, and session detection.
 
 Two suites are **differential** rather than hand-written expectations, because
@@ -491,12 +493,42 @@ Useful patterns already in the file: patch `mod.open` for a fake `/proc` or
    a real upstream change keeps `(session)` and the restart warning. The
    derived set is still broad, but breadth now costs a mild note rather than a
    false alarm. See "Session-critical detection".
-7. **The dpkg backend is still untested on a real apt-less box.** Everything
-   above was validated on a machine that has apt; `--backend=dpkg` paths were
-   exercised with a throwaway `TREE_DIR` and a synthetic USB repo, not on
-   hardware that lacks `apt-get`.
+7. **The dpkg backend on real apt-less hardware.** Deprioritised by the owner
+   — rare case, mostly works. Validated only against a throwaway `TREE_DIR`
+   and a synthetic USB repo.
+8. **`-1`/`--oneshot` cannot work on the apt backend as things stand.**
+   `@selected` *is* `apt-mark showmanual`, and `apt-get install` writes that
+   mark itself, so the only way to honour the flag is `apt-mark auto` after
+   the install — which hard rule 3 ("the only apt-mark call anywhere is
+   showmanual") forbids. It currently warns that the flag has no effect and
+   prints the `apt-mark auto` command to run by hand. **This needs an owner
+   decision:** relax the rule (the rule's stated purpose is avoiding version
+   *pins*, and the auto/manual flag is set membership, not a pin — a crash
+   before it leaves the package in `@world`, which is the default anyway), or
+   accept the flag as apt-only-unsupported and say so in `--help`.
 
 ---
+
+## Backend parity is the main source of bugs
+
+The single most productive thing done so far was diffing the two backends'
+shared surface (`resolve`, `merge`, `unmerge`, `depclean`, `sync`, `search`).
+**Five defects in a row had the same shape: the dpkg backend did the right
+thing and the apt backend did not** — and apt is what runs on every normal
+Debian box, so the broken one is the one everybody uses.
+
+- `unmerge` listed only the names you typed while `apt-get remove` cascaded.
+  `emerge -C libjpeg62-turbo` showed 1 package and would have removed 868.
+- No `is_protected` check at all on apt, though `--help` promises one.
+- A failed `apt-get -s` was ignored, so an impossible removal reported success.
+- Failure output was filtered away, so `merge` said "see output above" with
+  nothing above it and `unmerge` said nothing whatsoever. The dpkg backend has
+  always printed stderr.
+- `archive_settled`/`pending_notice` ran only on success in *both*, so a
+  partial install silently left stale ancestors and unannounced parked files.
+
+**When touching one backend, check the other.** They were written months
+apart and drift silently because nothing enforces the shared contract.
 
 ## Gotchas that bit us before (don't repeat)
 
@@ -523,6 +555,19 @@ Useful patterns already in the file: patch `mod.open` for a fake `/proc` or
 - gpgv reads binary keyrings only, and rejects armoured `.asc` outright
   (`invalid packet (ctb=2d)` — that's the leading `-`). It also fails a file
   whose signatures it cannot *all* check, so keys must be presented together.
+- `is_protected` (Essential + `Priority: required`) does **not** cover
+  `libc6` — Debian ships it `Priority: optional` now. What stops
+  `emerge -C libc6` is apt refusing to break `dpkg`'s Pre-Depends, not us.
+- Anything parsing apt's `Inst`/`Remv` lines must stop the package name at
+  `:` — `(\S+)` swallows the `:arch` qualifier apt emits on multiarch, and a
+  name captured as `tree:amd64` then matches nothing you asked for.
+- `run_mergetool`'s two template styles quote **differently on purpose**. The
+  `{named}` form is shlex-quoted here; the positional `%s` form is not,
+  because dispatch-conf templates quote the placeholders themselves
+  (`--output='%s'`). Quoting again nests quotes and splits paths containing
+  spaces. There is a test asserting this; don't "fix" it.
+- Never fork per search result. `emerge -s '^lib'` matches 29,185 packages;
+  one `apt-cache policy` per hit meant the search never finished. Batch it.
 
 ---
 

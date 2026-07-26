@@ -2668,6 +2668,10 @@ def run_mergetool(conf, base, mine, theirs, output):
                           theirs=shlex.quote(theirs),
                           output=shlex.quote(output))
     else:
+        # No quoting here on purpose: this is dispatch-conf's positional form
+        # and its templates quote the placeholders themselves ("... '%s'"),
+        # so quoting again would nest quotes and split paths containing
+        # spaces into two arguments. Use the {named} form for safe quoting.
         cmd = tmpl % (output, mine, theirs)
     return subprocess.call(cmd, shell=True) == 0
 
@@ -2845,7 +2849,11 @@ def dispatch_conf(opts):
                     bfile = os.path.join(td, "base")
                     out = os.path.join(td, "out")
                     if base is not None:
-                        open(bfile, "w").writelines(base)
+                        # close it before the mergetool reads it -- relying on
+                        # the handle being collected to flush is only true by
+                        # accident of refcounting
+                        with open(bfile, "w") as bf:
+                            bf.writelines(base)
                     else:
                         bfile = None
                     shutil.copy2(target, out)
