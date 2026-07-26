@@ -211,6 +211,12 @@ def _dep_ok(alt, inst, chosen, iprov, provides_of):
                 return True
     return False
 
+class _NduNoSolution(Exception):
+    """Every branch of the --no-dep-upgrade search was exhausted."""
+
+class _NduBudget(Exception):
+    """The search hit its step budget without deciding either way."""
+
 def _with_arg(allow, movers):
     """The --with argument to suggest in a wall message.
 
@@ -264,6 +270,14 @@ def ndu_solve(index, inst, iprov, worklist, atoms, update, allow=None):
     installed, stepping back to older versions as conflicts are found. An
     installed package that cannot satisfy a constraint is a genuine wall.
 
+    The search backtracks properly: exhausting one package's versions resumes
+    the previous decision at its next candidate, so a graph that only resolves
+    with an older version of an *earlier* dependency is found rather than
+    reported as a wall. Alternatives within one dependency (`a | b`) are still
+    taken first-match, not branched on. The search is bounded by a step
+    budget; hitting it raises RuntimeError rather than claiming a wall,
+    because giving up early is not proof that none exists.
+
     `allow` is a set of installed package names the caller has permitted to
     move; these are treated as not-installed for the no-upgrade check, so
     their dependents may pull them up.
@@ -278,28 +292,36 @@ def ndu_solve(index, inst, iprov, worklist, atoms, update, allow=None):
     inst_v = {n: st["Version"] for n, st in inst.items()}
     eff_inst = {n: st for n, st in inst.items() if n not in allow}
 
-    constraints = {}
-    chosen = {}
-    forced = {}
-    rejected = {}
-    clash_blame = {}
+    forced = {}          # package -> whatever put a constraint on it (blame)
+    wall = None          # best blocker seen, reported if the search runs dry
+    dead_end = None      # name that could not be resolved at all
 
     def satisfies(ver, cons):
         return all(meets(ver, op, v) for op, v in cons if op)
 
-    def pick(name):
-        cons = constraints.get(name, [])
+    def candidates(name, cons):
+        """Versions `name` may take, best first.
+
+        An installed package is pinned: it is kept at exactly its installed
+        version or it is a wall. Only not-installed packages are ever
+        version-searched -- that is the whole rule of --no-dep-upgrade.
+
+        The pin is a synthetic stanza with no Depends, so a pinned package
+        contributes nothing further to the closure. That is deliberate: it is
+        installed, so its dependencies are already satisfied on the system,
+        and walking them would make @world re-derive the whole installed tree.
+        It also means a constraint can only ever reach an installed package
+        from a not-installed dependent -- which forces_installed_upgrade()
+        catches first, leaving the satisfies() test below as a backstop."""
         iv = eff_inst.get(name, {}).get("Version")
         if iv is not None:
             if satisfies(iv, cons):
-                return {"Package": name, "Version": iv, "_installed": True}
-            return None
-        bad = rejected.get(name, set())
-        cands = [s for s in index.all_versions(name)
-                 if satisfies(s["Version"], cons) and s["Version"] not in bad]
-        return cands[0] if cands else None
+                return [{"Package": name, "Version": iv, "_installed": True}]
+            return []
+        return [s for s in index.all_versions(name)
+                if satisfies(s["Version"], cons)]
 
-    def forces_installed_upgrade(st):
+    def forces_installed_upgrade(st, chosen):
         for field in ("Pre-Depends", "Depends"):
             for alts in parse_depends(st.get(field, "")):
                 if any(_dep_ok(a, eff_inst, chosen, iprov, index.provides_of)
@@ -310,6 +332,12 @@ def ndu_solve(index, inst, iprov, worklist, atoms, update, allow=None):
                    and not meets(eff_inst[dn]["Version"], op, dv):
                     return (dn, op, dv)
         return None
+
+    def note_wall(name, iv, why, cons):
+        """Remember a blocker. The search may still find a way around it, so
+        this only decides what to report if every branch fails."""
+        nonlocal wall
+        wall = (name, iv, why, list(cons))
 
     def make_wall(primary_name, primary_iv, why, cons):
         """Assemble the structured mover list for a wall. The primary is the
@@ -337,46 +365,13 @@ def ndu_solve(index, inst, iprov, worklist, atoms, update, allow=None):
                          f"(or answer the prompt under -a)")
         return NduWall(movers, "\n".join(msg_lines))
 
-    stack = list(dict.fromkeys(worklist))
-    guard = 0
-    while stack:
-        guard += 1
-        if guard > 200000:
-            raise RuntimeError("--no-dep-upgrade: resolution did not "
-                               "converge (dependency cycle?)")
-        name = stack.pop(0)
-        if not index.has(name):
-            if name in atoms:
-                raise RuntimeError(f'there are no packages to satisfy "{name}"')
-            continue
-        st = pick(name)
-        if st is None:
-            iv = eff_inst.get(name, {}).get("Version", "?")
-            blame = clash_blame.get(name)
-            if blame and iv in ("?", None):
-                biv = eff_inst.get(blame, {}).get("Version",
-                                                  inst_v.get(blame, "?"))
-                raise make_wall(blame, biv, name, constraints.get(blame, []))
-            raise make_wall(name, iv, forced.get(name),
-                            constraints.get(name, []))
-
-        if "_installed" not in st and name not in eff_inst:
-            clash = forces_installed_upgrade(st)
-            if clash is not None:
-                cn, cop, cv = clash
-                rejected.setdefault(name, set()).add(st["Version"])
-                clash_blame[name] = cn
-                forced[cn] = name
-                cons = constraints.setdefault(cn, [])
-                if (cop, cv) not in cons:
-                    cons.append((cop, cv))
-                chosen.pop(name, None)
-                stack.insert(0, name)
-                continue
-
-        if chosen.get(name) is st:
-            continue
-        chosen[name] = st
+    def extend(name, st, chosen, cons, pending):
+        """Queue `st`'s dependencies and record their constraints. Returns the
+        new (cons, pending), or None if a constraint contradicts a choice
+        already made -- which kills this branch, not the whole search."""
+        nonlocal wall
+        cons = dict(cons)
+        pending = list(pending)
         for field in ("Pre-Depends", "Depends"):
             for alts in parse_depends(st.get(field, "")):
                 if any(_dep_ok(a, eff_inst, chosen, iprov, index.provides_of)
@@ -399,14 +394,107 @@ def ndu_solve(index, inst, iprov, worklist, atoms, update, allow=None):
                                            f'(required by {name})')
                     real = prov[0][0]
                 if op:
-                    prev = constraints.setdefault(real, [])
+                    prev = cons.get(real, ())
                     if (op, dv) not in prev:
-                        prev.append((op, dv))
-                        forced[real] = name
-                        if real in chosen:
-                            del chosen[real]
-                if real not in chosen and real not in stack:
-                    stack.append(real)
+                        cons[real] = prev + ((op, dv),)
+                        forced.setdefault(real, name)
+                        if real in chosen and not satisfies(
+                                chosen[real]["Version"], cons[real]):
+                            if real in eff_inst:
+                                note_wall(real, eff_inst[real]["Version"],
+                                          name, cons[real])
+                            return None
+                if real not in chosen and real not in pending:
+                    pending.append(real)
+        return cons, pending
+
+    # Backtracking search. Each decision keeps the state that preceded it, so
+    # exhausting one package's versions resumes the previous decision at its
+    # next candidate. The old solver committed to a choice permanently and
+    # only stepped the package it was currently looking at, so a graph
+    # solvable solely by an older version of an *earlier* dependency was
+    # reported as a wall that did not exist.
+    steps = 0
+    STEP_BUDGET = 200000
+
+    def advance(frame):
+        """Move a decision on to its next workable candidate, returning the
+        state that follows, or None once its candidates are spent."""
+        nonlocal steps
+        name = frame["name"]
+        while frame["i"] < len(frame["cands"]):
+            st = frame["cands"][frame["i"]]
+            frame["i"] += 1
+            steps += 1
+            if steps > STEP_BUDGET:
+                raise _NduBudget()
+            chosen = dict(frame["chosen"])
+            if "_installed" not in st and name not in eff_inst:
+                clash = forces_installed_upgrade(st, chosen)
+                if clash is not None:
+                    cn, cop, cv = clash
+                    forced.setdefault(cn, name)
+                    if cn in eff_inst:
+                        note_wall(cn, eff_inst[cn]["Version"], name,
+                                  tuple(frame["cons"].get(cn, ()))
+                                  + ((cop, cv),))
+                    continue
+            chosen[name] = st
+            ext = extend(name, st, chosen, frame["cons"], frame["pending"])
+            if ext is None:
+                continue
+            return chosen, ext[0], ext[1]
+        return None
+
+    chosen, constraints = {}, {}
+    pending = list(dict.fromkeys(worklist))
+    trail = []
+    try:
+        while True:
+            # skip names that need no decision of their own
+            while pending:
+                head = pending[0]
+                if not index.has(head):
+                    if head in atoms:
+                        raise RuntimeError(
+                            f'there are no packages to satisfy "{head}"')
+                    pending = pending[1:]
+                elif head in chosen:
+                    pending = pending[1:]
+                else:
+                    break
+            if not pending:
+                break
+            name = pending[0]
+            cons = constraints.get(name, ())
+            frame = {"name": name, "i": 0, "cands": candidates(name, cons),
+                     "chosen": chosen, "cons": constraints,
+                     "pending": pending[1:]}
+            if not frame["cands"]:
+                dead_end = name
+                iv = eff_inst.get(name, {}).get("Version")
+                note_wall(name, iv if iv is not None else "?",
+                          forced.get(name), cons)
+            nxt = advance(frame)
+            while nxt is None:
+                if not trail:
+                    raise _NduNoSolution()
+                frame = trail.pop()
+                nxt = advance(frame)
+            trail.append(frame)
+            chosen, constraints, pending = nxt
+    except _NduNoSolution:
+        if wall is None:
+            raise RuntimeError(
+                f'cannot satisfy "{dead_end}"' if dead_end else
+                "--no-dep-upgrade: no resolution found") from None
+        raise make_wall(*wall) from None
+    except _NduBudget:
+        raise RuntimeError(
+            f"--no-dep-upgrade: search did not converge within "
+            f"{STEP_BUDGET:,} steps. This is a limit of the solver, not "
+            f"proof that no resolution exists -- narrow the targets, or "
+            f"run without --no-dep-upgrade.") from None
 
     plan, merges = [], []
     ordered = list(dict.fromkeys(

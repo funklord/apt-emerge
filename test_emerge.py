@@ -536,6 +536,91 @@ class TestNduSolve(unittest.TestCase):
         _, merges = self.solve(idx, installed(("libc", "1.0")), ["app"])
         self.assertEqual(self.version_of(merges, "libnew"), "1.0")
 
+    # -- backtracking across independent dependencies ------------------------
+
+    def test_backtracks_to_an_older_earlier_dependency(self):
+        """The documented false wall. app needs liba and libb; libb only works
+        with libc < 2.0, and liba 2.0 demands libc >= 2.0. The only resolution
+        is the *older* liba, which a solver that commits to its first choice
+        and only steps the package in front of it will never reach."""
+        idx = FakeIndex({
+            "app": [stanza("app", "1.0", depends="liba, libb")],
+            "liba": [stanza("liba", "2.0", depends="libc (>= 2.0)"),
+                     stanza("liba", "1.0", depends="libc (>= 1.0)")],
+            "libb": [stanza("libb", "1.0", depends="libc (<< 2.0)")],
+            "libc": [stanza("libc", "2.0"), stanza("libc", "1.0")],
+        })
+        _, merges = self.solve(idx, installed(), ["app"])
+        self.assertEqual(self.version_of(merges, "liba"), "1.0")
+        self.assertEqual(self.version_of(merges, "libc"), "1.0")
+
+    def test_backtracking_walks_several_versions_back(self):
+        idx = FakeIndex({
+            "app": [stanza("app", "1.0", depends="liba, libb")],
+            "liba": [stanza("liba", "4.0", depends="libc (>= 4.0)"),
+                     stanza("liba", "3.0", depends="libc (>= 3.0)"),
+                     stanza("liba", "2.0", depends="libc (>= 2.0)"),
+                     stanza("liba", "1.0", depends="libc (>= 1.0)")],
+            "libb": [stanza("libb", "1.0", depends="libc (<< 2.0)")],
+            "libc": [stanza("libc", "4.0"), stanza("libc", "1.0")],
+        })
+        _, merges = self.solve(idx, installed(), ["app"])
+        self.assertEqual(self.version_of(merges, "liba"), "1.0")
+        self.assertEqual(self.version_of(merges, "libc"), "1.0")
+
+    def test_backtracking_still_refuses_to_move_installed_packages(self):
+        """Searching harder must not become a licence to upgrade something
+        installed: the only combination that satisfies everything needs libc
+        to move, so it is still a wall."""
+        idx = FakeIndex({
+            "app": [stanza("app", "1.0", depends="liba, libb")],
+            "liba": [stanza("liba", "1.0", depends="libc (>= 2.0)")],
+            "libb": [stanza("libb", "1.0", depends="libc (>= 2.0)")],
+            "libc": [stanza("libc", "2.0"), stanza("libc", "1.0")],
+        })
+        with self.assertRaises(em.NduWall) as cm:
+            self.solve(idx, installed(("libc", "1.0")), ["app"])
+        self.assertEqual([m["name"] for m in cm.exception.movers], ["libc"])
+
+    def test_constraint_arriving_after_a_choice_forces_a_retry(self):
+        """libc is decided first and takes 2.0; libb is only then discovered
+        to need libc < 2.0. The already-made choice has to be invalidated and
+        retried, not left in the plan violating the constraint."""
+        idx = FakeIndex({
+            "app": [stanza("app", "1.0", depends="libc, libb")],
+            "libb": [stanza("libb", "1.0", depends="libc (<< 2.0)")],
+            "libc": [stanza("libc", "2.0"), stanza("libc", "1.0")],
+        })
+        _, merges = self.solve(idx, installed(), ["app"])
+        self.assertEqual(self.version_of(merges, "libc"), "1.0")
+
+    def test_installed_packages_contribute_no_dependencies(self):
+        """A pinned package is represented by a synthetic stanza carrying only
+        its name and version, so its Depends are never walked. That is
+        deliberate -- it is installed, so its dependencies are already
+        satisfied on the system -- and it keeps @world from re-deriving the
+        entire installed closure. Worth pinning down: it is the reason a
+        constraint can only ever reach an installed package from a
+        not-installed dependent."""
+        idx = FakeIndex({
+            "base": [stanza("base", "1.0", depends="libc (>= 2.0)")],
+            "libc": [stanza("libc", "2.0"), stanza("libc", "1.0")],
+        })
+        _, merges = self.solve(idx, installed(("base", "1.0"),
+                                              ("libc", "1.0")), ["base"])
+        self.assertNotIn("libc", self.names(merges))
+
+    def test_long_dependency_chain_does_not_exhaust_the_stack(self):
+        """The search is iterative on purpose -- an @world closure is far
+        deeper than Python's recursion limit."""
+        table = {}
+        n = 600
+        for i in range(n):
+            dep = f"p{i + 1}" if i + 1 < n else ""
+            table[f"p{i}"] = [stanza(f"p{i}", "1.0", depends=dep)]
+        _, merges = self.solve(FakeIndex(table), installed(), ["p0"])
+        self.assertEqual(len(merges), n)
+
     # -- genuine walls -------------------------------------------------------
 
     def test_unsatisfiable_installed_dep_is_a_wall(self):

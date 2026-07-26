@@ -204,14 +204,39 @@ virtual name lands on the stack as if real. Also note `_AptIndex.provides_of()`
 leaves an empty list behind as a "already probed" marker — `has()` must test
 `bool(self._provides.get(name))`, not key presence.
 
-**Known limitation (state honestly, don't claim completeness):** greedy with
-single-package backtracking, NOT a complete SAT solver. A graph solvable only
-by a non-obvious *combination* of older versions across two independent deps can
-still report a false wall. Fixing fully means real backtracking search or
-handing the whole constraint set to an external solver.
+**Search:** real backtracking, iterative with an explicit decision stack (an
+`@world` closure is far deeper than Python's recursion limit, so recursion is
+not an option). Each decision keeps the state that preceded it; exhausting one
+package's versions resumes the previous decision at its next candidate. This
+replaced a greedy solver that committed permanently to each choice and only
+stepped the package in front of it — it reported false walls on any graph that
+only resolves with an older version of an *earlier* dependency, and the
+give-away was a wall naming a package with installed version `?` (i.e. one that
+is not installed at all).
 
-**Scope/perf:** works on atoms and `@world`; per-target search, so large sets
-run many simulations and can be slow (accepted).
+**Still not complete, and don't claim otherwise:**
+- Alternatives within one dependency (`a | b`) are taken first-match, never
+  branched on.
+- The search is bounded by a 200,000-step budget. Hitting it raises
+  `RuntimeError` explaining that this is a solver limit, *not* a wall — giving
+  up early is not proof that no resolution exists. Do not turn that into an
+  `NduWall`; it would be a lie.
+
+**Two semantics worth knowing before editing:**
+- A pinned (installed) package is represented by a synthetic stanza with no
+  `Depends`, so it contributes nothing further to the closure. Deliberate: it
+  is installed, so its deps are already satisfied, and walking them would make
+  `@world` re-derive the entire installed tree.
+- Consequently a constraint can only reach an installed package from a
+  not-installed dependent, which `forces_installed_upgrade()` catches first.
+  The `satisfies()` test on the pin in `candidates()` is a backstop — verified
+  by instrumentation to fire zero times across the libsdl3-dev wall, the
+  full-allow-set resolve and `@world`. Keep it, but don't expect a test to
+  reach it.
+
+**Perf:** faster than the greedy version it replaced, because each decision is
+made once instead of being repeatedly rejected and restarted. On this box:
+libsdl3-dev wall 4.6s (was 7.7s), `@world` 36s (was 47s).
 
 ### Validated against the live trixie tree (the libsdl3-dev case)
 
@@ -454,14 +479,18 @@ Useful patterns already in the file: patch `mod.open` for a fake `/proc` or
    the single-file purpose.
 2. ~~A real test suite~~ — **done**, see above. No CI wired up yet; that and a
    `make test` target are the obvious next step (item 1 covers the Makefile).
-3. **`ndu_solve` completeness** — the greedy false-wall limitation above. Still
-   open, and still the main known correctness gap in the solver.
+3. ~~`ndu_solve` completeness~~ — the greedy false wall is **fixed** (real
+   backtracking, see above). What remains open is narrower: `a | b`
+   alternatives are still first-match rather than branched on, and the step
+   budget bounds the search. Neither has been observed to bite in practice.
 4. ~~GPG verification~~ — **done**, see the verification section.
 5. ~~`_SESSION_LEADER_COMMS` truncation audit~~ — done for KDE Plasma/sddm.
    Still unverified on GNOME/gdm and the greeter entries.
-6. **Session-critical noise** — the derived set is broad (see that section).
-   Decide whether `(session)` should mean "mapped by the session" (today) or
-   the narrower "a restart actually depends on this".
+6. ~~Session-critical noise~~ — **done**. A same-upstream bump is now reported
+   as `(session rebuild)` with an einfo saying the session keeps running; only
+   a real upstream change keeps `(session)` and the restart warning. The
+   derived set is still broad, but breadth now costs a mild note rather than a
+   false alarm. See "Session-critical detection".
 7. **The dpkg backend is still untested on a real apt-less box.** Everything
    above was validated on a machine that has apt; `--backend=dpkg` paths were
    exercised with a throwaway `TREE_DIR` and a synthetic USB repo, not on
