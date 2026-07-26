@@ -1232,6 +1232,207 @@ class TestArgParsing(unittest.TestCase):
         self.assertIn("--oneshot", self.parse([]))
 
 
+class TestDispatchConf(unittest.TestCase):
+    """The interactive config-merge loop, driven with scripted answers over a
+    synthetic /etc. This decides what happens to files people have edited, so
+    every branch needs to be pinned -- including which version becomes the
+    ancestor afterwards, which is what the next upgrade's 3-way merge starts
+    from and where a past bug silently discarded every update."""
+
+    def setUp(self):
+        self.mod = load()
+        self.dir = tempfile.mkdtemp(prefix="emerge-dc-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.etc = os.path.join(self.dir, "etc")
+        os.makedirs(self.etc)
+        self.conf = dict(self.mod.DEFAULT_CONF)
+        self.conf["config-protect"] = self.etc
+        self.conf["archive-dir"] = os.path.join(self.dir, "archive")
+        self.mod.load_conf = lambda: self.conf
+        self.mod.need_root = lambda: None
+        self.mod.color_diff = lambda *a, **k: None
+        self.answers = []
+        self.mod.input = lambda prompt="": self.answers.pop(0)
+
+    def park(self, name, current, incoming, ancestor=None,
+             suffix=".dpkg-dist"):
+        """A config file plus the update dpkg parked beside it."""
+        target = os.path.join(self.etc, name)
+        with open(target, "w") as f:
+            f.write(current)
+        with open(target + suffix, "w") as f:
+            f.write(incoming)
+        if ancestor is not None:
+            a = self.mod.archive_path(self.conf, target)
+            os.makedirs(os.path.dirname(a), exist_ok=True)
+            with open(a, "w") as f:
+                f.write(ancestor)
+        return target
+
+    def dispatch(self, *answers):
+        self.answers = list(answers)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.mod.dispatch_conf({})
+        return buf.getvalue()
+
+    def content(self, path):
+        with open(path) as f:
+            return f.read()
+
+    def archived(self, target):
+        return self.content(self.mod.archive_path(self.conf, target))
+
+    def parked_exists(self, target, suffix=".dpkg-dist"):
+        return os.path.exists(target + suffix)
+
+    # -- the automatic paths -------------------------------------------------
+
+    def test_identical_update_is_retired_without_asking(self):
+        t = self.park("same.conf", "a = 1\n", "a = 1\n")
+        self.dispatch()                      # no answers: must not prompt
+        self.assertEqual(self.content(t), "a = 1\n")
+        self.assertFalse(self.parked_exists(t))
+
+    def test_frozen_file_keeps_yours_and_drops_the_update(self):
+        t = self.park("frozen.conf", "mine\n", "theirs\n")
+        self.conf["frozen-files"] = t
+        self.dispatch()
+        self.assertEqual(self.content(t), "mine\n")
+        self.assertFalse(self.parked_exists(t))
+
+    def test_untouched_file_takes_the_new_version(self):
+        """You never edited it, so there is nothing to preserve."""
+        t = self.park("clean.conf", "old\n", "new\n", ancestor="old\n")
+        self.dispatch()
+        self.assertEqual(self.content(t), "new\n")
+        self.assertFalse(self.parked_exists(t))
+
+    def test_comment_only_difference_is_applied(self):
+        t = self.park("ws.conf", "# yours\nkey = 1\n",
+                      "# theirs, rewritten\nkey  =  1\n", ancestor="x\n")
+        self.dispatch()
+        self.assertEqual(self.content(t), "# theirs, rewritten\nkey  =  1\n")
+
+    def test_conflict_free_three_way_is_merged(self):
+        t = self.park("merge.conf",
+                      "MINE\nb\nc\n",       # you changed the first line
+                      "a\nb\nTHEIRS\n",     # they changed the last
+                      ancestor="a\nb\nc\n")
+        self.dispatch()
+        self.assertEqual(self.content(t), "MINE\nb\nTHEIRS\n")
+        self.assertFalse(self.parked_exists(t))
+
+    def test_automerge_can_be_switched_off(self):
+        self.conf["automerge"] = "no"
+        t = self.park("merge.conf", "MINE\nb\nc\n", "a\nb\nTHEIRS\n",
+                      ancestor="a\nb\nc\n")
+        self.dispatch("1")                   # falls through to the prompt
+        self.assertEqual(self.content(t), "MINE\nb\nc\n")
+
+    # -- the interactive choices ---------------------------------------------
+
+    def conflict(self):
+        return self.park("conflict.conf", "a\nMINE\nc\n", "a\nTHEIRS\nc\n",
+                         ancestor="a\nb\nc\n")
+
+    def test_choice_1_keeps_your_version(self):
+        t = self.conflict()
+        self.dispatch("1")
+        self.assertEqual(self.content(t), "a\nMINE\nc\n")
+        self.assertFalse(self.parked_exists(t))
+
+    def test_choice_2_takes_theirs(self):
+        t = self.conflict()
+        self.dispatch("2")
+        self.assertEqual(self.content(t), "a\nTHEIRS\nc\n")
+        self.assertFalse(self.parked_exists(t))
+
+    def test_choice_3_writes_the_merge_with_markers(self):
+        t = self.conflict()
+        self.dispatch("3")
+        body = self.content(t)
+        self.assertIn("<<<<<<< current", body)
+        self.assertIn("MINE", body)
+        self.assertIn("THEIRS", body)
+
+    def test_skip_leaves_the_file_and_the_update_in_place(self):
+        t = self.conflict()
+        self.dispatch("s")
+        self.assertEqual(self.content(t), "a\nMINE\nc\n")
+        self.assertTrue(self.parked_exists(t),
+                        "skipping must leave it pending for next time")
+
+    def test_quit_stops_and_leaves_the_rest_pending(self):
+        t = self.conflict()
+        self.dispatch("q")
+        self.assertEqual(self.content(t), "a\nMINE\nc\n")
+        self.assertTrue(self.parked_exists(t))
+
+    def test_an_unrecognised_answer_asks_again(self):
+        t = self.conflict()
+        self.dispatch("wat", "", "2")
+        self.assertEqual(self.content(t), "a\nTHEIRS\nc\n")
+
+    def test_end_of_input_is_treated_as_quit(self):
+        def eof(prompt=""):
+            raise EOFError
+        self.mod.input = eof
+        t = self.conflict()
+        self.dispatch()
+        self.assertEqual(self.content(t), "a\nMINE\nc\n")
+        self.assertTrue(self.parked_exists(t))
+
+    # -- the ancestor, which the next upgrade depends on ---------------------
+
+    def test_keeping_yours_still_records_what_was_shipped(self):
+        """The archive must hold the version the package shipped, not the one
+        you kept -- otherwise the next 3-way merge starts from the wrong base
+        and re-offers changes you already rejected."""
+        t = self.conflict()
+        self.dispatch("1")
+        self.assertEqual(self.archived(t), "a\nTHEIRS\nc\n")
+
+    def test_taking_theirs_records_it_as_the_ancestor(self):
+        t = self.conflict()
+        self.dispatch("2")
+        self.assertEqual(self.archived(t), "a\nTHEIRS\nc\n")
+
+    def test_skipping_does_not_touch_the_ancestor(self):
+        t = self.park("skip.conf", "a\nMINE\nc\n", "a\nTHEIRS\nc\n",
+                      ancestor="a\nb\nc\n")
+        self.dispatch("s")
+        self.assertEqual(self.archived(t), "a\nb\nc\n")
+
+    # -- scanning ------------------------------------------------------------
+
+    def test_ucf_dist_files_are_picked_up_too(self):
+        t = self.park("ucf.conf", "mine\n", "theirs\n", ancestor="mine\n",
+                      suffix=".ucf-dist")
+        self.dispatch()
+        self.assertEqual(self.content(t), "theirs\n")
+
+    def test_masked_paths_are_left_alone(self):
+        t = self.park("masked.conf", "mine\n", "theirs\n")
+        self.conf["config-protect-mask"] = self.etc
+        self.dispatch()
+        self.assertEqual(self.content(t), "mine\n")
+        self.assertTrue(self.parked_exists(t))
+
+    def test_nothing_pending_is_reported_and_does_not_prompt(self):
+        out = self.dispatch()
+        self.assertIn("up to date", out)
+
+    def test_a_parked_file_with_no_target_is_ignored(self):
+        """dpkg only parks an update beside a file that already exists; a
+        stray .dpkg-dist on its own must not be applied to nothing."""
+        with open(os.path.join(self.etc, "ghost.conf.dpkg-dist"), "w") as f:
+            f.write("orphan\n")
+        out = self.dispatch()
+        self.assertIn("up to date", out)
+        self.assertFalse(os.path.exists(os.path.join(self.etc, "ghost.conf")))
+
+
 class TestBumpChangelog(unittest.TestCase):
     """The +local1 entry is what keeps a locally built package from being
     clobbered by the next @world upgrade, so the version it writes has to be
