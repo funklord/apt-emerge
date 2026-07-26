@@ -448,7 +448,22 @@ Always `python3 -m py_compile emerge` after edits.
 
 ## The test suite
 
-`python3 -m unittest test_emerge` — 214 tests, stdlib only, ~0.2s. Covers
+`python3 -m unittest test_emerge test_integration` — 244 tests, stdlib only,
+~0.7s.
+
+`test_integration.py` is the end-to-end half: real `.debs` built with
+`dpkg-deb`, a real `file://` repository, a real dpkg install, and the real
+resolver deciding what to do. It is the **only** place `merge`, `unmerge`,
+`depclean` and the download/SHA256 path actually execute — everything else
+uses fakes. It needs no privileges: `dpkg --root=<scratch> --force-not-root`
+unpacks into a tree you own, and every path constant in the module is
+repointed under a temp directory. The file skips itself if that does not
+work. Two things it gets right that are easy to get wrong when extending it:
+`/usr/sbin` must be on `PATH` for the *process* (emerge spawns dpkg itself
+and inherits the ambient environment), and it covers the corrupted-`.deb`
+path, which is the entire trust chain on that backend.
+
+`python3 -m unittest test_emerge` — 214 unit tests, stdlib only, ~0.2s. Covers
 `vercmp`, `meets`, `parse_depends`, `parse_stanzas`, `merge3`, `_significant`,
 `_dep_ok`, `ndu_solve`, `_wall_from_merges`, `_with_arg`, `_AptIndex.has`,
 `_policy_batch`, `stream_apt`, `run_mergetool`, `_write`, the apt backend's
@@ -520,8 +535,12 @@ write surface ever needs testing.
    derived set is still broad, but breadth now costs a mild note rather than a
    false alarm. See "Session-critical detection".
 7. **The dpkg backend on real apt-less hardware.** Deprioritised by the owner
-   — rare case, mostly works. Validated only against a throwaway `TREE_DIR`
-   and a synthetic USB repo.
+   — rare case, mostly works. It is now exercised end-to-end by
+   `test_integration.py` against a throwaway dpkg root (sync, resolve,
+   download+SHA256, merge, world file, `--no-dep-upgrade` pins and walls,
+   `--with`, unmerge, depclean), so what remains untested is only the
+   genuinely hardware-specific part: a box with no `apt-get` at all, and
+   sync over real http rather than `file://`.
 8. **`-1`/`--oneshot` cannot work on the apt backend as things stand.**
    `@selected` *is* `apt-mark showmanual`, and `apt-get install` writes that
    mark itself, so the only way to honour the flag is `apt-mark auto` after
