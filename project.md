@@ -43,11 +43,21 @@ been run against a real Debian 13 (trixie) desktop with `trixie-updates` and
 2. **dpkg backend is binary-only.** Source builds (`-b`/`-B`) are apt-only by
    design: a box big enough for `build-essential` can afford real apt. The dpkg
    backend refuses `-b/-B` with a pointer to the host-build workflow.
-3. **No persistent pins, ever.** `--no-dep-upgrade` version selections are
-   `pkg=version` arguments to a single `apt-get`/`dpkg` invocation — never
+3. **No persistent version pins, ever.** `--no-dep-upgrade` version selections
+   are `pkg=version` arguments to a single `apt-get`/`dpkg` invocation — never
    `apt-mark hold`, `/etc/apt/preferences`, or `dpkg --set-selections`. A crash
-   can therefore leave nothing pinned behind. The only `apt-mark` call anywhere
-   is `showmanual` (read-only). Keep it this way.
+   can therefore leave nothing pinned behind. This part is absolute.
+
+   The rule used to end "the only `apt-mark` call anywhere is `showmanual`",
+   which was too broad and was relaxed deliberately. `apt-mark auto|manual` is
+   not a pin: it records *set membership*, and on the apt backend `@selected`
+   **is** `apt-mark showmanual`, so writing that flag is the only way to
+   express world membership at all. `apt-get install` already writes a manual
+   mark on every install; `--oneshot` needs the symmetric call to undo it.
+   Crash-safety is unaffected — an interrupted run leaves the package marked
+   manual, i.e. in `@world`, which is the default outcome anyway.
+   **Still forbidden: `apt-mark hold`/`unhold` and anything else that pins a
+   version.**
 4. **Respond in Portage's dialect.** Output format (`[ebuild N/U/R/D]`, `>>>
    Emerging`, the unmerge block, `--help` layout) mimics real emerge. New
    features should match that voice.
@@ -466,6 +476,22 @@ Useful patterns already in the file: patch `mod.open` for a fake `/proc` or
 `/etc/apt`; patch `mod.capture` / `mod.fetch` for canned tool output; force
 `_session_critical_cache` and `_session_blind` to pin session state; stub
 `Verifier._gpgv` to test the decisions around gpgv without invoking it.
+
+**Exercising apt's write paths without root.** apt honours `-o` config
+overrides, so its state files can be pointed at throwaway copies:
+
+```sh
+cp /var/lib/apt/extended_states /tmp/es
+apt-mark -o Dir::State::extended_states=/tmp/es auto tree   # no root needed
+```
+
+Wrap `mod.capture` to inject that `-o` into any `apt-mark` call and the real
+`_apply_oneshot`/`_manual_set` run against the real binary with zero system
+impact. That is how `--oneshot` was verified in both directions (a new atom
+demoted to auto, one already in `@world` left alone) — better coverage than
+a real install, which could only have shown the first case. The same trick
+should work for `Dir::State::status` and `Dir::Cache` if more of the apt
+write surface ever needs testing.
 
 ---
 

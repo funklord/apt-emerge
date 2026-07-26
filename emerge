@@ -2049,6 +2049,7 @@ class AptBackend:
     def resolve(self, targets, update=False, deep=False,
                 no_dep_upgrade=False, allow=None):
         atoms, members, had_world = self.expand_sets(targets)
+        self._atoms = list(atoms)          # only these are world candidates
         if no_dep_upgrade:
             self._resolve_no_upgrade(atoms, members, update, allow)
         elif had_world and update and deep:
@@ -2099,6 +2100,10 @@ class AptBackend:
         total = len(merges)
         order = {m[0]: i + 1 for i, m in enumerate(merges)}
         vers  = {m[0]: m[1] for m in merges}
+        # snapshot before the install: apt marks everything it is told to
+        # install as manual, so afterwards there is no way to tell which of
+        # them were already in @world beforehand
+        was_manual = self._manual_set() if opts["oneshot"] else set()
         proc = subprocess.Popen(
             ["apt-get", "-y", "-q", "-o", "Dpkg::Use-Pty=0",
              "-o", "Dpkg::Options::=--force-confold",
@@ -2128,13 +2133,7 @@ class AptBackend:
         print()
         if rc == 0:
             if opts["oneshot"]:
-                # apt records a manual-install mark itself and @selected is
-                # defined as `apt-mark showmanual`, so there is nothing this
-                # backend can undo without writing that state back.
-                ewarn("--oneshot has no effect on the apt backend; apt "
-                      "recorded these as manually installed.")
-                ewarn(f"To keep them out of @world: "
-                      f"{BOLD('apt-mark auto ' + ' '.join(targets))}")
+                self._apply_oneshot(was_manual)
             else:
                 print(f"{ARROW} Recording targets in \"world\" favorites file "
                       f"(apt manual-install marks)")
@@ -2369,6 +2368,34 @@ class AptBackend:
         print()
         einfo("GNU info directory index is up-to-date.")
         pending_notice(load_conf())
+
+    @staticmethod
+    def _manual_set():
+        """Packages apt records as manually installed -- i.e. @selected."""
+        r = capture(["apt-mark", "showmanual"])
+        return {l.strip() for l in r.stdout.splitlines() if l.strip()}
+
+    def _apply_oneshot(self, before):
+        """Undo the world-file entry `apt-get install` just made.
+
+        On this backend @selected *is* `apt-mark showmanual`, and apt writes a
+        manual mark for everything named on its command line, so honouring
+        --oneshot means marking those back to auto. Only packages that were
+        not already manual are touched: --oneshot means "do not add this to
+        world", never "remove what was already there"."""
+        added = [a for a in getattr(self, "_atoms", []) if a not in before]
+        if not added:
+            print(f"{ARROW} Not recording targets in \"world\" "
+                  f"favorites file (--oneshot)")
+            return
+        r = capture(["apt-mark", "auto"] + added)
+        if r.returncode != 0:
+            ewarn("could not reset the manual-install mark: "
+                  + (r.stderr or r.stdout).strip())
+            ewarn(f"These stayed in @world: {', '.join(added)}")
+            return
+        print(f"{ARROW} Not recording targets in \"world\" favorites file "
+              f"(--oneshot): {', '.join(added)}")
 
     @staticmethod
     def _policy_batch(names, chunk=500):
@@ -3042,8 +3069,12 @@ Options:
 
    --oneshot (-1)
                  Emerge as normal, but do not add the packages to the world
-                 file for later updating. (dpkg backend; the apt backend
-                 relies on apt's own manual-install marks.)
+                 file for later updating. On the dpkg backend this skips the
+                 world-file entry; on the apt backend, where @selected is
+                 apt's set of manually-installed packages, the marks apt
+                 writes are reset with `apt-mark auto`. Packages that were
+                 already in world stay there -- this never removes an
+                 existing entry, it only declines to add a new one.
 
    --pretend (-p)
                  Instead of actually performing the merge, simply display

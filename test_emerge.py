@@ -1259,6 +1259,13 @@ class TestMergeAftermath(unittest.TestCase):
         self.mod.pending_notice = lambda conf: self.noticed.append(True)
         self.mod.ewarn = self.warned.append
         self.mod.einfo = lambda m: None
+        self.marked = []
+        self.manual = set()
+        self.be._manual_set = lambda: set(self.manual)
+
+        class R:
+            stdout, stderr, returncode = "", "", 0
+        self.mod.capture = lambda cmd: (self.marked.append(cmd), R)[1]
 
     def run_merge(self, rc, opts=None):
         class P:
@@ -1298,18 +1305,61 @@ class TestMergeAftermath(unittest.TestCase):
         out = self.run_merge(100)
         self.assertIn("emerge failed", out)
 
-    def test_oneshot_says_it_cannot_honour_the_flag(self):
-        """apt writes the manual-install mark itself and @selected is defined
-        as `apt-mark showmanual`, so -1 cannot work here. Say so rather than
-        printing that the targets were recorded in world."""
-        out = self.run_merge(0, {"fetchonly": False, "oneshot": True})
-        self.assertTrue(any("no effect on the apt backend" in w
-                            for w in self.warned))
-        self.assertNotIn("Recording targets", out)
-
     def test_without_oneshot_it_reports_recording(self):
         out = self.run_merge(0)
         self.assertIn("Recording targets", out)
+        self.assertEqual(self.marked, [])       # nothing demoted
+
+    def test_oneshot_marks_the_new_atom_auto(self):
+        """apt marks everything it installs as manual, and @selected *is*
+        `apt-mark showmanual`, so keeping a package out of world means
+        marking it back to auto."""
+        self.be._atoms = ["foo"]
+        self.manual = set()
+        self.run_merge(0, {"fetchonly": False, "oneshot": True})
+        self.assertEqual(self.marked, [["apt-mark", "auto", "foo"]])
+
+    def test_oneshot_does_not_evict_a_package_already_in_world(self):
+        """--oneshot means "do not add this to world", never "remove what was
+        already there"."""
+        self.be._atoms = ["foo"]
+        self.manual = {"foo"}
+        self.run_merge(0, {"fetchonly": False, "oneshot": True})
+        self.assertEqual(self.marked, [])
+
+    def test_oneshot_only_demotes_the_newly_added_ones(self):
+        self.be._atoms = ["foo", "bar"]
+        self.manual = {"foo"}
+        self.run_merge(0, {"fetchonly": False, "oneshot": True})
+        self.assertEqual(self.marked, [["apt-mark", "auto", "bar"]])
+
+    def test_oneshot_never_demotes_a_dependency(self):
+        """Only the atoms the user named are world candidates; dependencies
+        are already auto and must not be touched."""
+        self.be._atoms = ["foo"]
+        self.manual = set()
+        self.run_merge(0, {"fetchonly": False, "oneshot": True})
+        self.assertNotIn("libdep", str(self.marked))
+
+    def test_oneshot_reports_what_it_kept_out_of_world(self):
+        self.be._atoms = ["foo"]
+        out = self.run_merge(0, {"fetchonly": False, "oneshot": True})
+        self.assertIn("Not recording targets", out)
+        self.assertNotIn("Recording targets in", out.replace(
+            "Not recording targets", ""))
+
+    def test_a_failed_mark_warns_instead_of_lying(self):
+        class R:
+            stdout, stderr, returncode = "", "apt-mark exploded", 1
+        self.mod.capture = lambda cmd: R
+        self.be._atoms = ["foo"]
+        self.run_merge(0, {"fetchonly": False, "oneshot": True})
+        self.assertTrue(any("stayed in @world" in w for w in self.warned))
+
+    def test_oneshot_is_not_applied_when_the_merge_failed(self):
+        self.be._atoms = ["foo"]
+        self.run_merge(100, {"fetchonly": False, "oneshot": True})
+        self.assertEqual(self.marked, [])
 
 
 class TestRunMergetool(unittest.TestCase):
