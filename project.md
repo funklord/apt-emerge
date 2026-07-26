@@ -614,6 +614,12 @@ apart and drift silently because nothing enforces the shared contract.
   because dispatch-conf templates quote the placeholders themselves
   (`--output='%s'`). Quoting again nests quotes and splits paths containing
   spaces. There is a test asserting this; don't "fix" it.
+- `DpkgBackend._resolve_inner`'s `select()` is **recursive**, one frame per
+  dependency level, so it raises `RecursionError` on a chain deeper than
+  about 1,000. Measured, not guessed: 900 works, 1,500 does not. Real Debian
+  depth is nowhere near that (plasma-desktop's 1,484 packages are breadth),
+  so this is a documented bound rather than a bug to fix — `ndu_solve` was
+  made iterative because `@world` genuinely is deep, and this is not.
 - Never fork per search result. `emerge -s '^lib'` matches 29,185 packages;
   one `apt-cache policy` per hit meant the search never finished. Batch it.
 

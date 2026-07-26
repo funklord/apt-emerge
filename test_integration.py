@@ -218,6 +218,32 @@ class DpkgBackendEndToEnd(unittest.TestCase):
         shutil.rmtree(m.DISTFILES, ignore_errors=True)
         m.DpkgBackend().sync(verify=False)
 
+        # -- an index entry with no hash must not pass silently -------------
+        # Every real Packages file has SHA256, so its absence means the index
+        # is not what we think it is. Installing anyway without saying so
+        # would make the checksum look enforced when it is not.
+        tree = os.path.join(m.TREE_DIR, os.listdir(m.TREE_DIR)[0])
+        with open(tree) as f:
+            stripped = "\n".join(l for l in f.read().splitlines()
+                                 if not l.startswith("SHA256:"))
+        with open(tree, "w") as f:
+            f.write(stripped)
+        warned = []
+        real_warn, m.ewarn = m.ewarn, warned.append
+        try:
+            self.sh("dpkg", f"--root={self.sysroot}", "--force-not-root",
+                    "-r", "emtest-app")
+            shutil.rmtree(m.DISTFILES, ignore_errors=True)
+            be = m.DpkgBackend()
+            be.merge(be.resolve(["emtest-app"]), ["emtest-app"],
+                     {"fetchonly": False, "oneshot": False})
+        finally:
+            m.ewarn = real_warn
+        with self.subTest("an unchecked download is reported"):
+            self.assertTrue(any("without a checksum" in w for w in warned),
+                            f"no warning; got {warned}")
+        m.DpkgBackend().sync(verify=False)          # restore the real index
+
         # -- --no-dep-upgrade against real installed state -----------------
         for pkg in ("emtest-app", "emtest-lib"):
             self.sh("dpkg", f"--root={self.sysroot}", "--force-not-root",

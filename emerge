@@ -1737,13 +1737,22 @@ class DpkgBackend:
             if data is None:
                 print(RED("failed"))
                 raise RuntimeError(f"could not fetch {st['Filename']}")
-            if st.get("SHA256") and \
-               hashlib.sha256(data).hexdigest() != st["SHA256"]:
+            want = st.get("SHA256")
+            if want and hashlib.sha256(data).hexdigest() != want:
                 print(RED("checksum mismatch!"))
                 raise RuntimeError(f"SHA256 verification failed for {fname}")
             with open(dest, "wb") as f:
                 f.write(data)
-            print(GREEN("ok") + f" [{GREEN('sha256 ✓')}]")
+            if want:
+                print(GREEN("ok") + f" [{GREEN('sha256 ✓')}]")
+            else:
+                # Every real Packages file carries one, and so does the index
+                # generated for a USB directory. Missing means the index is
+                # not what we think it is, and the .deb is unverified -- say
+                # so rather than printing a bare "ok" for an unchecked file.
+                print(YELLOW("ok") + f" [{YELLOW('no sha256 in index')}]")
+                ewarn(f"{fname} was installed without a checksum: its index "
+                      f"entry has no SHA256 field.")
             paths.append(dest)
         return paths
 
