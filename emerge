@@ -475,59 +475,89 @@ def _proc_comm(pid):
     except OSError:
         return None
 
-def _proc_mapped_libs(pid):
-    """Shared-library paths a process currently has mapped."""
-    libs = set()
+def _proc_exe(pid):
+    """Path to the binary a process is running, if we may read it."""
+    try:
+        path = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return None
+    if path.endswith(" (deleted)"):      # binary replaced under a running proc
+        path = path[:-len(" (deleted)")]
+    return path if path.startswith("/") else None
+
+def _proc_mapped_code(pid, comm=None):
+    """File-backed *code* a process currently has mapped: its own executable
+    plus every shared library. Data mappings (fonts, icon caches, locale
+    archives) carry no execute bit and are skipped -- upgrading those cannot
+    change the code the session is running.
+
+    A hardened leader (dumpable=0, e.g. a setcap'd compositor) hides both
+    /proc/PID/exe and /proc/PID/maps from anyone but root, so a non-root
+    `emerge -p` would learn nothing about it. Falling back to resolving its
+    comm on PATH still names the binary, which is the important one."""
+    files = set()
+    exe = _proc_exe(pid)
+    if not exe and comm:
+        exe = shutil.which(comm)             # truncated comms simply miss
+    if exe:
+        files.add(exe)
     try:
         with open(f"/proc/{pid}/maps") as f:
             for line in f:
                 parts = line.split()
                 if len(parts) >= 6:
-                    path = parts[5]
-                    if path.startswith("/") and ".so" in path:
-                        libs.add(path)
+                    perms, path = parts[1], parts[5]
+                    if path.startswith("/") and ("x" in perms or ".so" in path):
+                        files.add(path)
     except OSError:
         pass
-    return libs
+    return files
 
 def _find_session_leaders():
-    """PIDs whose comm marks them as a graphical-session leader."""
-    leaders = []
+    """(pid, comm) for processes whose comm marks them a graphical-session
+    leader. Returns None if /proc could not be scanned at all -- that is "we
+    cannot tell", a different answer from [] ("scanned, nothing running")."""
     try:
         pids = [d for d in os.listdir("/proc") if d.isdigit()]
     except OSError:
-        return leaders
-    for pid in pids:
-        comm = _proc_comm(pid)
-        if comm and comm in _SESSION_LEADER_COMMS:
-            leaders.append(pid)
-    return leaders
+        return None
+    found = ((p, _proc_comm(p)) for p in pids)
+    return [(p, c) for p, c in found if c in _SESSION_LEADER_COMMS]
 
 _session_critical_cache = None   # None = not computed; set() = computed empty
+_session_blind = False           # couldn't tell what (if anything) is running
 
 def compute_session_critical_packages():
     """Packages whose code the running graphical session has loaded. Cached
-    for the process. Empty set means: no session found (headless), so nothing
-    is session-critical. None-ish failures fall back to the static test."""
-    global _session_critical_cache
+    for the process. An empty set means either no session is running or we
+    were not allowed to look; `_session_blind` tells the two apart."""
+    global _session_critical_cache, _session_blind
     if _session_critical_cache is not None:
         return _session_critical_cache
 
     leaders = _find_session_leaders()
+    if leaders is None:                      # /proc not readable at all
+        _session_blind = True
+        _session_critical_cache = set()
+        return _session_critical_cache
     if not leaders:
         _session_critical_cache = set()      # headless / no GUI session
         return _session_critical_cache
 
-    libs = set()
-    for pid in leaders:
-        libs |= _proc_mapped_libs(pid)
-    if not libs:
+    files = set()
+    for pid, comm in leaders:
+        files |= _proc_mapped_code(pid, comm)
+    if not files:
+        # A session is up but every leader was opaque: hardened processes run
+        # with dumpable=0, so /proc/PID/{maps,exe} is root-only and a non-root
+        # `emerge -p` sees nothing. Blind, not headless.
+        _session_blind = True
         _session_critical_cache = set()
         return _session_critical_cache
 
-    # one batched dpkg-query -S for all libs (per-call is ~8x slower)
+    # one batched dpkg-query -S for all paths (per-call is ~8x slower)
     pkgs = set()
-    r = capture(["dpkg-query", "-S"] + sorted(libs))
+    r = capture(["dpkg-query", "-S"] + sorted(files))
     for line in r.stdout.splitlines():
         # format: "pkg1, pkg2: /path"  (diversions can list several)
         head, _, _path = line.partition(": ")
@@ -540,18 +570,21 @@ def compute_session_critical_packages():
     return pkgs
 
 def is_session_critical(name):
-    """True if moving `name` could disturb the running session. Prefers the
-    live-derived set; falls back to the static recogniser when no session was
-    detected (so headless boxes report nothing, and the static list only acts
-    as a safety net where introspection returned empty for another reason)."""
+    """True if moving `name` could disturb the running session.
+
+    The live set is the ground truth for what the session actually loaded, but
+    it is a floor, not a ceiling: leaders we were not allowed to read
+    contribute nothing, and code the session dlopen()s later is not mapped yet.
+    So the static recogniser sits underneath it whenever a session exists.
+    With no session running there is nothing to disturb and nothing is
+    critical -- unless we could not tell, where we stay conservative."""
     live = compute_session_critical_packages()
-    if live:
-        return name in live
-    # no live session detected -> nothing to protect, UNLESS introspection
-    # simply isn't available; the static set is the conservative fallback
-    if name in _SESSION_CRITICAL_EXACT:
+    if name in live:
         return True
-    return any(name.startswith(p) for p in _SESSION_CRITICAL_PREFIX)
+    if not live and not _session_blind:
+        return False                         # genuinely headless
+    return (name in _SESSION_CRITICAL_EXACT
+            or name.startswith(_SESSION_CRITICAL_PREFIX))
 
 
 class NduWall(Exception):
