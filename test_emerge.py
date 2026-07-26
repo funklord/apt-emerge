@@ -909,8 +909,11 @@ class TestAptBackendHonoursNoDepUpgrade(unittest.TestCase):
             self.be._action = ["install"] + list(atoms)
             return []
         self.be._resolve_no_upgrade = stub_resolve_no_upgrade
-        self.be._sizes = staticmethod(lambda names: {})
-        self.be._installed_version = staticmethod(lambda pkg: None)
+        # plain lambdas, not staticmethod(): a staticmethod object only
+        # became callable in 3.10, and an instance attribute never goes
+        # through the descriptor protocol that would unwrap it
+        self.be._sizes = lambda names: {}
+        self.be._installed_version = lambda pkg: None
 
     def fake_simulation(self, stdout):
         class R:
@@ -964,7 +967,7 @@ class TestUnmergeShowsTheCascade(unittest.TestCase):
             "bash": {"Package": "bash", "Version": "5.2", "Essential": "yes",
                      "Priority": "required"},
         }
-        self.be._installed_version = staticmethod(lambda p: None)
+        self.be._installed_version = lambda p: None
         self.warnings = []
         self.mod.ewarn = self.warnings.append   # keep test output quiet
         self.mod.eerror = self.warnings.append
