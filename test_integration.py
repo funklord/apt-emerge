@@ -288,6 +288,12 @@ class AptBackendEndToEnd(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="emerge-apt-itest-")
         self.addCleanup(shutil.rmtree, self.dir, True)
+        # When apt runs as root it drops to APT::Sandbox::User (_apt) to
+        # fetch, and mkdtemp gives 0700, so _apt cannot traverse the file://
+        # repository. Invisible when the tests run as an ordinary user --
+        # apt only sandboxes when it is root -- which is why this passed
+        # locally and failed in a container.
+        os.chmod(self.dir, 0o755)
         self.sysroot = os.path.join(self.dir, "sysroot")
         self.repo = os.path.join(self.dir, "repo")
         for sub in ("info", "updates", "triggers"):
@@ -321,6 +327,8 @@ class AptBackendEndToEnd(unittest.TestCase):
             "-o", "Dir::Etc::preferences=/dev/null",
             "-o", "Dir::Etc::preferencesparts=/dev/null",
             "-o", "Debug::NoLocking=1",
+            # belt and braces with the chmod above: do not drop to _apt at all
+            "-o", "APT::Sandbox::User=root",
             "-o", f"DPkg::Options::=--root={self.sysroot}",
             "-o", "DPkg::Options::=--force-not-root",
             "-o", f"DPkg::Options::=--log={self.dir}/dpkg.log",

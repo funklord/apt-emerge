@@ -62,8 +62,13 @@ jobs:
       - name: Byte-compile the shipped script
         run: python3 -m py_compile emerge
 
-      - name: Full suite
-        run: python3 -m unittest test_emerge test_integration -v
+      # kept as separate steps so a failure says which half broke without
+      # needing the logs
+      - name: Unit tests
+        run: python3 -m unittest test_emerge -v
+
+      - name: Integration tests
+        run: python3 -m unittest test_integration -v
 
   # Hard rule 1: the shipped artifact is a single stdlib-only file. That is
   # the whole deploy story for apt-less boxes, and it is easy to break by

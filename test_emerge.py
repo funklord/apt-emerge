@@ -18,7 +18,9 @@ import io
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+import tokenize
 import unittest
 import urllib.error
 
@@ -1131,6 +1133,71 @@ class TestPolicyBatch(unittest.TestCase):
         self.stub(POLICY_OUTPUT)
         got = self.mod.AptBackend._policy_batch(["nosuchpkg"])
         self.assertNotIn("nosuchpkg", got)
+
+
+class TestPortability(unittest.TestCase):
+    """emerge is stdlib-only so it can be scp'd onto whatever a target box
+    runs, which is not necessarily a current Python. Syntax that only a new
+    interpreter accepts is therefore a real defect, and one that a modern
+    dev machine cannot notice by running the tests."""
+
+    FILES = ("emerge", "test_emerge.py", "test_integration.py")
+
+    def paths(self):
+        return [os.path.join(HERE, f) for f in self.FILES]
+
+    def test_syntax_parses_as_far_back_as_3_8(self):
+        import ast
+        for path in self.paths():
+            with self.subTest(file=os.path.basename(path)):
+                with open(path) as f:
+                    src = f.read()
+                ast.parse(src, feature_version=(3, 8))
+
+    @unittest.skipIf(not hasattr(tokenize, "FSTRING_START"),
+                     "f-string tokens need Python 3.12+ to inspect")
+    def test_no_f_string_field_spans_a_line_break(self):
+        """A replacement field split across lines is PEP 701, i.e. 3.12+.
+        ast.parse(feature_version=...) does NOT reject it -- that is handled
+        by the tokeniser -- so the local check passed while Python 3.9 and
+        3.11 failed to compile the script at all."""
+        for path in self.paths():
+            with self.subTest(file=os.path.basename(path)):
+                with open(path) as f:
+                    src = f.read()
+                depth, field_line, in_f, bad = 0, None, 0, []
+                for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+                    if tok.type == tokenize.FSTRING_START:
+                        in_f += 1
+                    elif tok.type == tokenize.FSTRING_END:
+                        in_f = max(0, in_f - 1)
+                    elif in_f and tok.type == tokenize.OP:
+                        if tok.string == "{":
+                            depth += 1
+                            if depth == 1:
+                                field_line = tok.start[0]
+                        elif tok.string == "}":
+                            if (depth == 1 and field_line is not None
+                                    and tok.end[0] != field_line):
+                                bad.append((field_line, tok.end[0]))
+                            depth = max(0, depth - 1)
+                self.assertEqual(bad, [], f"multi-line f-string fields: {bad}")
+
+    def test_shipped_script_imports_only_the_stdlib(self):
+        """Hard rule 1. CI checks this too, but failing here is faster."""
+        import ast
+        if not hasattr(sys, "stdlib_module_names"):
+            self.skipTest("stdlib_module_names needs Python 3.10+")
+        with open(os.path.join(HERE, "emerge")) as f:
+            tree = ast.parse(f.read())
+        mods = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                mods.update(a.name.split(".")[0] for a in node.names)
+            elif (isinstance(node, ast.ImportFrom)
+                  and node.level == 0 and node.module):
+                mods.add(node.module.split(".")[0])
+        self.assertEqual(sorted(mods - set(sys.stdlib_module_names)), [])
 
 
 class TestArgParsing(unittest.TestCase):

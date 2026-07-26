@@ -948,8 +948,10 @@ def print_unmerge_list(removals, requested=None):
     print("All selected packages: " +
           " ".join(f"{p}-{v}" for p, v in selected) + "\n")
     if collateral:
-        print(f" {RED('These depend on the above and would also be '
-                      'removed:')}\n")
+        # built outside the f-string: a replacement field may not span lines
+        # before Python 3.12, and this script has to run on older ones
+        heading = "These depend on the above and would also be removed:"
+        print(f" {RED(heading)}\n")
         line = "    "
         for pkg, _ in collateral:
             if len(line) + len(pkg) > 76:
