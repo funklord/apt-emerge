@@ -1060,6 +1060,79 @@ class TestPrintUnmergeList(unittest.TestCase):
         self.assertIn("a-1 b-2", out)
 
 
+POLICY_OUTPUT = """\
+nano:
+  Installed: 8.4-1+deb13u1
+  Candidate: 8.4-1+deb13u1
+  Version table:
+ *** 8.4-1+deb13u1 500
+        500 http://deb.debian.org/debian trixie/main amd64 Packages
+        100 /var/lib/dpkg/status
+libsdl3-dev:
+  Installed: (none)
+  Candidate: 3.2.10+ds-1
+  Version table:
+     3.2.10+ds-1 500
+libgbm1:amd64:
+  Installed: 25.0.7-2
+  Candidate: 25.0.7-2+deb13u1
+"""
+
+
+class TestPolicyBatch(unittest.TestCase):
+    """`emerge -s '^lib'` matches 29,000 packages on Debian. Asking apt-cache
+    about each one separately made that search never finish."""
+
+    def setUp(self):
+        self.mod = load()
+
+    def stub(self, output):
+        self.calls = []
+
+        class R:
+            stdout, stderr, returncode = output, "", 0
+
+        def capture(cmd):
+            self.calls.append(cmd)
+            return R
+        self.mod.capture = capture
+
+    def test_parses_installed_and_candidate(self):
+        self.stub(POLICY_OUTPUT)
+        got = self.mod.AptBackend._policy_batch(["nano", "libsdl3-dev"])
+        self.assertEqual(got["nano"], ("8.4-1+deb13u1", "8.4-1+deb13u1"))
+        self.assertEqual(got["libsdl3-dev"], ("(none)", "3.2.10+ds-1"))
+
+    def test_arch_qualifier_in_the_header_is_dropped(self):
+        self.stub(POLICY_OUTPUT)
+        got = self.mod.AptBackend._policy_batch(["libgbm1"])
+        self.assertEqual(got["libgbm1"], ("25.0.7-2", "25.0.7-2+deb13u1"))
+
+    def test_version_table_lines_are_not_taken_as_packages(self):
+        """'Version table:' also ends in a colon, but it is indented."""
+        self.stub(POLICY_OUTPUT)
+        got = self.mod.AptBackend._policy_batch(["nano"])
+        self.assertNotIn("Version table", got)
+        self.assertEqual(len(got), 3)
+
+    def test_queries_are_batched(self):
+        self.stub("")
+        self.mod.AptBackend._policy_batch([f"p{i}" for i in range(1200)],
+                                          chunk=500)
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(len(self.calls[0]), 502)   # apt-cache policy + 500
+
+    def test_no_names_means_no_calls(self):
+        self.stub("")
+        self.assertEqual(self.mod.AptBackend._policy_batch([]), {})
+        self.assertEqual(self.calls, [])
+
+    def test_unknown_package_is_simply_absent(self):
+        self.stub(POLICY_OUTPUT)
+        got = self.mod.AptBackend._policy_batch(["nosuchpkg"])
+        self.assertNotIn("nosuchpkg", got)
+
+
 class TestStreamApt(unittest.TestCase):
     """Portage-style output means suppressing most of apt's chatter, but a
     run that fails has to explain itself. dpkg reports the real cause on
@@ -1167,6 +1240,76 @@ class TestStreamApt(unittest.TestCase):
         out = buf.getvalue()
         self.assertIn("chatter line 999", out)
         self.assertNotIn("chatter line 100\n", out)
+
+
+class TestMergeAftermath(unittest.TestCase):
+    """A merge that fails partway still installed something. Those packages'
+    conffiles are settled on disk and have to become the new ancestor, and
+    anything dpkg parked has to be announced -- a partial install is exactly
+    when you need to be told config files are waiting."""
+
+    def setUp(self):
+        self.mod = load()
+        self.be = self.mod.AptBackend()
+        self.be._action = ["install", "foo"]
+        self.mod.need_root = lambda: None
+        self.mod.load_conf = lambda: {}
+        self.archived, self.noticed, self.warned = [], [], []
+        self.mod.archive_settled = lambda conf, pkgs: self.archived.append(pkgs)
+        self.mod.pending_notice = lambda conf: self.noticed.append(True)
+        self.mod.ewarn = self.warned.append
+        self.mod.einfo = lambda m: None
+
+    def run_merge(self, rc, opts=None):
+        class P:
+            def __init__(self):
+                self.stdout = io.BytesIO(b"Unpacking foo (1.0) ...\n")
+
+            def wait(self):
+                return rc
+        original = self.mod.subprocess.Popen
+        self.mod.subprocess.Popen = lambda *a, **k: P()
+        self.addCleanup(setattr, self.mod.subprocess, "Popen", original)
+        merges = [("foo", "1.0", None, 0, "ebuild", "")]
+        opts = opts or {"fetchonly": False, "oneshot": False}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            if rc:
+                with self.assertRaises(SystemExit):
+                    self.be.merge(merges, ["foo"], opts)
+            else:
+                self.be.merge(merges, ["foo"], opts)
+        return buf.getvalue()
+
+    def test_successful_merge_archives_and_notifies(self):
+        self.run_merge(0)
+        self.assertEqual(self.archived, [["foo"]])
+        self.assertTrue(self.noticed)
+
+    def test_failed_merge_still_archives(self):
+        self.run_merge(100)
+        self.assertEqual(self.archived, [["foo"]])
+
+    def test_failed_merge_still_announces_parked_config(self):
+        self.run_merge(100)
+        self.assertTrue(self.noticed)
+
+    def test_failure_is_still_reported(self):
+        out = self.run_merge(100)
+        self.assertIn("emerge failed", out)
+
+    def test_oneshot_says_it_cannot_honour_the_flag(self):
+        """apt writes the manual-install mark itself and @selected is defined
+        as `apt-mark showmanual`, so -1 cannot work here. Say so rather than
+        printing that the targets were recorded in world."""
+        out = self.run_merge(0, {"fetchonly": False, "oneshot": True})
+        self.assertTrue(any("no effect on the apt backend" in w
+                            for w in self.warned))
+        self.assertNotIn("Recording targets", out)
+
+    def test_without_oneshot_it_reports_recording(self):
+        out = self.run_merge(0)
+        self.assertIn("Recording targets", out)
 
 
 class TestConfigWrite(unittest.TestCase):

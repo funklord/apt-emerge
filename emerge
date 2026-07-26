@@ -1759,6 +1759,15 @@ class DpkgBackend:
         conf = load_conf()
         print()
         total = len(self._plan)
+
+        def abort(msg):
+            """Bail out, but not before recording the state of whatever did
+            get installed and announcing any config files dpkg parked."""
+            archive_settled(conf, [st["Package"] for st in self._plan])
+            print(f"{RED('!!!')} {msg}")
+            pending_notice(conf)
+            sys.exit(1)
+
         # deps were appended after their dependents: unpack in reverse
         for i, (st, deb) in enumerate(
                 reversed(list(zip(self._plan, debs))), 1):
@@ -1768,12 +1777,12 @@ class DpkgBackend:
                          "--unpack", "--auto-deconfigure", deb])
             if r.returncode != 0:
                 print(r.stderr, file=sys.stderr)
-                print(f"{RED('!!!')} unpack failed for {pv}"); sys.exit(1)
+                abort(f"unpack failed for {pv}")
         r = capture(["dpkg", "--force-confold", "--force-confdef",
                      "--configure", "-a"])
         if r.returncode != 0:
             print(r.stderr, file=sys.stderr)
-            print(f"{RED('!!!')} configure phase failed"); sys.exit(1)
+            abort("configure phase failed")
         for i, st in enumerate(self._plan, 1):
             pv = f"{st['Package']}-{st['Version']}"
             print(f"{ARROW} Installing ({i} of {total}) {BGREEN(pv)}")
@@ -2118,13 +2127,26 @@ class AptBackend:
         rc = stream_apt(proc, translate)
         print()
         if rc == 0:
-            print(f"{ARROW} Recording targets in \"world\" favorites file "
-                  f"(apt manual-install marks)")
+            if opts["oneshot"]:
+                # apt records a manual-install mark itself and @selected is
+                # defined as `apt-mark showmanual`, so there is nothing this
+                # backend can undo without writing that state back.
+                ewarn("--oneshot has no effect on the apt backend; apt "
+                      "recorded these as manually installed.")
+                ewarn(f"To keep them out of @world: "
+                      f"{BOLD('apt-mark auto ' + ' '.join(targets))}")
+            else:
+                print(f"{ARROW} Recording targets in \"world\" favorites file "
+                      f"(apt manual-install marks)")
             print(f"{ARROW} {BGREEN('Auto-cleaning packages...')}\n")
             einfo("GNU info directory index is up-to-date.")
-            archive_settled(conf, [m[0] for m in merges])
-            pending_notice(conf)
-        else:
+        # Regardless of the outcome: whatever did get installed has settled
+        # conffiles that must be archived as the new ancestor, and anything
+        # dpkg parked has to be announced. A partial install is exactly when
+        # you need to be told there are config files waiting.
+        archive_settled(conf, [m[0] for m in merges])
+        pending_notice(conf)
+        if rc != 0:
             print(f"{RED('!!!')} {BOLD('emerge failed; see output above.')}")
             sys.exit(rc)
 
@@ -2348,21 +2370,47 @@ class AptBackend:
         einfo("GNU info directory index is up-to-date.")
         pending_notice(load_conf())
 
+    @staticmethod
+    def _policy_batch(names, chunk=500):
+        """{name: (installed, candidate)} for many packages in one go.
+
+        `apt-cache policy` reports both, so this replaces two forks per
+        result with one call per chunk. It matters: `emerge -s '^lib'`
+        matches over 29,000 packages on Debian, and a fork each for the
+        policy and the installed version made that search never finish."""
+        out = {}
+        for i in range(0, len(names), chunk):
+            r = capture(["apt-cache", "policy"] + names[i:i + chunk])
+            cur = None
+            for line in r.stdout.splitlines():
+                if line[:1] not in (" ", "\t") and line.rstrip().endswith(":"):
+                    cur = line.rstrip()[:-1].split(":")[0]   # drop :arch
+                    out.setdefault(cur, ("", ""))
+                elif cur:
+                    m = re.match(r"\s+(Installed|Candidate):\s*(\S+)", line)
+                    if m:
+                        inst, cand = out[cur]
+                        if m.group(1) == "Installed":
+                            inst = m.group(2)
+                        else:
+                            cand = m.group(2)
+                        out[cur] = (inst, cand)
+        return out
+
     def search(self, terms, desc):
         for term in terms:
             r = capture(["apt-cache", "search"]
                         + ([] if desc else ["--names-only"]) + [term])
             results = [l for l in r.stdout.splitlines() if l.strip()]
             print_search_header(term, len(results))
+            policy = self._policy_batch([l.partition(" - ")[0]
+                                         for l in results])
             for line in results:
                 name, _, description = line.partition(" - ")
-                iv = self._installed_version(name) or "[ Not Installed ]"
-                cand = "?"
-                p = capture(["apt-cache", "policy", name])
-                m = re.search(r"Candidate:\s*(\S+)", p.stdout)
-                if m:
-                    cand = m.group(1)
-                print_search_hit(name, cand, iv, description, 0)
+                inst, cand = policy.get(name, ("", ""))
+                if not inst or inst == "(none)":
+                    inst = "[ Not Installed ]"
+                print_search_hit(name, cand or "?", inst, description, 0)
 
 # ---------------------------------------------------------------------------
 # Shared search formatting
