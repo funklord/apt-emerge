@@ -945,6 +945,120 @@ class TestAptBackendHonoursNoDepUpgrade(unittest.TestCase):
         self.assertEqual([m[0] for m in merges], ["libgbm1"])
 
 
+class TestUnmergeShowsTheCascade(unittest.TestCase):
+    """`apt-get remove` takes every dependent with it. Showing only the names
+    the user typed and then running apt-get -y means confirming a removal
+    nobody was shown -- on a desktop, `emerge -C libjpeg62-turbo` displayed
+    one package and would have removed 868."""
+
+    def setUp(self):
+        self.mod = load()
+        self.be = self.mod.AptBackend()
+        self.mod.installed_state = lambda: {
+            "libjpeg62-turbo": {"Package": "libjpeg62-turbo",
+                                "Version": "1:2.1.5-4", "Priority": "optional"},
+            "tree": {"Package": "tree", "Version": "2.2.1-1",
+                     "Priority": "optional"},
+            "bash": {"Package": "bash", "Version": "5.2", "Essential": "yes",
+                     "Priority": "required"},
+        }
+        self.be._installed_version = staticmethod(lambda p: None)
+        self.warnings = []
+        self.mod.ewarn = self.warnings.append   # keep test output quiet
+
+    def sim(self, stdout, returncode=0):
+        class R:
+            pass
+        R.stdout, R.stderr, R.returncode = stdout, "", returncode
+        self.mod.capture = lambda cmd: R
+
+    def test_dependents_are_returned_not_just_the_target(self):
+        self.sim("Remv libjpeg62-turbo [1:2.1.5-4]\n"
+                 "Remv kmail [4:24.12]\nRemv libgtk-3-0t64 [3.24]\n")
+        got = self.be.unmerge_candidates(["libjpeg62-turbo"],
+                                         {"ask": True, "pretend": False})
+        self.assertEqual([p for p, _ in got],
+                         ["libjpeg62-turbo", "kmail", "libgtk-3-0t64"])
+
+    def test_cascade_without_ask_or_pretend_is_refused(self):
+        """Without -a there is no confirmation step at all before apt-get -y
+        runs, so this is the last place it can be stopped."""
+        self.sim("Remv libjpeg62-turbo [1:2.1.5-4]\nRemv kmail [4:24.12]\n")
+        with self.assertRaises(SystemExit):
+            self.be.unmerge_candidates(["libjpeg62-turbo"],
+                                       {"ask": False, "pretend": False})
+
+    def test_cascade_is_allowed_under_pretend(self):
+        self.sim("Remv libjpeg62-turbo [1:2.1.5-4]\nRemv kmail [4:24.12]\n")
+        got = self.be.unmerge_candidates(["libjpeg62-turbo"],
+                                         {"ask": False, "pretend": True})
+        self.assertEqual(len(got), 2)
+
+    def test_leaf_removal_needs_no_confirmation(self):
+        self.sim("Remv tree [2.2.1-1]\n")
+        got = self.be.unmerge_candidates(["tree"],
+                                         {"ask": False, "pretend": False})
+        self.assertEqual(got, [("tree", "2.2.1-1")])
+
+    def test_essential_package_is_refused_by_emerge(self):
+        """The help promises this; only the dpkg backend was doing it, so on
+        apt it fell through to a raw apt error after the user had already
+        confirmed a list showing one package."""
+        self.sim("")
+        with self.assertRaises(SystemExit):
+            self.be.unmerge_candidates(["bash"], {"ask": True,
+                                                  "pretend": False})
+
+    def test_failed_simulation_is_reported_not_ignored(self):
+        self.sim("E: Unable to satisfy dependencies\n", returncode=100)
+        with self.assertRaises(SystemExit):
+            self.be.unmerge_candidates(["libjpeg62-turbo"],
+                                       {"ask": True, "pretend": False})
+
+    def test_uninstalled_target_is_skipped(self):
+        self.sim("")
+        self.assertEqual(
+            self.be.unmerge_candidates(["nosuchpkg"],
+                                       {"ask": True, "pretend": False}), [])
+
+    def test_arch_qualifier_is_stripped_from_remv_lines(self):
+        self.sim("Remv tree:amd64 [2.2.1-1]\n")
+        got = self.be.unmerge_candidates(["tree"],
+                                         {"ask": False, "pretend": False})
+        self.assertEqual(got, [("tree", "2.2.1-1")])
+
+
+class TestPrintUnmergeList(unittest.TestCase):
+    def render(self, removals, requested=None):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            em.print_unmerge_list(removals, requested)
+        return buf.getvalue()
+
+    def test_collateral_is_listed_and_counted(self):
+        out = self.render([("libjpeg62-turbo", "1:2"), ("kmail", "4:24"),
+                           ("libgtk-3-0t64", "3.24")], ["libjpeg62-turbo"])
+        self.assertIn("would also be removed", out)
+        self.assertIn("kmail", out)
+        self.assertIn("2 additional package(s)", out)
+        self.assertIn("3 in total", out)
+
+    def test_no_collateral_section_for_a_clean_leaf(self):
+        out = self.render([("tree", "2.2.1-1")], ["tree"])
+        self.assertNotIn("would also be removed", out)
+        self.assertNotIn("additional package", out)
+
+    def test_requested_packages_are_the_selected_ones(self):
+        out = self.render([("a", "1"), ("b", "2")], ["a"])
+        self.assertIn("All selected packages: a-1\n", out)
+
+    def test_depclean_style_call_treats_everything_as_selected(self):
+        """depclean passes no `requested`; nothing there is collateral."""
+        out = self.render([("a", "1"), ("b", "2")])
+        self.assertNotIn("would also be removed", out)
+        self.assertIn("a-1 b-2", out)
+
+
 class TestAptIndexHas(unittest.TestCase):
     """_AptIndex.has() drives provider substitution, so its exact answer
     matters. These poke the caches directly rather than shelling to apt."""

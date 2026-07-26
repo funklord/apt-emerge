@@ -881,15 +881,39 @@ def print_merge_list(merges, verbose):
         einfo("Same upstream version, so your session keeps running. Open apps "
               "stay on the old build until you log out.")
 
-def print_unmerge_list(removals):
+def print_unmerge_list(removals, requested=None):
+    """removals: [(name, version)] -- everything that will actually go.
+
+    `requested` names what the user asked for; anything else in `removals`
+    only goes because it depends on one of those, and has to be shown as
+    such. Listing just the requested names and then handing the whole
+    cascade to `apt-get -y remove` means confirming a removal you were
+    never shown."""
+    asked = set(requested) if requested is not None else {p for p, _ in removals}
+    selected = [(p, v) for p, v in removals if p in asked]
+    collateral = [(p, v) for p, v in removals if p not in asked]
+
     print(f"\n{BGREEN(' These are the packages that would be unmerged:')}\n")
-    for pkg, ver in removals:
+    for pkg, ver in selected:
         print(f" {BGREEN(pkg)}")
         print(f"    {GREEN('selected:')} {ver}")
         print(f"   {GREEN('protected:')} none")
         print(f"     {GREEN('omitted:')} none\n")
     print("All selected packages: " +
-          " ".join(f"{p}-{v}" for p, v in removals) + "\n")
+          " ".join(f"{p}-{v}" for p, v in selected) + "\n")
+    if collateral:
+        print(f" {RED('These depend on the above and would also be '
+                      'removed:')}\n")
+        line = "    "
+        for pkg, _ in collateral:
+            if len(line) + len(pkg) > 76:
+                print(line); line = "    "
+            line += pkg + " "
+        if line.strip():
+            print(line)
+        print()
+        ewarn(f"{len(collateral)} additional package(s) would be removed as "
+              f"a consequence, {len(removals)} in total.")
     ewarn("'Selected' packages are slated for removal.")
     ewarn("'Protected' and 'omitted' packages will not be removed.\n")
 
@@ -1940,7 +1964,7 @@ class AptBackend:
             return None, (r.stderr or r.stdout).strip().replace("E: ", "")
         ups = []
         for line in r.stdout.splitlines():
-            m = re.match(r"^Inst (\S+) \[([^\]]+)\] \((\S+) ", line)
+            m = re.match(r"^Inst ([^\s:]+)(?::\S+)? \[([^\]]+)\] \((\S+) ", line)
             if m and vercmp(m.group(3), m.group(2)) > 0:
                 ups.append(m.group(1))
         return ups, None
@@ -1993,7 +2017,7 @@ class AptBackend:
                                .replace("E: ", ""))
         raw = []
         for line in r.stdout.splitlines():
-            m = re.match(r"^Inst (\S+)(?: \[([^\]]+)\])? \((\S+) ", line)
+            m = re.match(r"^Inst ([^\s:]+)(?::\S+)?(?: \[([^\]]+)\])? \((\S+) ", line)
             if m:
                 name, old, new = m.group(1), m.group(2), m.group(3)
                 if old is None:
@@ -2058,20 +2082,50 @@ class AptBackend:
             sys.exit(rc)
 
     def unmerge_candidates(self, targets, opts):
-        removals = []
+        inst = installed_state()
+        names = []
         for t in targets:
-            v = self._installed_version(t)
-            if v is None:
+            if t not in inst:
                 ewarn(f"{t} is not installed; skipping.")
-            else:
-                removals.append((t, v))
+                continue
+            if is_protected(inst[t]):
+                eerror(f"{t} is Essential/required; refusing to unmerge.")
+                sys.exit(1)
+            names.append(t)
+        if not names:
+            return []
+        # Ask apt what removing these actually costs. `apt-get remove` takes
+        # everything that depends on the target with it, and reporting only
+        # the names the user typed invites them to confirm a one-line removal
+        # that takes hundreds of packages -- removing libjpeg62-turbo on a
+        # desktop is 868 of them, and the merge runs with -y.
+        r = capture(["apt-get", "-s", "-qq", "remove"] + names)
+        if r.returncode != 0:
+            eerror((r.stderr or r.stdout).strip().replace("E: ", ""))
+            sys.exit(1)
+        removals = []
+        for line in r.stdout.splitlines():
+            m = re.match(r"^Remv ([^\s:]+)(?::\S+)?(?: \[([^\]]+)\])?", line)
+            if m:
+                removals.append((m.group(1),
+                                 m.group(2)
+                                 or self._installed_version(m.group(1)) or "?"))
+        # Same guard the dpkg backend applies: an unmerge that takes
+        # dependents with it is not something to do silently, and without -a
+        # there is no confirmation step at all before apt-get -y runs.
+        asked = set(names)
+        extra = [p for p, _ in removals if p not in asked]
+        if extra and not opts["ask"] and not opts["pretend"]:
+            eerror(f"Unmerging would also remove {len(extra)} package(s) that "
+                   f"depend on this. Use -p to list them, or -a to confirm.")
+            sys.exit(1)
         return removals
 
     def depclean_candidates(self):
         r = capture(["apt-get", "-s", "-qq", "autoremove"])
         removals = []
         for line in r.stdout.splitlines():
-            m = re.match(r"^Remv (\S+)(?: \[([^\]]+)\])?", line)
+            m = re.match(r"^Remv ([^\s:]+)(?::\S+)?(?: \[([^\]]+)\])?", line)
             if m:
                 removals.append((m.group(1),
                                  m.group(2) or self._installed_version(m.group(1))
@@ -2142,7 +2196,7 @@ class AptBackend:
                 raise RuntimeError((r.stderr or r.stdout).strip()
                                    .replace("E: ", ""))
             for line in r.stdout.splitlines():
-                m = re.match(r"^Inst (\S+)(?: \[([^\]]+)\])? \((\S+) ", line)
+                m = re.match(r"^Inst ([^\s:]+)(?::\S+)?(?: \[([^\]]+)\])? \((\S+) ", line)
                 if m and m.group(1) not in seen:
                     seen.add(m.group(1))
                     merges.append((m.group(1), m.group(3), m.group(2),
@@ -3024,7 +3078,7 @@ def main(argv):
         removals = be.unmerge_candidates(pkgs, opts)
         if not removals:
             sys.exit(1)
-        print_unmerge_list(removals)
+        print_unmerge_list(removals, pkgs)
         if opts["pretend"]:
             return
         if opts["ask"] and not ask_continue("unmerge"):
