@@ -439,7 +439,11 @@ class FakeIndex:
         return self.table.get(name, [])
 
     def has(self, name):
-        return name in self.table
+        # Deliberately mirrors _AptIndex.has: a purely virtual name is "known"
+        # because something provides it, even though no package ships under
+        # that name. A fake that answered False here would hide the case where
+        # a virtual dependency is pushed onto the stack as if it were real.
+        return bool(self.all_versions(name)) or bool(self.provides_of(name))
 
     def provides_of(self, name):
         out = []
@@ -629,6 +633,39 @@ class TestNduSolve(unittest.TestCase):
         _, merges = self.solve(idx, installed(), ["app"])
         self.assertIn("postfix", self.names(merges))
 
+    def test_virtual_dependency_does_not_become_a_bogus_wall(self):
+        """A purely virtual name has no versions of its own. Deciding whether
+        to substitute a provider by asking has() never fires -- has() is true
+        for a virtual name *because* it is provided -- so the name lands on the
+        stack as real, fails to resolve, and is reported as an installed
+        package that must move. It is not installed, so --with cannot release
+        it and the user loops forever. (gir1.2-gio-2.0-dev, provided by
+        gir1.2-glib-2.0-dev, hit exactly this on trixie.)"""
+        idx = FakeIndex({
+            "app": [stanza("app", "1.0", depends="gir1.2-gio-2.0-dev")],
+            "gir1.2-glib-2.0-dev": [stanza("gir1.2-glib-2.0-dev", "2.84.4",
+                                           provides="gir1.2-gio-2.0-dev")],
+        })
+        self.assertTrue(idx.has("gir1.2-gio-2.0-dev"))
+        self.assertEqual(idx.all_versions("gir1.2-gio-2.0-dev"), [])
+        _, merges = self.solve(idx, installed(), ["app"])
+        self.assertEqual(self.names(merges), {"app", "gir1.2-glib-2.0-dev"})
+
+    def test_wall_suggestion_carries_earlier_grants(self):
+        """Lockstep stacks wall one package at a time; a suggestion naming
+        only the newest mover drops the grants already made and bounces the
+        user back to the previous wall."""
+        idx = FakeIndex({
+            "app": [stanza("app", "1.0",
+                           depends="libc (>= 2.0), libz (>= 2.0)")],
+            "libc": [stanza("libc", "2.0"), stanza("libc", "1.0")],
+            "libz": [stanza("libz", "2.0"), stanza("libz", "1.0")],
+        })
+        with self.assertRaises(em.NduWall) as cm:
+            self.solve(idx, installed(("libc", "1.0"), ("libz", "1.0")),
+                       ["app"], allow={"libc"})
+        self.assertIn("--with libc,libz", str(cm.exception))
+
     def test_installed_provider_satisfies_a_virtual_dependency(self):
         idx = FakeIndex({
             "app": [stanza("app", "1.0", depends="mail-transport-agent")],
@@ -692,6 +729,154 @@ class TestNduSolve(unittest.TestCase):
         name, newv, oldv, size, kind, _use = merges[0]
         self.assertEqual((name, newv, oldv, size, kind),
                          ("app", "2.0", "1.0", 4096, "ebuild"))
+
+
+# ---------------------------------------------------------------------------
+# The --no-dep-upgrade guarantee, independent of any solver
+# ---------------------------------------------------------------------------
+
+class TestWithArg(unittest.TestCase):
+    def test_names_the_new_mover(self):
+        self.assertEqual(em._with_arg(set(), [{"name": "libgbm1"}]),
+                         "libgbm1")
+
+    def test_carries_packages_already_permitted(self):
+        self.assertEqual(
+            em._with_arg({"libgbm1"}, [{"name": "mesa-libgallium"}]),
+            "libgbm1,mesa-libgallium")
+
+    def test_sorted_and_deduplicated(self):
+        self.assertEqual(
+            em._with_arg({"b", "a"}, [{"name": "a"}, {"name": "c"}]),
+            "a,b,c")
+
+    def test_accepts_no_allow_set(self):
+        self.assertEqual(em._with_arg(None, [{"name": "x"}]), "x")
+
+
+class TestWallFromMerges(unittest.TestCase):
+    """The check that enforces the flag's promise on a finished merge list --
+    applied to the solver's own plan and, on the apt backend, to apt's
+    simulation of it."""
+
+    def merges(self, *rows):
+        return [(n, new, old, 0, "ebuild", "") for n, new, old in rows]
+
+    def test_installing_new_packages_is_fine(self):
+        em._wall_from_merges(self.merges(("brand-new", "1.0", None)), set())
+
+    def test_reinstalling_the_same_version_is_not_a_move(self):
+        em._wall_from_merges(self.merges(("app", "1.0", "1.0")), set())
+
+    def test_upgrading_an_installed_package_walls(self):
+        with self.assertRaises(em.NduWall) as cm:
+            em._wall_from_merges(self.merges(("libc", "2.0", "1.0")), set())
+        self.assertEqual([m["name"] for m in cm.exception.movers], ["libc"])
+
+    def test_allow_permits_exactly_what_it_names(self):
+        rows = self.merges(("libc", "2.0", "1.0"), ("libz", "2.0", "1.0"))
+        with self.assertRaises(em.NduWall) as cm:
+            em._wall_from_merges(rows, {"libc"})
+        self.assertEqual([m["name"] for m in cm.exception.movers], ["libz"])
+
+    def test_fully_allowed_list_passes(self):
+        rows = self.merges(("libc", "2.0", "1.0"), ("libz", "2.0", "1.0"))
+        em._wall_from_merges(rows, {"libc", "libz"})
+
+    def test_lockstep_stack_is_reported_in_one_go(self):
+        """Mesa moves as a block; reporting it a package at a time is what
+        made the escape hatch feel endless."""
+        rows = self.merges(*[(n, "25.0.7-2+deb13u1", "25.0.7-2")
+                             for n in ("libgbm1", "libglx-mesa0",
+                                       "mesa-libgallium")])
+        with self.assertRaises(em.NduWall) as cm:
+            em._wall_from_merges(rows, set())
+        self.assertEqual(len(cm.exception.movers), 3)
+        self.assertIn("--with libgbm1,libglx-mesa0,mesa-libgallium",
+                      str(cm.exception))
+        self.assertTrue(all(m["same_upstream"] for m in cm.exception.movers))
+
+    def test_downgrades_are_not_counted_as_upgrades(self):
+        em._wall_from_merges(self.merges(("app", "1.0", "2.0")), set())
+
+
+class TestAptBackendHonoursNoDepUpgrade(unittest.TestCase):
+    """The apt backend resolves with the shared solver but then re-simulates
+    through apt, and it is apt's plan that gets executed. Pinning the versions
+    the solver chose does not stop apt from upgrading installed packages it
+    was never told about, so the promise has to be re-checked on that plan."""
+
+    def setUp(self):
+        self.mod = load()
+        self.be = self.mod.AptBackend()
+        # the solver half is covered elsewhere; stub it so this test is about
+        # what happens to apt's answer afterwards
+        self.be.expand_sets = lambda targets: (list(targets), [], False)
+
+        def stub_resolve_no_upgrade(atoms, members, update, allow=None):
+            self.be._action = ["install"] + list(atoms)
+            return []
+        self.be._resolve_no_upgrade = stub_resolve_no_upgrade
+        self.be._sizes = staticmethod(lambda names: {})
+        self.be._installed_version = staticmethod(lambda pkg: None)
+
+    def fake_simulation(self, stdout):
+        class R:
+            returncode = 0
+        R.stdout, R.stderr = stdout, ""
+        self.mod.capture = lambda cmd: R
+
+    def test_extra_upgrade_in_apt_plan_is_a_wall(self):
+        self.fake_simulation(
+            "Inst libsdl3-dev (3.2.10+ds-1 Debian:13/stable [amd64])\n"
+            "Inst libgbm1 [25.0.7-2] (25.0.7-2+deb13u1 Debian:13 [amd64])\n")
+        with self.assertRaises(self.mod.NduWall) as cm:
+            self.be.resolve(["libsdl3-dev"], no_dep_upgrade=True, allow=set())
+        self.assertEqual([m["name"] for m in cm.exception.movers], ["libgbm1"])
+
+    def test_allowed_upgrade_in_apt_plan_passes(self):
+        self.fake_simulation(
+            "Inst libgbm1 [25.0.7-2] (25.0.7-2+deb13u1 Debian:13 [amd64])\n")
+        merges = self.be.resolve(["libsdl3-dev"], no_dep_upgrade=True,
+                                 allow={"libgbm1"})
+        self.assertEqual([m[0] for m in merges], ["libgbm1"])
+
+    def test_new_installs_in_apt_plan_pass(self):
+        self.fake_simulation(
+            "Inst libsdl3-dev (3.2.10+ds-1 Debian:13/stable [amd64])\n")
+        merges = self.be.resolve(["libsdl3-dev"], no_dep_upgrade=True,
+                                 allow=set())
+        self.assertEqual([m[0] for m in merges], ["libsdl3-dev"])
+
+    def test_check_does_not_apply_without_the_flag(self):
+        self.fake_simulation(
+            "Inst libgbm1 [25.0.7-2] (25.0.7-2+deb13u1 Debian:13 [amd64])\n")
+        merges = self.be.resolve(["libsdl3-dev"])
+        self.assertEqual([m[0] for m in merges], ["libgbm1"])
+
+
+class TestAptIndexHas(unittest.TestCase):
+    """_AptIndex.has() drives provider substitution, so its exact answer
+    matters. These poke the caches directly rather than shelling to apt."""
+
+    def test_real_package_is_known(self):
+        idx = em._AptIndex()
+        idx._cache["real"] = [stanza("real", "1.0")]
+        self.assertTrue(idx.has("real"))
+
+    def test_virtual_name_is_known_when_provided(self):
+        idx = em._AptIndex()
+        idx._cache["virt"] = []
+        idx._provides["virt"] = [("real", "1.0")]
+        self.assertTrue(idx.has("virt"))
+
+    def test_probed_marker_alone_does_not_make_a_name_known(self):
+        """provides_of() leaves an empty list behind so it does not re-shell;
+        testing key presence would read that marker as 'this exists'."""
+        idx = em._AptIndex()
+        idx._cache["ghost"] = []
+        idx._provides["ghost"] = []
+        self.assertFalse(idx.has("ghost"))
 
 
 # ---------------------------------------------------------------------------

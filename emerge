@@ -209,6 +209,45 @@ def _dep_ok(alt, inst, chosen, iprov, provides_of):
                 return True
     return False
 
+def _with_arg(allow, movers):
+    """The --with argument to suggest in a wall message.
+
+    It has to carry the packages already permitted as well as the new mover:
+    lockstep stacks (Mesa, Qt) wall one package at a time, and a suggestion
+    naming only the latest one drops the earlier grants and bounces the user
+    straight back to the previous wall."""
+    return ",".join(sorted(set(allow or ()) | {m["name"] for m in movers}))
+
+def _wall_from_merges(merges, allow, why=None):
+    """Raise NduWall if a merge list moves an installed package that is not in
+    `allow`. `why` maps a package to whatever pulled it in, where known.
+
+    The solver applies this to its own plan, and the apt backend applies it
+    again to apt's simulation of that plan -- pinning the packages we chose
+    does not stop apt from upgrading installed ones we never mentioned."""
+    allow = allow or set()
+    why = why or {}
+    ups = sorted({n for n, nv, old, *_ in merges
+                  if old is not None and vercmp(nv, old) > 0
+                  and n not in allow})
+    if not ups:
+        return
+    movers = []
+    for n in ups:
+        row = next(m for m in merges if m[0] == n)
+        movers.append({
+            "name": n, "installed": row[2], "wanted": row[1],
+            "why": why.get(n, "dependency"),
+            "same_upstream": same_upstream(row[2], row[1]),
+            "session_critical": is_session_critical(n),
+        })
+    lines = ["--no-dep-upgrade: cannot install without moving an "
+             "already-installed package:"]
+    lines += _format_movers(movers)
+    lines.append("")
+    lines.append(f"    to allow: {BOLD('--with ' + _with_arg(allow, movers))}")
+    raise NduWall(movers, "\n".join(lines))
+
 def ndu_solve(index, inst, iprov, worklist, atoms, update, allow=None):
     """Shared --no-dep-upgrade closure solver, used by both backends.
 
@@ -290,7 +329,7 @@ def ndu_solve(index, inst, iprov, worklist, atoms, update, allow=None):
         msg_lines = ["--no-dep-upgrade: cannot install without moving an "
                      "already-installed package:"]
         msg_lines += _format_movers(movers)
-        movable = ",".join(m["name"] for m in movers)
+        movable = _with_arg(allow, movers)
         msg_lines.append("")
         msg_lines.append(f"    to allow just this: {BOLD('--with ' + movable)} "
                          f"(or answer the prompt under -a)")
@@ -343,13 +382,20 @@ def ndu_solve(index, inst, iprov, worklist, atoms, update, allow=None):
                     continue
                 dn, op, dv = alts[0]
                 real = dn
-                if not index.has(dn):
+                if not index.all_versions(dn):
+                    # Nothing ships a package under this name, so it is purely
+                    # virtual and has to be resolved to a provider. Asking
+                    # index.has() instead would never fire: has() is true for a
+                    # virtual name *because* something provides it, so the name
+                    # would go on the stack as if it were real and then fail to
+                    # resolve -- reported as an installed package that must
+                    # move, which --with can never release because it is not
+                    # installed at all.
                     prov = index.provides_of(dn)
-                    if prov:
-                        real = prov[0][0]
-                    else:
+                    if not prov:
                         raise RuntimeError(f'cannot satisfy "{dn}" '
                                            f'(required by {name})')
+                    real = prov[0][0]
                 if op:
                     prev = constraints.setdefault(real, [])
                     if (op, dv) not in prev:
@@ -375,25 +421,8 @@ def ndu_solve(index, inst, iprov, worklist, atoms, update, allow=None):
         merges.append((name, st["Version"], old,
                        int(st.get("Size", 0)), "ebuild", ""))
 
-    ups = [n for n, nv, old, *_ in merges
-           if old is not None and vercmp(nv, old) > 0 and n not in allow]
-    if ups:
-        # a package outside the allow-set still had to move: report as a wall
-        movers = []
-        for n in sorted(set(ups)):
-            row = next(m for m in merges if m[0] == n)
-            movers.append({
-                "name": n, "installed": row[2], "wanted": row[1],
-                "why": forced.get(n, "dependency"),
-                "same_upstream": same_upstream(row[2], row[1]),
-                "session_critical": is_session_critical(n),
-            })
-        lines = ["--no-dep-upgrade: cannot install without moving an "
-                 "already-installed package:"]
-        lines += _format_movers(movers)
-        lines.append("")
-        lines.append(f"    to allow: {BOLD('--with ' + ','.join(m['name'] for m in movers))}")
-        raise NduWall(movers, "\n".join(lines))
+    # a package outside the allow-set still had to move: report as a wall
+    _wall_from_merges(merges, allow, forced)
     return plan, merges
 
 
@@ -1373,7 +1402,9 @@ class _AptIndex:
     def has(self, name):
         if name in self._known:
             return self._known[name]
-        ok = bool(self._load(name)) or name in self._provides
+        # `in self._provides` would be wrong: provides_of() leaves an empty
+        # list behind to mark a name as already probed.
+        ok = bool(self._load(name)) or bool(self._provides.get(name))
         self._known[name] = ok
         return ok
 
@@ -1539,6 +1570,12 @@ class AptBackend:
         sizes = self._sizes([n for n, _, _ in raw])
         merges = [(n, new, old, sizes.get(n, 0), "ebuild", "")
                   for n, new, old in raw]
+        if no_dep_upgrade:
+            # The solver cleared its own plan, but this simulation is what apt
+            # will really do, and pinning the packages we chose leaves it free
+            # to upgrade installed ones we never named -- a lockstep stack like
+            # Mesa moves as a block. Hold apt's answer to the same rule.
+            _wall_from_merges(merges, allow)
         self._merges = merges
         return merges
 
