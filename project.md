@@ -487,6 +487,24 @@ both reimplement something with an existing reference — keep them that way:
 
 Both skip themselves if the tool is missing, so the suite runs off a Debian box.
 
+**Tests must not depend on the machine they run on.** Two escaped review
+and were caught only by CI, both passing here for reasons that had nothing
+to do with what they claimed to check:
+
+- `test_unreadable_maps_still_yields_the_executable` never faked the maps
+  read, so it read the real `/proc/1/maps`. That is unreadable to an
+  ordinary user, so it passed on a desktop and on GitHub's runners, and
+  failed in a container where everything is root and pid 1 is readable. It
+  now fakes the read *and* uses its own pid, so dropping the fake fails
+  everywhere rather than only where /proc happens to be off limits.
+- A stub used `staticmethod(lambda ...)` on an instance attribute, which is
+  callable only on 3.10+.
+
+For portability, run a real old interpreter rather than reasoning about one:
+`uv python install 3.9` takes seconds. `ast.parse(feature_version=...)` is
+*not* a substitute — it does not reject PEP 701 syntax, which is how a
+3.12-only f-string reached CI.
+
 **Test the tests by mutation, not by watching them pass.** Everything here was
 checked by deliberately breaking `emerge` and confirming the suite fails —
 that is how three tests that never actually exercised their target were found

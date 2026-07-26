@@ -2501,6 +2501,14 @@ class TestSessionCritical(unittest.TestCase):
             raise FileNotFoundError(path)
         self.mod.open = fake_open
 
+    def no_maps(self):
+        """Make the maps read fail outright. Leaving it unfaked reads the
+        real /proc/PID/maps, which passes only where that happens to be
+        unreadable -- true for an ordinary user, false for root."""
+        def denied(path, *a, **kw):
+            raise PermissionError(13, "Permission denied", str(path))
+        self.mod.open = denied
+
     def no_exe(self):
         def denied(_path):
             raise PermissionError(13, "Permission denied")
@@ -2587,9 +2595,15 @@ class TestSessionCritical(unittest.TestCase):
                       self.mod._proc_mapped_code("1", "kwin_wayland"))
 
     def test_unreadable_maps_still_yields_the_executable(self):
+        # deliberately our own pid, whose maps is always readable: if the
+        # fake below is ever dropped this fails everywhere instead of
+        # passing wherever /proc/1/maps happens to be off limits, which is
+        # how it passed as a user and failed as root in a container
+        self.no_maps()
         self.patch(self.mod.os, "readlink", lambda _p: "/usr/bin/kwin_wayland")
-        self.assertEqual(self.mod._proc_mapped_code("1", "kwin_wayland"),
-                         {"/usr/bin/kwin_wayland"})
+        self.assertEqual(
+            self.mod._proc_mapped_code(str(os.getpid()), "kwin_wayland"),
+            {"/usr/bin/kwin_wayland"})
 
     def test_truncated_comm_without_exe_yields_nothing(self):
         """comm is capped at 15 chars, so some names cannot be resolved; that
