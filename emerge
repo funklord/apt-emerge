@@ -2248,6 +2248,7 @@ class AptBackend:
 
     def resolve_source(self, atoms, opts):
         merges, self._src_plan = [], []
+        self._atoms = list(atoms)          # world candidates, for --oneshot
         use = self._build_use()
         for a in atoms:
             sv = self._src_version(a)
@@ -2285,6 +2286,10 @@ class AptBackend:
         with open(cl) as f:
             old = f.read()
         m = re.match(r"^(\S+) \(([^)]+)\)", old)
+        if m is None:
+            raise RuntimeError(
+                f"cannot read the source name from {cl}: its first line is "
+                f"not a changelog header. Refusing to guess.")
         entry = (f"{m.group(1)} ({newver}) unstable; urgency=medium\n\n"
                  f"  * Local rebuild by emerge.\n\n"
                  f" -- emerge <root@localhost>  "
@@ -2296,6 +2301,9 @@ class AptBackend:
         need_root()
         os.makedirs(BINPKGS, exist_ok=True)
         use = self._build_use()
+        installed = []
+        # snapshot before anything is installed, for --oneshot below
+        was_manual = self._manual_set() if opts["oneshot"] else set()
         env = {**os.environ, "DEB_BUILD_OPTIONS": use,
                "DEBIAN_FRONTEND": "noninteractive"}
         total = len(self._src_plan)
@@ -2320,11 +2328,19 @@ class AptBackend:
                 print(r.stderr, file=sys.stderr)
                 print(f"{RED('!!!')} fetching source failed for {atom}")
                 sys.exit(1)
-            srcdir = next(os.path.join(workdir, d)
-                          for d in sorted(os.listdir(workdir))
-                          if os.path.isdir(os.path.join(workdir, d)))
+            srcdir = next((os.path.join(workdir, d)
+                           for d in sorted(os.listdir(workdir))
+                           if os.path.isdir(os.path.join(workdir, d))), None)
+            if srcdir is None:
+                print(f"{RED('!!!')} apt-get source produced no source "
+                      f"directory for {atom}")
+                sys.exit(1)
             print(f"{ARROW} Source unpacked in {srcdir}")
-            self._bump_changelog(srcdir, newver)
+            try:
+                self._bump_changelog(srcdir, newver)
+            except (RuntimeError, OSError) as e:
+                print(f"{RED('!!!')} {e}")
+                sys.exit(1)
             print(f"{ARROW} Compiling source in {BOLD(srcdir)} ...")
             proc = subprocess.Popen(
                 ["dpkg-buildpackage", "-b", "-uc", "-us"],
@@ -2363,11 +2379,19 @@ class AptBackend:
                 print(r.stderr, file=sys.stderr)
                 print(f"{RED('!!!')} install failed for {atom}")
                 sys.exit(1)
+            installed.append(atom)
             print(f"{ARROW} Installing ({i} of {total}) {BGREEN(pv)}")
             print(f"{ARROW} Completed ({i} of {total}) {BGREEN(pv)}")
         print()
+        if installed and opts["oneshot"]:
+            self._apply_oneshot(was_manual)
         einfo("GNU info directory index is up-to-date.")
-        pending_notice(load_conf())
+        # same as merge(): what we just installed has settled conffiles that
+        # become the next ancestor, and parked ones have to be announced
+        conf = load_conf()
+        if installed:
+            archive_settled(conf, installed)
+        pending_notice(conf)
 
     @staticmethod
     def _manual_set():

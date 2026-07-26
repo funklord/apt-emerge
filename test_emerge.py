@@ -1232,6 +1232,77 @@ class TestArgParsing(unittest.TestCase):
         self.assertIn("--oneshot", self.parse([]))
 
 
+class TestBumpChangelog(unittest.TestCase):
+    """The +local1 entry is what keeps a locally built package from being
+    clobbered by the next @world upgrade, so the version it writes has to be
+    exactly right -- and it must not crash on a changelog it cannot read."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        os.makedirs(os.path.join(self.dir, "debian"))
+
+    def write(self, text):
+        with open(os.path.join(self.dir, "debian", "changelog"), "w") as f:
+            f.write(text)
+
+    def read(self):
+        with open(os.path.join(self.dir, "debian", "changelog")) as f:
+            return f.read()
+
+    REAL = ("tree (2.2.1-1) unstable; urgency=medium\n"
+            "\n"
+            "  * New upstream release.\n"
+            "\n"
+            " -- Some Maintainer <m@example.org>  "
+            "Mon, 01 Jan 2025 00:00:00 +0000\n")
+
+    def test_new_entry_is_prepended(self):
+        self.write(self.REAL)
+        em.AptBackend._bump_changelog(self.dir, "2.2.1-1+local1")
+        self.assertTrue(self.read().startswith("tree (2.2.1-1+local1) "))
+
+    def test_the_old_content_is_kept(self):
+        self.write(self.REAL)
+        em.AptBackend._bump_changelog(self.dir, "2.2.1-1+local1")
+        self.assertIn(self.REAL, self.read())
+
+    def test_source_name_is_taken_from_the_existing_header(self):
+        """The source name often differs from the binary package name."""
+        self.write("gcc-13 (13.3.0-1) unstable; urgency=low\n")
+        em.AptBackend._bump_changelog(self.dir, "13.3.0-1+local1")
+        self.assertTrue(self.read().startswith("gcc-13 ("))
+
+    def test_epoch_is_preserved(self):
+        self.write("qemu (1:10.0.8+ds-1) unstable; urgency=medium\n")
+        em.AptBackend._bump_changelog(self.dir, "1:10.0.8+ds-1+local1")
+        self.assertIn("qemu (1:10.0.8+ds-1+local1)", self.read())
+
+    def test_result_is_parseable_as_a_changelog_again(self):
+        """It has to survive a second build, so the new first line must match
+        the same header pattern."""
+        self.write(self.REAL)
+        em.AptBackend._bump_changelog(self.dir, "2.2.1-1+local1")
+        em.AptBackend._bump_changelog(self.dir, "2.2.1-1+local2")
+        self.assertTrue(self.read().startswith("tree (2.2.1-1+local2)"))
+
+    def test_local_version_sorts_above_the_repository_one(self):
+        """The whole point: @world must not consider the build outdated."""
+        self.assertGreater(em.vercmp("2.2.1-1+local1", "2.2.1-1"), 0)
+        self.assertLess(em.vercmp("2.2.1-1+local1", "2.2.1-2"), 0)
+
+    def test_unreadable_header_raises_instead_of_crashing(self):
+        """It used to index a None match object and die with a traceback."""
+        self.write("this is not a changelog header\n")
+        with self.assertRaises(RuntimeError):
+            em.AptBackend._bump_changelog(self.dir, "1.0+local1")
+
+    def test_empty_changelog_raises(self):
+        self.write("")
+        with self.assertRaises(RuntimeError):
+            em.AptBackend._bump_changelog(self.dir, "1.0+local1")
+
+
 class TestStreamApt(unittest.TestCase):
     """Portage-style output means suppressing most of apt's chatter, but a
     run that fails has to explain itself. dpkg reports the real cause on
