@@ -47,6 +47,7 @@ Paths (dpkg backend): tree /var/lib/emerge-dpkg/tree, world file
 /var/lib/emerge-dpkg/world, distfiles /var/cache/emerge-dpkg/distfiles.
 """
 
+import base64
 import difflib
 import email.utils
 import functools
@@ -59,6 +60,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 
 try:
@@ -805,13 +807,25 @@ def system_set(inst):
 # ---------------------------------------------------------------------------
 
 def read_sources():
-    """Return [(base_url, suite, [components])]. suite ending in '/' = flat."""
+    """Return [(base_url, suite, [components], signed_by)]. A suite ending in
+    '/' is a flat repository. `signed_by` is the keyring path (or inline key
+    material) the entry names, or None to fall back to the system trust
+    store."""
     entries = []
     def one_line(line):
+        # read the options block before stripping it: signed-by names the only
+        # key that may sign this entry, and honouring it is the difference
+        # between apt's trust model and "anything in the keyring will do"
+        signed_by = None
+        m = re.search(r"signed-by=([^\s\]]+)", " ".join(re.findall(r"\[(.*?)\]",
+                                                                  line)))
+        if m:
+            signed_by = m.group(1)
         line = re.sub(r"\[.*?\]", "", line)
         parts = line.split()
         if len(parts) >= 3 and parts[0] == "deb":
-            entries.append((parts[1].rstrip("/"), parts[2], parts[3:] or ["main"]))
+            entries.append((parts[1].rstrip("/"), parts[2],
+                            parts[3:] or ["main"], signed_by))
     files = ["/etc/apt/sources.list"]
     d = "/etc/apt/sources.list.d"
     if os.path.isdir(d):
@@ -824,10 +838,12 @@ def read_sources():
             for st in parse_stanzas(text):
                 if "deb" not in st.get("Types", ""):
                     continue
+                signed_by = st.get("Signed-By", "").strip() or None
                 for uri in st.get("URIs", "").split():
                     for suite in st.get("Suites", "").split():
                         entries.append((uri.rstrip("/"), suite,
-                                        st.get("Components", "main").split()))
+                                        st.get("Components", "main").split(),
+                                        signed_by))
         elif path.endswith((".list", "sources.list")):
             for line in text.splitlines():
                 line = line.strip()
@@ -842,6 +858,249 @@ def fetch(url, timeout=60):
     req = urllib.request.Request(url, headers={"User-Agent": "emerge/1.0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
+
+# ---------------------------------------------------------------------------
+# Repository signature verification (dpkg backend)
+# ---------------------------------------------------------------------------
+#
+# The dpkg backend already checks every .deb against a SHA256 taken from the
+# Packages index. That chain is only worth as much as the index it starts
+# from, and nothing vouched for the index. Verifying the archive's signature
+# over Release -- and the index against the hashes inside it -- anchors it.
+#
+# gpgv is the whole dependency: it is a single verify-only binary from
+# gnupg, not apt, so an apt-less box can still have it.
+
+TRUSTED_DIR = "/etc/apt/trusted.gpg.d"
+TRUSTED_LEGACY = "/etc/apt/trusted.gpg"
+
+_ARMOUR_RE = re.compile(r"-----BEGIN PGP PUBLIC KEY BLOCK-----(.*?)"
+                        r"-----END PGP PUBLIC KEY BLOCK-----", re.S)
+
+def dearmor(data):
+    """ASCII-armoured public key block -> raw OpenPGP packets.
+
+    gpgv reads binary keyrings only, and Debian ships most of its archive
+    keys as armoured .asc, so we unwrap them here. Shelling out to gpg(1) for
+    this would pull in exactly the dependency an apt-less box lacks. Data
+    that is already binary passes through untouched."""
+    if b"-----BEGIN PGP" not in data[:4096]:
+        return data
+    out = b""
+    for m in _ARMOUR_RE.finditer(data.decode("utf-8", "replace")):
+        body = m.group(1)
+        # armour headers (Version:, Comment:) run to the first blank line
+        for sep in ("\n\n", "\r\n\r\n"):
+            if sep in body:
+                body = body.split(sep, 1)[1]
+                break
+        # '=' starts the CRC24 trailer, which is not part of the packets
+        b64 = "".join(l for l in body.splitlines()
+                      if l.strip() and not l.startswith("="))
+        try:
+            out += base64.b64decode(b64)
+        except Exception:
+            continue
+    return out
+
+def clearsigned_payload(text):
+    """The signed message out of a clearsigned document (an InRelease).
+
+    Only the region gpgv actually covered is returned: everything from the
+    end of the armour headers up to the signature block, dash-unescaped per
+    RFC 4880. Getting this wrong can only produce a hash mismatch, never a
+    silent pass, because the hashes it yields are what we then enforce."""
+    start = text.find("-----BEGIN PGP SIGNED MESSAGE-----")
+    if start < 0:
+        return None
+    rest = text[start:]
+    for sep in ("\n\n", "\r\n\r\n"):
+        if sep in rest:
+            rest = rest.split(sep, 1)[1]
+            break
+    else:
+        return None
+    end = rest.find("-----BEGIN PGP SIGNATURE-----")
+    if end < 0:
+        return None
+    lines = rest[:end].split("\n")
+    # the newline in front of the signature armour terminates the last line,
+    # it is not an extra empty one
+    if lines and lines[-1] == "":
+        lines.pop()
+    return "".join(l[2:] + "\n" if l.startswith("- ") else l + "\n"
+                   for l in lines)
+
+def release_hashes(text):
+    """{path: sha256} from a Release file's SHA256 section."""
+    hashes = {}
+    in_sha = False
+    for line in text.splitlines():
+        if not line[:1].isspace():
+            in_sha = line.startswith("SHA256:")
+            continue
+        if in_sha:
+            parts = line.split()
+            if len(parts) >= 3:
+                hashes[parts[2]] = parts[0]
+    return hashes
+
+
+class Verifier:
+    """Checks repository metadata signatures with gpgv.
+
+    A failed check is fatal. Being *unable* to check is not: an embedded box
+    may have no gpgv, and a USB-stick repo has no Release at all. Those warn
+    and continue, so turning this on cannot break a setup that worked before
+    -- it only ever adds a guarantee where one is available."""
+
+    def __init__(self, enabled=True):
+        self.wanted = enabled
+        self.enabled = enabled and bool(shutil.which("gpgv"))
+        if enabled and not self.enabled:
+            ewarn("gpgv not found: repository signatures will NOT be checked "
+                  "(install gpgv, or pass --no-verify to silence this).")
+        self._rings = {}          # signed_by -> keyring path or None
+        self._releases = {}       # (base, suite) -> verified text or None
+        self._tmp = []
+        self._warned = set()
+        self.checked = 0
+
+    @property
+    def had_warnings(self):
+        return bool(self._warned)
+
+    def _warn_once(self, key, msg):
+        if key not in self._warned:
+            self._warned.add(key)
+            ewarn(msg)
+
+    def _tmpfile(self, data, suffix):
+        fd, path = tempfile.mkstemp(prefix="emerge-verify-", suffix=suffix)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        self._tmp.append(path)
+        return path
+
+    def close(self):
+        for path in self._tmp:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self._tmp = []
+
+    def keyring(self, signed_by=None):
+        """Path to a binary keyring holding the keys trusted for a source.
+
+        A Debian InRelease carries several signatures and gpgv fails the file
+        if it cannot check even one of them, so every candidate key has to be
+        handed over in a single keyring rather than one file per call."""
+        if signed_by in self._rings:
+            return self._rings[signed_by]
+        blob = b""
+        if signed_by and "BEGIN PGP" in signed_by:
+            blob = dearmor(signed_by.encode())          # inline key material
+        else:
+            if signed_by:
+                files = signed_by.replace(",", " ").split()
+            else:
+                files = []
+                if os.path.isdir(TRUSTED_DIR):
+                    files += [os.path.join(TRUSTED_DIR, f)
+                              for f in sorted(os.listdir(TRUSTED_DIR))]
+                if os.path.isfile(TRUSTED_LEGACY):
+                    files.append(TRUSTED_LEGACY)
+            for path in files:
+                try:
+                    with open(path, "rb") as f:
+                        blob += dearmor(f.read())
+                except OSError:
+                    self._warn_once(f"key:{path}",
+                                    f"cannot read keyring {path}")
+        path = self._tmpfile(blob, ".gpg") if blob else None
+        self._rings[signed_by] = path
+        return path
+
+    def _gpgv(self, ring, sig_path, data_path=None):
+        cmd = ["gpgv", "--keyring", ring, sig_path]
+        if data_path:
+            cmd.append(data_path)
+        return subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE).returncode == 0
+
+    def release(self, base, suite, signed_by=None):
+        """Fetch and verify the Release for one (base, suite), returning its
+        verified text -- or None if it could not be checked at all."""
+        key = (base, suite)
+        if key in self._releases:
+            return self._releases[key]
+        self._releases[key] = None
+        if not self.enabled:
+            return None
+        ring = self.keyring(signed_by)
+        if not ring:
+            self._warn_once("nokeys",
+                            f"no usable keys in {TRUSTED_DIR}: repository "
+                            f"signatures will NOT be checked.")
+            return None
+
+        stem = (f"{base}/{suite}" if suite.endswith("/")
+                else f"{base}/dists/{suite}/").replace("/./", "/")
+        text = None
+        # InRelease (inline signature) first, then detached Release+Release.gpg
+        try:
+            raw = fetch(stem + "InRelease")
+            if self._gpgv(ring, self._tmpfile(raw, ".InRelease")):
+                text = clearsigned_payload(raw.decode("utf-8", "replace"))
+            else:
+                raise RuntimeError(
+                    f"{base} {suite}: InRelease signature verification "
+                    f"FAILED (bad signature, or signed by an untrusted key)")
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+        if text is None:
+            try:
+                rel = fetch(stem + "Release")
+                sig = fetch(stem + "Release.gpg")
+                rel_path = self._tmpfile(rel, ".Release")
+                if not self._gpgv(ring, self._tmpfile(sig, ".gpg"), rel_path):
+                    raise RuntimeError(
+                        f"{base} {suite}: Release signature verification "
+                        f"FAILED (bad signature, or signed by an untrusted "
+                        f"key)")
+                text = rel.decode("utf-8", "replace")
+            except (urllib.error.URLError, OSError, ValueError):
+                pass
+        if text is None:
+            self._warn_once(f"norel:{base} {suite}",
+                            f"{base} {suite}: no verifiable InRelease or "
+                            f"Release; its index is NOT signature-checked.")
+        self._releases[key] = text
+        return text
+
+    def check_index(self, base, suite, signed_by, relpath, raw):
+        """Check a downloaded index against the signed Release. Raises on a
+        mismatch; returns True when the index was genuinely verified."""
+        text = self.release(base, suite, signed_by)
+        if text is None:
+            return False
+        want = release_hashes(text).get(relpath)
+        if want is None:
+            self._warn_once(f"nohash:{base} {suite} {relpath}",
+                            f"{base} {suite}: {relpath} is not listed in "
+                            f"Release; NOT hash-checked.")
+            return False
+        got = hashlib.sha256(raw).hexdigest()
+        if got != want:
+            raise RuntimeError(
+                f"{base} {suite}: SHA256 mismatch for {relpath}\n"
+                f"  expected {want}\n  got      {got}\n"
+                f"The index does not match the signed Release. Refusing to "
+                f"use it.")
+        self.checked += 1
+        return True
+
 
 # ---------------------------------------------------------------------------
 # dpkg backend
@@ -915,7 +1174,7 @@ class DpkgBackend:
             out.append(fields)
         return ("\n\n".join(out) + "\n").encode()
 
-    def sync(self):
+    def sync(self, verify=True):
         need_root()
         os.makedirs(TREE_DIR, exist_ok=True)
         a = capture(["dpkg", "--print-architecture"]).stdout.strip()
@@ -925,26 +1184,54 @@ class DpkgBackend:
                    "On apt-less systems, create one (plain `deb` lines work).")
             sys.exit(1)
         einfo(f"Syncing {len(sources)} repository entries...")
-        ok = 0
-        for base, suite, comps in sources:
+        verifier = Verifier(verify)
+        ok = signed = 0
+        for base, suite, comps, signed_by in sources:
             flat = suite.endswith("/")
             for comp in comps:
                 if flat:
                     stem = f"{base}/{suite}Packages".replace("/./", "/")
+                    relbase = "Packages"
                 else:
                     stem = f"{base}/dists/{suite}/{comp}/binary-{a}/Packages"
+                    relbase = f"{comp}/binary-{a}/Packages"
+                # Verify the Release before opening the progress line, so a
+                # warning or a failure report does not land in the middle of
+                # it. Cached per (base, suite), so this costs one fetch.
+                try:
+                    verifier.release(base, suite, signed_by)
+                except RuntimeError as e:
+                    verifier.close()
+                    eblock(str(e))
+                    sys.exit(1)
                 print(f"{ARROW} Fetching {BLUE(f'{base} {suite}/{comp}')} ...",
                       end=" ", flush=True)
-                data = None
+                data = raw = None
+                used_ext = ""
                 attempts = [(".gz", gzip.decompress), ("", lambda b: b)]
                 if lzma:
                     attempts.insert(0, (".xz", lzma.decompress))
                 for ext, dec in attempts:
                     try:
-                        data = dec(fetch(stem + ext))
+                        raw = fetch(stem + ext)
+                        data = dec(raw)
+                        used_ext = ext
                         break
                     except Exception:
                         continue
+                this_signed = False
+                if data is not None:
+                    # Release records the hash of the file as transferred, so
+                    # this has to check the bytes before decompression.
+                    try:
+                        this_signed = verifier.check_index(
+                            base, suite, signed_by, relbase + used_ext, raw)
+                        signed += this_signed
+                    except RuntimeError as e:
+                        print(RED("FAILED"))
+                        verifier.close()
+                        eblock(str(e))
+                        sys.exit(1)
                 if data is None and flat and base.startswith("file://"):
                     directory = base[len("file://"):]
                     if os.path.isdir(directory):
@@ -957,13 +1244,23 @@ class DpkgBackend:
                 else:
                     if not (flat and base.startswith("file://")
                             and not os.path.exists(stem)):
-                        print(GREEN("done") + f" ({len(data) / 2**20:,.1f} MiB)")
+                        mark = f" [{GREEN('gpg ✓')}]" if this_signed else ""
+                        print(GREEN("done") +
+                              f" ({len(data) / 2**20:,.1f} MiB){mark}")
                 with open(self._tree_file(base, suite, comp), "wb") as f:
                     f.write(data)
                 ok += 1
                 if flat:
                     break
+        verifier.close()
         print(f"\n{ARROW} Sync completed: {ok} indexes in {TREE_DIR}")
+        if verifier.enabled:
+            if signed == ok:
+                einfo(f"All {ok} indexes verified against signed Release files.")
+            else:
+                tail = " (see warnings above)" if verifier.had_warnings else ""
+                ewarn(f"{signed} of {ok} indexes were signature-verified; "
+                      f"the rest could not be checked{tail}.")
         einfo("In post-sync... " + GREEN("done!"))
 
     # -- index --------------------------------------------------------------
@@ -1209,7 +1506,7 @@ class DpkgBackend:
 
     def _download(self):
         os.makedirs(DISTFILES, exist_ok=True)
-        bases = [b for b, _, _ in read_sources()]
+        bases = [b for b, *_ in read_sources()]
         paths, total = [], len(self._plan)
         for i, st in enumerate(self._plan, 1):
             fname = os.path.basename(st["Filename"])
@@ -2322,7 +2619,17 @@ Actions:
                  http(s):// or file:// into {TREE_DIR}; a
                  file:// flat entry pointing at a bare directory of .deb
                  files (e.g. a USB stick) gets an index generated for it
-                 on the spot with dpkg-deb.
+                 on the spot with dpkg-deb. Each downloaded index is checked
+                 against the archive's signed Release file (see --no-verify).
+
+   --no-verify   Skips signature checking during --sync on the dpkg backend.
+                 By default each index is verified with gpgv against the
+                 archive's InRelease (or Release plus Release.gpg), using the
+                 keyring named by the entry's signed-by option, or every key
+                 in /etc/apt/trusted.gpg.d otherwise; the index is then
+                 checked against the SHA256 recorded in that signed Release.
+                 A failed check aborts the sync. Missing signatures only
+                 warn, so unsigned local repositories keep working.
 
    --unmerge (-C)
                  WARNING: This action can remove important packages! Removes
@@ -2475,7 +2782,7 @@ def main(argv):
                                "fetchonly", "oneshot", "search", "searchdesc",
                                "unmerge", "depclean", "sync",
                                "buildpkg", "buildpkgonly", "dispatch",
-                               "no_dep_upgrade")}
+                               "no_dep_upgrade", "no_verify")}
     pkgs, backend_flag = [], None
     if not argv:
         print(HELP); return
@@ -2490,6 +2797,8 @@ def main(argv):
             opts["dispatch"] = True; continue
         if arg == "--no-dep-upgrade":
             opts["no_dep_upgrade"] = True; continue
+        if arg == "--no-verify":
+            opts["no_verify"] = True; continue
         if arg == "--with" or arg.startswith("--with="):
             # --with pkg,pkg  or  --with=pkg,pkg : permit these installed
             # packages to move under --no-dep-upgrade
@@ -2551,7 +2860,10 @@ def main(argv):
     be = pick_backend(backend_flag)
 
     if opts["sync"]:
-        be.sync(); return
+        # the apt backend's sync is apt-get update, which verifies on its own
+        be.sync(**({} if be.name == "apt"
+                   else {"verify": not opts["no_verify"]}))
+        return
     if opts["searchdesc"] or opts["search"]:
         if not pkgs:
             eerror("no search terms given."); sys.exit(1)

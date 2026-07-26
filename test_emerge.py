@@ -9,13 +9,17 @@ Tests that compare against real Debian tools (dpkg, diff3) skip themselves
 when those tools are absent, so the suite still runs on a non-Debian box.
 """
 
+import base64
+import hashlib
 import importlib.machinery
 import importlib.util
 import io
 import os
 import shutil
 import subprocess
+import tempfile
 import unittest
+import urllib.error
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "emerge")
@@ -936,6 +940,387 @@ class TestDepOk(unittest.TestCase):
     def test_missing_everywhere(self):
         self.assertFalse(em._dep_ok(("nope", None, None), {}, {}, {},
                                     self.none_provides))
+
+
+# ---------------------------------------------------------------------------
+# Repository signature verification
+# ---------------------------------------------------------------------------
+
+def armour(payload, headers=""):
+    b64 = base64.b64encode(payload).decode()
+    body = "\n".join(b64[i:i + 64] for i in range(0, len(b64), 64))
+    return ("-----BEGIN PGP PUBLIC KEY BLOCK-----\n"
+            + (headers + "\n" if headers else "")
+            + "\n" + body + "\n=AbCd\n"
+            + "-----END PGP PUBLIC KEY BLOCK-----\n").encode()
+
+
+def clearsign(body, headers="Hash: SHA512"):
+    return ("-----BEGIN PGP SIGNED MESSAGE-----\n" + headers + "\n\n"
+            + body
+            + "-----BEGIN PGP SIGNATURE-----\n\nAAAA\n-----END PGP "
+              "SIGNATURE-----\n")
+
+
+class TestDearmor(unittest.TestCase):
+    def test_binary_keyring_passes_through(self):
+        raw = b"\x99\x01\x0d\x04binary key packets"
+        self.assertEqual(em.dearmor(raw), raw)
+
+    def test_armoured_block_is_decoded(self):
+        self.assertEqual(em.dearmor(armour(b"key packets here")),
+                         b"key packets here")
+
+    def test_armour_headers_are_skipped(self):
+        self.assertEqual(
+            em.dearmor(armour(b"payload", headers="Version: GnuPG v2")),
+            b"payload")
+
+    def test_crc_trailer_is_not_decoded(self):
+        """The '=AbCd' line is a CRC24 checksum, not key material. Feeding it
+        to the decoder appends three junk bytes to the keyring."""
+        self.assertEqual(em.dearmor(armour(b"abc")), b"abc")
+        payload = b"x" * 48          # encodes without '=' padding of its own
+        self.assertEqual(em.dearmor(armour(payload)), payload)
+
+    def test_multiple_blocks_concatenate(self):
+        """A keyring file may hold several keys; gpgv wants them all."""
+        both = armour(b"first") + armour(b"second")
+        self.assertEqual(em.dearmor(both), b"firstsecond")
+
+    def test_undecodable_block_does_not_raise(self):
+        junk = (b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n!!!not base64!!!\n"
+                b"-----END PGP PUBLIC KEY BLOCK-----\n")
+        self.assertEqual(em.dearmor(junk), b"")
+
+
+class TestClearsignedPayload(unittest.TestCase):
+    def test_extracts_the_signed_body(self):
+        body = "Origin: Debian\nSuite: stable\n"
+        self.assertEqual(em.clearsigned_payload(clearsign(body)), body)
+
+    def test_body_keeps_its_final_newline_only_once(self):
+        """The newline before the signature armour terminates the last line;
+        emitting it again makes the payload one byte longer than the detached
+        Release it must match."""
+        body = "A: 1\nB: 2\n"
+        self.assertEqual(len(em.clearsigned_payload(clearsign(body))),
+                         len(body))
+
+    def test_dash_escaping_is_undone(self):
+        signed = clearsign("- -----BEGIN SOMETHING-----\nreal line\n")
+        self.assertEqual(em.clearsigned_payload(signed),
+                         "-----BEGIN SOMETHING-----\nreal line\n")
+
+    def test_multiple_hash_headers(self):
+        body = "X: 1\n"
+        self.assertEqual(
+            em.clearsigned_payload(clearsign(body, "Hash: SHA256\nHash: SHA1")),
+            body)
+
+    def test_not_clearsigned_returns_none(self):
+        self.assertIsNone(em.clearsigned_payload("Origin: Debian\n"))
+
+    def test_missing_signature_block_returns_none(self):
+        self.assertIsNone(em.clearsigned_payload(
+            "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\nbody\n"))
+
+
+RELEASE_SAMPLE = """\
+Origin: Debian
+Suite: stable
+MD5Sum:
+ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1234 main/binary-amd64/Packages
+ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 99 md5-only/Packages
+SHA256:
+ 1111111111111111111111111111111111111111111111111111111111111111 1234 main/binary-amd64/Packages
+ 2222222222222222222222222222222222222222222222222222222222222222 567 main/binary-amd64/Packages.xz
+Acquire-By-Hash: yes
+"""
+
+
+class TestReleaseHashes(unittest.TestCase):
+    def test_reads_the_sha256_section(self):
+        h = em.release_hashes(RELEASE_SAMPLE)
+        self.assertEqual(h["main/binary-amd64/Packages"], "1" * 64)
+        self.assertEqual(h["main/binary-amd64/Packages.xz"], "2" * 64)
+
+    def test_md5_section_is_ignored(self):
+        """MD5Sum lists the same paths and is written first, so a parser that
+        read both would be saved only by SHA256 overwriting it. A path that
+        appears solely under MD5Sum must not show up at all."""
+        h = em.release_hashes(RELEASE_SAMPLE)
+        self.assertNotIn("md5-only/Packages", h)
+        self.assertNotIn("a" * 32, h.values())
+
+    def test_section_ends_at_the_next_field(self):
+        self.assertNotIn("yes", em.release_hashes(RELEASE_SAMPLE))
+        self.assertEqual(len(em.release_hashes(RELEASE_SAMPLE)), 2)
+
+    def test_release_without_sha256(self):
+        self.assertEqual(em.release_hashes("Origin: Debian\n"), {})
+
+
+class TestVerifier(unittest.TestCase):
+    """gpgv itself is stubbed here -- these cover the decisions made around
+    it. The signature check is exercised for real against the live archive."""
+
+    def setUp(self):
+        self.mod = load()
+        self.patch(self.mod.shutil, "which", lambda n: "/usr/bin/" + n)
+        self.warnings = []
+        self.mod.ewarn = self.warnings.append   # keep test output quiet
+
+    def patch(self, obj, attr, value):
+        original = getattr(obj, attr)
+        setattr(obj, attr, value)
+        self.addCleanup(setattr, obj, attr, original)
+
+    def make(self, gpgv_ok=True, files=None, enabled=True):
+        v = self.mod.Verifier(enabled)
+        self.addCleanup(v.close)
+        v._gpgv = lambda ring, sig, data=None: gpgv_ok
+        v._rings[None] = "/nonexistent/keyring.gpg"   # skip real keyring build
+        files = files or {}
+
+        def fake_fetch(url, timeout=60):
+            for suffix, payload in files.items():
+                if url.endswith(suffix):
+                    return payload
+            raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
+        self.mod.fetch = fake_fetch
+        return v
+
+    def test_inrelease_is_verified_and_unwrapped(self):
+        v = self.make(files={"InRelease": clearsign(RELEASE_SAMPLE).encode()})
+        self.assertEqual(v.release("http://x", "trixie"), RELEASE_SAMPLE)
+
+    def test_detached_release_is_used_when_no_inrelease(self):
+        v = self.make(files={"Release": RELEASE_SAMPLE.encode(),
+                             "Release.gpg": b"signature"})
+        self.assertEqual(v.release("http://x", "trixie"), RELEASE_SAMPLE)
+
+    def test_bad_inrelease_signature_is_fatal(self):
+        v = self.make(gpgv_ok=False,
+                      files={"InRelease": clearsign(RELEASE_SAMPLE).encode()})
+        with self.assertRaises(RuntimeError) as cm:
+            v.release("http://x", "trixie")
+        self.assertIn("FAILED", str(cm.exception))
+
+    def test_bad_detached_signature_is_fatal(self):
+        v = self.make(gpgv_ok=False,
+                      files={"Release": RELEASE_SAMPLE.encode(),
+                             "Release.gpg": b"signature"})
+        with self.assertRaises(RuntimeError):
+            v.release("http://x", "trixie")
+
+    def test_missing_release_warns_but_does_not_raise(self):
+        """A USB-stick repo has no Release at all; that must not be fatal."""
+        v = self.make(files={})
+        self.assertIsNone(v.release("http://x", "trixie"))
+        self.assertTrue(v.had_warnings)
+
+    def test_disabled_verifier_checks_nothing(self):
+        v = self.make(enabled=False,
+                      files={"InRelease": clearsign(RELEASE_SAMPLE).encode()})
+        self.assertIsNone(v.release("http://x", "trixie"))
+
+    def test_release_is_fetched_once_per_suite(self):
+        calls = []
+        v = self.make(files={"InRelease": clearsign(RELEASE_SAMPLE).encode()})
+        inner = self.mod.fetch
+        self.mod.fetch = lambda url, timeout=60: (calls.append(url),
+                                                  inner(url, timeout))[1]
+        v.release("http://x", "trixie")
+        v.release("http://x", "trixie")
+        self.assertEqual(len(calls), 1)
+
+    # -- check_index ---------------------------------------------------------
+
+    def index_verifier(self):
+        return self.make(files={"InRelease": clearsign(RELEASE_SAMPLE).encode()})
+
+    def test_matching_index_verifies(self):
+        v = self.index_verifier()
+        data = b"payload"
+        digest = hashlib.sha256(data).hexdigest()
+        self.patch(self.mod, "release_hashes",
+                   lambda text: {"main/binary-amd64/Packages": digest})
+        self.assertTrue(v.check_index("http://x", "trixie", None,
+                                      "main/binary-amd64/Packages", data))
+        self.assertEqual(v.checked, 1)
+
+    def test_mismatching_index_raises(self):
+        v = self.index_verifier()
+        with self.assertRaises(RuntimeError) as cm:
+            v.check_index("http://x", "trixie", None,
+                          "main/binary-amd64/Packages", b"tampered")
+        self.assertIn("SHA256 mismatch", str(cm.exception))
+
+    def test_index_absent_from_release_warns(self):
+        v = self.index_verifier()
+        self.assertFalse(v.check_index("http://x", "trixie", None,
+                                       "main/binary-i386/Packages", b"x"))
+        self.assertTrue(v.had_warnings)
+
+    def test_unverifiable_release_means_unchecked_not_failed(self):
+        v = self.make(files={})
+        self.assertFalse(v.check_index("http://x", "trixie", None,
+                                       "main/binary-amd64/Packages", b"x"))
+
+    # -- keyring assembly ----------------------------------------------------
+
+    def test_keyring_merges_every_trusted_key(self):
+        """gpgv fails a file whose signatures it cannot all check, and Debian
+        signs InRelease several times, so the keys must arrive together."""
+        with tempfile.TemporaryDirectory() as d:
+            for name, payload in (("a.asc", b"AAA"), ("b.gpg", b"BBB")):
+                with open(os.path.join(d, name), "wb") as f:
+                    f.write(armour(payload) if name.endswith(".asc")
+                            else payload)
+            v = self.mod.Verifier(True)
+            self.addCleanup(v.close)
+            self.patch(self.mod, "TRUSTED_DIR", d)
+            self.patch(self.mod, "TRUSTED_LEGACY", "/nonexistent")
+            with open(v.keyring(), "rb") as f:
+                self.assertEqual(f.read(), b"AAABBB")
+
+    def test_keyring_includes_the_legacy_trusted_gpg(self):
+        """Pre-deb822 systems keep keys in /etc/apt/trusted.gpg; dropping it
+        would silently stop trusting repositories that still rely on it."""
+        with tempfile.TemporaryDirectory() as d:
+            legacy = os.path.join(d, "trusted.gpg")
+            with open(legacy, "wb") as f:
+                f.write(b"LEGACY")
+            v = self.mod.Verifier(True)
+            self.addCleanup(v.close)
+            self.patch(self.mod, "TRUSTED_DIR", "/nonexistent")
+            self.patch(self.mod, "TRUSTED_LEGACY", legacy)
+            with open(v.keyring(), "rb") as f:
+                self.assertEqual(f.read(), b"LEGACY")
+
+    def test_signed_by_pins_one_keyring(self):
+        with tempfile.TemporaryDirectory() as d:
+            named = os.path.join(d, "repo.gpg")
+            with open(named, "wb") as f:
+                f.write(b"ONLYTHIS")
+            v = self.mod.Verifier(True)
+            self.addCleanup(v.close)
+            self.patch(self.mod, "TRUSTED_DIR", d)
+            with open(v.keyring(named), "rb") as f:
+                self.assertEqual(f.read(), b"ONLYTHIS")
+
+    def test_inline_signed_by_key_material(self):
+        v = self.mod.Verifier(True)
+        self.addCleanup(v.close)
+        with open(v.keyring(armour(b"INLINE").decode()), "rb") as f:
+            self.assertEqual(f.read(), b"INLINE")
+
+    def test_no_keys_yields_no_keyring(self):
+        v = self.mod.Verifier(True)
+        self.addCleanup(v.close)
+        self.patch(self.mod, "TRUSTED_DIR", "/nonexistent")
+        self.patch(self.mod, "TRUSTED_LEGACY", "/nonexistent")
+        self.assertIsNone(v.keyring())
+
+    def test_close_removes_temporary_files(self):
+        v = self.mod.Verifier(True)
+        path = v._tmpfile(b"data", ".gpg")
+        self.assertTrue(os.path.exists(path))
+        v.close()
+        self.assertFalse(os.path.exists(path))
+
+    def test_missing_gpgv_disables_verification(self):
+        self.patch(self.mod.shutil, "which", lambda n: None)
+        v = self.mod.Verifier(True)
+        self.addCleanup(v.close)
+        self.assertFalse(v.enabled)
+        self.assertTrue(v.wanted)
+
+
+class TestReadSourcesSignedBy(unittest.TestCase):
+    """read_sources reads fixed paths under /etc/apt, so this fakes that
+    corner of the filesystem rather than touching the real one."""
+
+    def setUp(self):
+        self.mod = load()
+
+    def parse(self, files):
+        mod = self.mod
+
+        def fake_isfile(p):
+            return p in files
+
+        def fake_isdir(p):
+            return p == "/etc/apt/sources.list.d"
+
+        def fake_listdir(p):
+            prefix = "/etc/apt/sources.list.d/"
+            return sorted(k[len(prefix):] for k in files
+                          if k.startswith(prefix))
+
+        def fake_open(path, *a, **kw):
+            return io.StringIO(files[path])
+
+        for obj, attr, val in ((mod.os.path, "isfile", fake_isfile),
+                               (mod.os.path, "isdir", fake_isdir),
+                               (mod.os, "listdir", fake_listdir)):
+            original = getattr(obj, attr)
+            setattr(obj, attr, val)
+            self.addCleanup(setattr, obj, attr, original)
+        mod.open = fake_open
+        return mod.read_sources()
+
+    def test_plain_one_line_entry(self):
+        got = self.parse({"/etc/apt/sources.list":
+                          "deb http://deb.debian.org/debian trixie main\n"})
+        self.assertEqual(got, [("http://deb.debian.org/debian", "trixie",
+                                ["main"], None)])
+
+    def test_one_line_signed_by_is_captured(self):
+        got = self.parse({"/etc/apt/sources.list":
+                          "deb [signed-by=/usr/share/keyrings/x.gpg] "
+                          "http://r/ trixie main\n"})
+        self.assertEqual(got[0][3], "/usr/share/keyrings/x.gpg")
+
+    def test_signed_by_among_other_options(self):
+        got = self.parse({"/etc/apt/sources.list":
+                          "deb [arch=amd64 signed-by=/k.gpg trusted=no] "
+                          "http://r/ trixie main contrib\n"})
+        self.assertEqual(got[0][3], "/k.gpg")
+        self.assertEqual(got[0][2], ["main", "contrib"])
+
+    def test_options_block_is_still_stripped_from_the_url(self):
+        got = self.parse({"/etc/apt/sources.list":
+                          "deb [arch=amd64] http://r/x trixie main\n"})
+        self.assertEqual(got[0][0], "http://r/x")
+
+    def test_deb822_signed_by(self):
+        got = self.parse({"/etc/apt/sources.list.d/docker.sources":
+                          "Types: deb\nURIs: https://download.docker.com/d\n"
+                          "Suites: trixie\nComponents: stable\n"
+                          "Signed-By: /etc/apt/keyrings/docker.asc\n"})
+        self.assertEqual(got, [("https://download.docker.com/d", "trixie",
+                                ["stable"], "/etc/apt/keyrings/docker.asc")])
+
+    def test_deb822_without_signed_by(self):
+        got = self.parse({"/etc/apt/sources.list.d/x.sources":
+                          "Types: deb\nURIs: http://r\nSuites: trixie\n"
+                          "Components: main\n"})
+        self.assertIsNone(got[0][3])
+
+    def test_deb_src_lines_are_skipped(self):
+        got = self.parse({"/etc/apt/sources.list":
+                          "deb-src http://r trixie main\n"
+                          "deb http://r trixie main\n"})
+        self.assertEqual(len(got), 1)
+
+    def test_comments_are_skipped(self):
+        got = self.parse({"/etc/apt/sources.list":
+                          "# deb http://evil trixie main\n"
+                          "deb http://r trixie main\n"})
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0][0], "http://r")
 
 
 # ---------------------------------------------------------------------------
