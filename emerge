@@ -49,6 +49,7 @@ Paths (dpkg backend): tree /var/lib/emerge-dpkg/tree, world file
 
 import difflib
 import email.utils
+import functools
 import gzip
 import hashlib
 import os
@@ -355,6 +356,7 @@ class DpkgBackend:
     def __init__(self):
         self.pkgs = {}        # name -> best index stanza
         self.provides = {}    # virtual -> [(provider, version|None)]
+        self.versions = None  # name -> [stanza,...] (built lazily on demand)
         self._plan = []       # resolver output stanzas, kept for merge()
         self._seed_world()
 
@@ -462,25 +464,55 @@ class DpkgBackend:
 
     # -- index --------------------------------------------------------------
 
-    def _load_index(self):
-        if self.pkgs:
+    def _load_index(self, all_versions=False):
+        if self.pkgs and (self.versions is not None or not all_versions):
             return
         if not os.path.isdir(TREE_DIR) or not os.listdir(TREE_DIR):
             eerror("No package tree found. Run `emerge --sync` first.")
             sys.exit(1)
-        for fn in os.listdir(TREE_DIR):
-            with open(os.path.join(TREE_DIR, fn), errors="replace") as f:
-                for st in parse_stanzas(f.read()):
-                    name = st.get("Package")
-                    if not name or "Version" not in st:
-                        continue
-                    cur = self.pkgs.get(name)
-                    if cur is None or vercmp(st["Version"], cur["Version"]) > 0:
-                        self.pkgs[name] = st
-        for name, st in self.pkgs.items():
-            for clauses in parse_depends(st.get("Provides", "")):
-                for (v, _, ver) in clauses:
-                    self.provides.setdefault(v, []).append((name, ver))
+        allvers = {} if all_versions else None
+        if not self.pkgs:
+            for fn in os.listdir(TREE_DIR):
+                with open(os.path.join(TREE_DIR, fn), errors="replace") as f:
+                    for st in parse_stanzas(f.read()):
+                        name = st.get("Package")
+                        if not name or "Version" not in st:
+                            continue
+                        if allvers is not None:
+                            allvers.setdefault(name, []).append(st)
+                        cur = self.pkgs.get(name)
+                        if cur is None or vercmp(st["Version"],
+                                                 cur["Version"]) > 0:
+                            self.pkgs[name] = st
+            for name, st in self.pkgs.items():
+                for clauses in parse_depends(st.get("Provides", "")):
+                    for (v, _, ver) in clauses:
+                        self.provides.setdefault(v, []).append((name, ver))
+        elif all_versions:
+            # index already loaded newest-only; re-read just to collect
+            # every version (only reached when --no-dep-upgrade runs)
+            for fn in os.listdir(TREE_DIR):
+                with open(os.path.join(TREE_DIR, fn), errors="replace") as f:
+                    for st in parse_stanzas(f.read()):
+                        name = st.get("Package")
+                        if name and "Version" in st:
+                            allvers.setdefault(name, []).append(st)
+
+        if all_versions:
+            # newest-first per package, for the downgrade search. Most
+            # packages have one version -- keep those, sort only the rest.
+            self.versions = {}
+            _key = functools.cmp_to_key(vercmp)
+            for name, sts in allvers.items():
+                if len(sts) == 1:
+                    self.versions[name] = sts
+                    continue
+                sts.sort(key=lambda s: _key(s["Version"]), reverse=True)
+                seen, ordered = set(), []
+                for st in sts:
+                    if st["Version"] not in seen:
+                        seen.add(st["Version"]); ordered.append(st)
+                self.versions[name] = ordered
 
     @staticmethod
     def _inst_provides(inst):
@@ -527,12 +559,11 @@ class DpkgBackend:
                                 keep.add(h); stack.append(h)
         return keep
 
-    def resolve(self, targets, update=False, deep=False):
-        self._load_index()
+    def resolve(self, targets, update=False, deep=False,
+                no_dep_upgrade=False):
+        self._load_index(all_versions=no_dep_upgrade)
         inst = installed_state()
         iprov = self._inst_provides(inst)
-        selected, order = {}, []
-        pending, reinstalls = set(), set()
 
         atoms, set_members = self.expand_sets(targets)
         self._atoms = list(atoms)          # only these get world-file entries
@@ -541,6 +572,22 @@ class DpkgBackend:
             # --deep widens the update scope from the set members to the
             # full dependency closure of the sets (Gentoo -uD @world)
             worklist = atoms + sorted(self._dep_closure(inst, set(set_members)))
+
+        if no_dep_upgrade:
+            return self._resolve_no_upgrade(worklist, atoms, inst, iprov,
+                                            update)
+        return self._resolve_inner(worklist, atoms, inst, iprov, update,
+                                   pins={})
+
+    def _resolve_inner(self, worklist, atoms, inst, iprov, update, pins):
+        """Core resolver. `pins` maps name -> chosen stanza, overriding the
+        default 'newest' pick (used by the no-upgrade search to force older
+        target versions)."""
+        selected, order = {}, []
+        pending, reinstalls = set(), set()
+
+        def candidate(name):
+            return pins.get(name) or self.pkgs.get(name)
 
         def dep_satisfied(name, op, ver):
             if name in selected:
@@ -563,7 +610,7 @@ class DpkgBackend:
             return False
 
         def select(name, why):
-            st = self.pkgs.get(name)
+            st = candidate(name)
             if st is None:
                 provs = self.provides.get(name, [])
                 if provs:
@@ -579,7 +626,7 @@ class DpkgBackend:
                     if any(dep_satisfied(*a) for a in alts):
                         continue
                     for (dn, op, dv) in alts:
-                        cand = self.pkgs.get(dn)
+                        cand = candidate(dn)
                         if cand and (op is None
                                      or meets(cand["Version"], op, dv)):
                             select(dn, name)
@@ -596,7 +643,7 @@ class DpkgBackend:
                                            f'"{pretty}" of {name}')
 
         for t in worklist:
-            st = self.pkgs.get(t)
+            st = candidate(t)
             if st is None and t not in self.provides:
                 if t in atoms:
                     raise RuntimeError(f'there are no packages to satisfy "{t}"')
@@ -604,7 +651,7 @@ class DpkgBackend:
             iv = inst.get(t, {}).get("Version")
             if iv and st is not None:
                 r = vercmp(st["Version"], iv)
-                if r < 0:
+                if r < 0 and t not in pins:
                     continue                # repo older than installed
                 if r == 0:
                     if update:              # -u: skip up-to-date
@@ -639,6 +686,66 @@ class DpkgBackend:
                                 f"-- blocked; unmerge it first")
         self._plan = plan
         return merges
+
+    def _upgrades_in(self, merges, inst):
+        """Names in a merge plan that would upgrade an already-installed
+        package (the reboot-causing set we want to avoid)."""
+        return [n for n, newv, old, *_ in merges
+                if old is not None and vercmp(newv, old) > 0]
+
+    def _resolve_no_upgrade(self, worklist, atoms, inst, iprov, update):
+        """Find, per target, the newest version whose full closure upgrades
+        nothing already installed. Backtracks through older versions of each
+        target independently; a target that must upgrade a dep at every
+        version is reported as the blocker."""
+        pins = {}
+        # Resolve targets one at a time so each can be downgraded in isolation
+        # while seeing the pins already chosen for earlier targets.
+        real_targets = [t for t in worklist
+                        if t in self.versions or t in self.pkgs
+                        or t in self.provides]
+        blockers = []
+        for t in real_targets:
+            versions = self.versions.get(t)
+            if not versions:
+                continue
+            iv = inst.get(t, {}).get("Version")
+            chosen = None
+            last_bad = None
+            for st in versions:                    # newest first
+                if iv and vercmp(st["Version"], iv) < 0:
+                    break                          # don't downgrade below inst
+                trial = dict(pins); trial[t] = st
+                try:
+                    merges = self._resolve_inner(
+                        [t], atoms, inst, iprov, update, trial)
+                except RuntimeError:
+                    continue                       # this version won't resolve
+                ups = [u for u in self._upgrades_in(merges, inst) if u != t]
+                if not ups:
+                    chosen = st
+                    break
+                last_bad = (st["Version"], ups)
+            if chosen is None:
+                if last_bad:
+                    blockers.append((t, last_bad[0], last_bad[1]))
+                else:
+                    blockers.append((t, iv or "?", ["(no satisfiable version)"]))
+            else:
+                pins[t] = chosen
+
+        if blockers:
+            lines = ["--no-dep-upgrade: no version avoids upgrading "
+                     "installed dependencies:"]
+            for t, ver, ups in blockers:
+                shown = ", ".join(sorted(set(ups))[:8])
+                lines.append(f"      {BOLD(t)} (best: {ver}) would need to "
+                             f"upgrade: {shown}")
+            raise RuntimeError("\n".join(lines))
+
+        # Final resolve with all target pins in place, so shared deps and
+        # ordering are computed once against the chosen set.
+        return self._resolve_inner(worklist, atoms, inst, iprov, update, pins)
 
     # -- fetch & install ----------------------------------------------------
 
@@ -860,9 +967,80 @@ class AptBackend:
                 atoms.append(t)
         return atoms, sorted(members), had_world
 
-    def resolve(self, targets, update=False, deep=False):
+    def _madison_versions(self, pkg):
+        """All available versions of pkg, newest-first."""
+        r = capture(["apt-cache", "madison", pkg])
+        vers = []
+        for line in r.stdout.splitlines():
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) >= 2 and parts[0] == pkg:
+                vers.append(parts[1])
+        # de-dup preserving apt's order, then sort strictly newest-first
+        seen = [v for i, v in enumerate(vers) if v not in vers[:i]]
+        return sorted(seen, key=functools.cmp_to_key(vercmp), reverse=True)
+
+    def _simulate(self, specs):
+        """Return (upgrades, error). upgrades = installed pkgs this action
+        would move to a newer version."""
+        r = capture(["apt-get", "-s", "-qq",
+                     "-o", "APT::Get::Show-User-Simulation-Note=0",
+                     "install"] + specs)
+        if r.returncode != 0:
+            return None, (r.stderr or r.stdout).strip().replace("E: ", "")
+        ups = []
+        for line in r.stdout.splitlines():
+            m = re.match(r"^Inst (\S+) \[([^\]]+)\] \((\S+) ", line)
+            if m and vercmp(m.group(3), m.group(2)) > 0:
+                ups.append(m.group(1))
+        return ups, None
+
+    def _resolve_no_upgrade(self, atoms, members, update):
+        """Pick, per target, the newest version whose install upgrades no
+        already-installed package. Uses apt simulation per candidate."""
+        pins, blockers = [], []
+        for t in atoms + members:
+            iv = self._installed_version(t)
+            versions = self._madison_versions(t)
+            if not versions:
+                if t in atoms:
+                    blockers.append((t, "?", ["(not found)"]))
+                continue
+            chosen, last_bad = None, None
+            for v in versions:
+                if iv and vercmp(v, iv) < 0:
+                    break                              # don't downgrade
+                if iv and vercmp(v, iv) == 0 and update:
+                    chosen = None                      # already current, -u
+                    break
+                ups, err = self._simulate(pins + [f"{t}={v}"])
+                if err is not None:
+                    continue
+                ups = [u for u in ups if u != t]
+                if not ups:
+                    chosen = f"{t}={v}"
+                    break
+                last_bad = (v, ups)
+            if chosen:
+                pins.append(chosen)
+            elif last_bad:
+                blockers.append((t, last_bad[0], last_bad[1]))
+        if blockers:
+            lines = ["--no-dep-upgrade: no version avoids upgrading "
+                     "installed dependencies:"]
+            for t, ver, ups in blockers:
+                shown = ", ".join(sorted(set(ups))[:8])
+                lines.append(f"      {BOLD(t)} (best: {ver}) would need to "
+                             f"upgrade: {shown}")
+            raise RuntimeError("\n".join(lines))
+        self._action = ["install"] + pins
+        return pins
+
+    def resolve(self, targets, update=False, deep=False,
+                no_dep_upgrade=False):
         atoms, members, had_world = self.expand_sets(targets)
-        if had_world and update and deep:
+        if no_dep_upgrade:
+            self._resolve_no_upgrade(atoms, members, update)
+        elif had_world and update and deep:
             # emerge -uD @world: the full-tree upgrade apt's solver owns
             self._action = ["dist-upgrade"]
         elif update:
@@ -1690,6 +1868,20 @@ Options:
                  {DISTFILES} and are verified
                  against the index's SHA256.
 
+   --no-dep-upgrade
+                 Choose, for each target, the newest available version
+                 whose entire dependency closure is already satisfied by
+                 what is installed -- so the merge pulls in genuinely new
+                 dependencies but never *upgrades* one that is already
+                 present. This avoids dragging up libc, systemd, the
+                 kernel and similar packages (and the reboots they force)
+                 just to install a leaf. Unlike a version pin it does not
+                 freeze the graph: it searches older target versions until
+                 one fits, and fails -- naming the dependency that formed
+                 the wall -- if none does. Works on atoms and on @world;
+                 the search is per-target, so on a large set it runs many
+                 dependency simulations and can be slow.
+
    --oneshot (-1)
                  Emerge as normal, but do not add the packages to the world
                  file for later updating. (dpkg backend; the apt backend
@@ -1758,7 +1950,8 @@ def main(argv):
     opts = {k: False for k in ("ask", "verbose", "pretend", "update", "deep",
                                "fetchonly", "oneshot", "search", "searchdesc",
                                "unmerge", "depclean", "sync",
-                               "buildpkg", "buildpkgonly", "dispatch")}
+                               "buildpkg", "buildpkgonly", "dispatch",
+                               "no_dep_upgrade")}
     pkgs, backend_flag = [], None
     if not argv:
         print(HELP); return
@@ -1771,6 +1964,8 @@ def main(argv):
             opts["depclean"] = True; continue
         if arg in ("--dispatch-conf", "--etc-update", "--config-update"):
             opts["dispatch"] = True; continue
+        if arg == "--no-dep-upgrade":
+            opts["no_dep_upgrade"] = True; continue
         if arg in ("--help", "-h"):
             print(HELP); return
         if arg == "--version":
@@ -1883,7 +2078,8 @@ def main(argv):
         eerror("no targets given."); sys.exit(1)
     calc_deps_start()
     try:
-        merges = be.resolve(pkgs, update=opts["update"], deep=opts["deep"])
+        merges = be.resolve(pkgs, update=opts["update"], deep=opts["deep"],
+                            no_dep_upgrade=opts["no_dep_upgrade"])
     except RuntimeError as e:
         calc_deps_done(ok=False)
         print(f"\n{RED('!!!')} {BOLD(str(e))}")
