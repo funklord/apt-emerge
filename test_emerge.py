@@ -1385,6 +1385,244 @@ class TestArgParsing(unittest.TestCase):
         self.assertIn("--oneshot", self.parse([]))
 
 
+class TestLoadConf(unittest.TestCase):
+    """dispatch-conf.conf uses Gentoo's key names, so an operator can bring
+    habits across. Unknown keys must be ignored rather than crash."""
+
+    def setUp(self):
+        self.mod = load()
+        self.dir = tempfile.mkdtemp(prefix="emerge-conf-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def parse(self, text, alt=None):
+        main = os.path.join(self.dir, "conf")
+        with open(main, "w") as f:
+            f.write(text)
+        self.mod.CONF_FILE = main
+        self.mod.CONF_FILE_ALT = alt or os.path.join(self.dir, "absent")
+        return self.mod.load_conf()
+
+    def test_defaults_when_no_file_exists(self):
+        self.mod.CONF_FILE = os.path.join(self.dir, "nope")
+        self.mod.CONF_FILE_ALT = os.path.join(self.dir, "nope2")
+        self.assertEqual(self.mod.load_conf(), self.mod.DEFAULT_CONF)
+
+    def test_simple_assignment(self):
+        self.assertEqual(self.parse("automerge=no\n")["automerge"], "no")
+
+    def test_surrounding_whitespace_is_trimmed(self):
+        self.assertEqual(self.parse("  automerge  =  no  \n")["automerge"],
+                         "no")
+
+    def test_quotes_are_stripped(self):
+        c = self.parse('mergetool="meld {mine} {theirs}"\n')
+        self.assertEqual(c["mergetool"], "meld {mine} {theirs}")
+
+    def test_single_quotes_too(self):
+        self.assertEqual(self.parse("frozen-files='/etc/a /etc/b'\n")
+                         ["frozen-files"], "/etc/a /etc/b")
+
+    def test_comments_and_blank_lines_are_ignored(self):
+        c = self.parse("# automerge=yes\n\n   \nautomerge=no\n")
+        self.assertEqual(c["automerge"], "no")
+
+    def test_unknown_keys_are_ignored(self):
+        c = self.parse("nonsense=1\nautomerge=no\n")
+        self.assertNotIn("nonsense", c)
+        self.assertEqual(c["automerge"], "no")
+
+    def test_lines_without_an_equals_are_ignored(self):
+        self.assertEqual(self.parse("garbage\nautomerge=no\n")["automerge"],
+                         "no")
+
+    def test_conf_yes_spellings(self):
+        for text in ("yes", "YES", "true", "1", "on"):
+            with self.subTest(text=text):
+                self.assertTrue(self.mod.conf_yes({"k": text}, "k"))
+        for text in ("no", "false", "0", "off", "", "maybe"):
+            with self.subTest(text=text):
+                self.assertFalse(self.mod.conf_yes({"k": text}, "k"))
+
+    def test_conf_yes_defaults_to_no_for_a_missing_key(self):
+        self.assertFalse(self.mod.conf_yes({}, "absent"))
+
+
+class TestPkgConffiles(unittest.TestCase):
+    """Parses dpkg's Conffiles field, which is what tells the archiver which
+    files it is allowed to touch."""
+
+    def setUp(self):
+        self.mod = load()
+
+    def stub(self, stdout):
+        class R:
+            pass
+        R.stdout, R.stderr, R.returncode = stdout, "", 0
+        self.mod.capture = lambda cmd: R
+
+    def test_reads_the_paths(self):
+        self.stub(" /etc/foo.conf 0123abc\n /etc/bar.conf 4567def\n")
+        self.assertEqual(self.mod.pkg_conffiles("p"),
+                         ["/etc/foo.conf", "/etc/bar.conf"])
+
+    def test_obsolete_entries_are_skipped(self):
+        """dpkg keeps removed conffiles listed as obsolete; archiving one
+        would resurrect a file the package no longer ships."""
+        self.stub(" /etc/keep.conf 0123abc\n"
+                  " /etc/gone.conf 4567def obsolete\n")
+        self.assertEqual(self.mod.pkg_conffiles("p"), ["/etc/keep.conf"])
+
+    def test_blank_and_relative_lines_are_ignored(self):
+        self.stub("\n\n not-a-path 0123\n /etc/ok.conf 4567\n")
+        self.assertEqual(self.mod.pkg_conffiles("p"), ["/etc/ok.conf"])
+
+    def test_package_with_no_conffiles(self):
+        self.stub("\n")
+        self.assertEqual(self.mod.pkg_conffiles("p"), [])
+
+
+class TestArchiveSettled(unittest.TestCase):
+    """The half of config merging that decides what the *next* upgrade will
+    treat as the common ancestor.
+
+    Its timing is the load-bearing part and has been wrong before: archiving
+    the incoming version instead of the settled one makes new == ancestor,
+    so the 3-way merge sees no incoming change and every update is silently
+    discarded. These pin the rule -- archive what dpkg left in place, never
+    what it parked."""
+
+    def setUp(self):
+        self.mod = load()
+        self.dir = tempfile.mkdtemp(prefix="emerge-arch-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.etc = os.path.join(self.dir, "etc")
+        os.makedirs(self.etc)
+        self.conf = dict(self.mod.DEFAULT_CONF)
+        self.conf["archive-dir"] = os.path.join(self.dir, "archive")
+        self.conffiles = []
+        self.mod.pkg_conffiles = lambda pkg: list(self.conffiles)
+
+    def conffile(self, name, content, parked=None,
+                 suffix=".dpkg-dist"):
+        path = os.path.join(self.etc, name)
+        with open(path, "w") as f:
+            f.write(content)
+        if parked is not None:
+            with open(path + suffix, "w") as f:
+                f.write(parked)
+        self.conffiles.append(path)
+        return path
+
+    def archived(self, path):
+        with open(self.mod.archive_path(self.conf, path)) as f:
+            return f.read()
+
+    def has_archive(self, path):
+        return os.path.exists(self.mod.archive_path(self.conf, path))
+
+    def test_an_unmodified_conffile_becomes_the_ancestor(self):
+        """dpkg installed it without parking, so what is on disk is exactly
+        what the package ships -- the right thing to remember."""
+        p = self.conffile("plain.conf", "shipped v2\n")
+        self.assertEqual(self.mod.archive_settled(self.conf, ["pkg"]), 1)
+        self.assertEqual(self.archived(p), "shipped v2\n")
+
+    def test_a_parked_conffile_is_left_alone(self):
+        """This is the one that matters. You edited it, so dpkg parked the
+        new version and your edits are still on disk. Archiving the file as
+        it stands would record *your* version as what the package shipped,
+        and the next merge would have no idea anything changed."""
+        p = self.conffile("edited.conf", "my edits\n", parked="shipped v2\n")
+        self.assertEqual(self.mod.archive_settled(self.conf, ["pkg"]), 0)
+        self.assertFalse(self.has_archive(p))
+
+    def test_an_older_ancestor_survives_a_parked_update(self):
+        p = self.conffile("edited.conf", "my edits\n", parked="shipped v2\n")
+        dest = self.mod.archive_path(self.conf, p)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w") as f:
+            f.write("shipped v1\n")
+        self.mod.archive_settled(self.conf, ["pkg"])
+        self.assertEqual(self.archived(p), "shipped v1\n",
+                         "the previously shipped version is the ancestor")
+
+    def test_every_parked_suffix_counts(self):
+        for suffix in (".dpkg-dist", ".dpkg-new", ".ucf-dist", ".ucf-new"):
+            with self.subTest(suffix=suffix):
+                self.conffiles = []
+                p = self.conffile(f"c{suffix.replace('.', '')}.conf", "mine\n",
+                                  parked="theirs\n", suffix=suffix)
+                self.assertEqual(self.mod.archive_settled(self.conf, ["pkg"]),
+                                 0)
+                self.assertFalse(self.has_archive(p))
+
+    def test_a_missing_conffile_is_skipped(self):
+        self.conffiles.append(os.path.join(self.etc, "never-existed.conf"))
+        self.assertEqual(self.mod.archive_settled(self.conf, ["pkg"]), 0)
+
+    def test_mode_is_preserved_in_the_archive(self):
+        p = self.conffile("secret.conf", "token\n")
+        os.chmod(p, 0o600)
+        self.mod.archive_settled(self.conf, ["pkg"])
+        mode = os.stat(self.mod.archive_path(self.conf, p)).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+    def test_a_later_run_refreshes_the_ancestor(self):
+        p = self.conffile("plain.conf", "shipped v2\n")
+        self.mod.archive_settled(self.conf, ["pkg"])
+        with open(p, "w") as f:
+            f.write("shipped v3\n")
+        self.mod.archive_settled(self.conf, ["pkg"])
+        self.assertEqual(self.archived(p), "shipped v3\n")
+
+
+class TestAncestorFor(unittest.TestCase):
+    """Where the common ancestor comes from, in order of preference."""
+
+    def setUp(self):
+        self.mod = load()
+        self.dir = tempfile.mkdtemp(prefix="emerge-anc-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.conf = dict(self.mod.DEFAULT_CONF)
+        self.conf["archive-dir"] = os.path.join(self.dir, "archive")
+        self.ucf = os.path.join(self.dir, "ucf")
+        os.makedirs(self.ucf)
+        self.mod.UCF_CACHE = self.ucf
+        self.target = "/etc/thing.conf"
+
+    def put_archive(self, text):
+        dest = self.mod.archive_path(self.conf, self.target)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w") as f:
+            f.write(text)
+
+    def put_ucf(self, text):
+        # ucf mangles the path into a single filename
+        with open(os.path.join(self.ucf, self.target.replace("/", ":")),
+                  "w") as f:
+            f.write(text)
+
+    def test_our_archive_is_preferred(self):
+        self.put_archive("ours\n")
+        self.put_ucf("ucfs\n")
+        lines, src = self.mod.ancestor_for(self.conf, self.target)
+        self.assertEqual(lines, ["ours\n"])
+        self.assertEqual(src, "archive")
+
+    def test_ucf_cache_is_the_fallback(self):
+        """ucf keeps the previously shipped version for the files it
+        manages, which is the same thing our archive holds."""
+        self.put_ucf("ucfs\n")
+        lines, src = self.mod.ancestor_for(self.conf, self.target)
+        self.assertEqual(lines, ["ucfs\n"])
+        self.assertEqual(src, "ucf cache")
+
+    def test_no_ancestor_anywhere(self):
+        """First upgrade after installing emerge: 2-way review only."""
+        self.assertEqual(self.mod.ancestor_for(self.conf, self.target),
+                         (None, None))
+
+
 class TestDispatchConf(unittest.TestCase):
     """The interactive config-merge loop, driven with scripted answers over a
     synthetic /etc. This decides what happens to files people have edited, so
@@ -1575,6 +1813,30 @@ class TestDispatchConf(unittest.TestCase):
     def test_nothing_pending_is_reported_and_does_not_prompt(self):
         out = self.dispatch()
         self.assertIn("up to date", out)
+
+    def test_portage_style_cfg_files_are_picked_up(self):
+        """Portage parks updates as ._cfg0000_<name>. Debian does not
+        produce these, but the tool answers to dispatch-conf and etc-update,
+        so someone will arrive with them."""
+        target = os.path.join(self.etc, "cfg.conf")
+        with open(target, "w") as f:
+            f.write("mine\n")
+        with open(os.path.join(self.etc, "._cfg0000_cfg.conf"), "w") as f:
+            f.write("theirs\n")
+        self.dispatch("2")
+        self.assertEqual(self.content(target), "theirs\n")
+
+    def test_the_diff_display_runs(self):
+        """color_diff only renders, but it runs on every conflict and a
+        traceback there would strand the review half way through."""
+        self.mod = load()          # undo setUp's stub of color_diff
+        self.mod.load_conf = lambda: self.conf
+        self.mod.need_root = lambda: None
+        self.mod.input = lambda prompt="": "1"
+        self.park("shown.conf", "a\nMINE\nc\n", "a\nTHEIRS\nc\n",
+                  ancestor="a\nb\nc\n")
+        out = self.dispatch("1")
+        self.assertIn("shown.conf", out)
 
     def test_a_parked_file_with_no_target_is_ignored(self):
         """dpkg only parks an update beside a file that already exists; a
