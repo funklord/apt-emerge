@@ -429,6 +429,19 @@ def same_upstream(v1, v2):
 # Packages whose rebuild can restart the display server / session even
 # though it is not a reboot-class change. A same-upstream bump here is the
 # dangerous kind: allowing it may kill X/Wayland and every GUI app running.
+# --- session-critical detection ---------------------------------------------
+#
+# A package is "session-critical" if rebuilding it could restart the running
+# display server / compositor / desktop and take your GUI apps with it. Rather
+# than trust a hand-maintained list, we derive the set from the live system:
+# find the processes that ARE the graphical session, see which shared
+# libraries they have mapped, and map those files back to packages. That set
+# is exactly "code the session is currently running", per-machine and self-
+# updating. On a headless box no session is found, so nothing is critical.
+#
+# The static set below is a fallback for when /proc can't be introspected
+# (unusual), and a fast-path recogniser.
+
 _SESSION_CRITICAL_EXACT = {
     "libgl1", "libglx-mesa0", "libglapi-mesa", "libgbm1", "libegl1",
     "libegl-mesa0", "libgles2", "libvulkan1", "libdrm2", "libgallium",
@@ -440,7 +453,102 @@ _SESSION_CRITICAL_EXACT = {
 _SESSION_CRITICAL_PREFIX = ("libgl1-mesa", "libgl1-amber", "xserver-xorg-video-",
                             "libmutter-", "libgtk-", "libqt5gui", "libqt6gui")
 
+# process names (comm) that identify a graphical session leader
+_SESSION_LEADER_COMMS = {
+    # X server / Xwayland
+    "Xorg", "X", "Xwayland",
+    # Wayland compositors / shells
+    "gnome-shell", "kwin_wayland", "kwin_x11", "plasmashell", "sway",
+    "weston", "mutter", "wayfire", "labwc", "hyprland", "river", "cosmic-comp",
+    "cinnamon", "xfwm4", "marco", "muffin", "compiz", "openbox", "i3",
+    # display managers
+    "gdm", "gdm3", "gdm-session-wor", "sddm", "sddm-greeter",
+    "lightdm", "lightdm-gtk-gre", "slick-greeter", "ly", "greetd",
+    # session buses that, if restarted, tear the session down
+    "Xwayland",
+}
+
+def _proc_comm(pid):
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+def _proc_mapped_libs(pid):
+    """Shared-library paths a process currently has mapped."""
+    libs = set()
+    try:
+        with open(f"/proc/{pid}/maps") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 6:
+                    path = parts[5]
+                    if path.startswith("/") and ".so" in path:
+                        libs.add(path)
+    except OSError:
+        pass
+    return libs
+
+def _find_session_leaders():
+    """PIDs whose comm marks them as a graphical-session leader."""
+    leaders = []
+    try:
+        pids = [d for d in os.listdir("/proc") if d.isdigit()]
+    except OSError:
+        return leaders
+    for pid in pids:
+        comm = _proc_comm(pid)
+        if comm and comm in _SESSION_LEADER_COMMS:
+            leaders.append(pid)
+    return leaders
+
+_session_critical_cache = None   # None = not computed; set() = computed empty
+
+def compute_session_critical_packages():
+    """Packages whose code the running graphical session has loaded. Cached
+    for the process. Empty set means: no session found (headless), so nothing
+    is session-critical. None-ish failures fall back to the static test."""
+    global _session_critical_cache
+    if _session_critical_cache is not None:
+        return _session_critical_cache
+
+    leaders = _find_session_leaders()
+    if not leaders:
+        _session_critical_cache = set()      # headless / no GUI session
+        return _session_critical_cache
+
+    libs = set()
+    for pid in leaders:
+        libs |= _proc_mapped_libs(pid)
+    if not libs:
+        _session_critical_cache = set()
+        return _session_critical_cache
+
+    # one batched dpkg-query -S for all libs (per-call is ~8x slower)
+    pkgs = set()
+    r = capture(["dpkg-query", "-S"] + sorted(libs))
+    for line in r.stdout.splitlines():
+        # format: "pkg1, pkg2: /path"  (diversions can list several)
+        head, _, _path = line.partition(": ")
+        if head:
+            for p in head.split(", "):
+                p = p.split(":")[0].strip()   # drop :arch qualifier
+                if p:
+                    pkgs.add(p)
+    _session_critical_cache = pkgs
+    return pkgs
+
 def is_session_critical(name):
+    """True if moving `name` could disturb the running session. Prefers the
+    live-derived set; falls back to the static recogniser when no session was
+    detected (so headless boxes report nothing, and the static list only acts
+    as a safety net where introspection returned empty for another reason)."""
+    live = compute_session_critical_packages()
+    if live:
+        return name in live
+    # no live session detected -> nothing to protect, UNLESS introspection
+    # simply isn't available; the static set is the conservative fallback
     if name in _SESSION_CRITICAL_EXACT:
         return True
     return any(name.startswith(p) for p in _SESSION_CRITICAL_PREFIX)
@@ -535,6 +643,7 @@ def print_merge_list(merges, verbose):
     kind: 'ebuild' (source build / normal merge) | 'binary' (dep .deb)"""
     n_new = n_up = n_down = n_re = 0
     dl = 0
+    crit = []
     for name, newver, oldver, size, kind, use in merges:
         if oldver is None:
             flag, col = "N", GREEN; n_new += 1
@@ -548,6 +657,10 @@ def print_merge_list(merges, verbose):
                 f"{BGREEN(name + '-' + newver)}")
         if flag in "UD":
             line += f" [{BLUE(oldver)}]"
+        # flag upgrades/downgrades of packages the running session is using
+        if flag in "UD" and is_session_critical(name):
+            line += f" {YELLOW('(session)')}"
+            crit.append(name)
         if use:
             line += f' USE="{RED(use)}"'
         if verbose and size:
@@ -562,6 +675,12 @@ def print_merge_list(merges, verbose):
     if verbose and dl:
         s += f", Size of downloads: {dl / 2**20:,.1f} MiB"
     print(s)
+    if crit:
+        print()
+        ewarn(f"{len(crit)} package(s) in use by your graphical session "
+              f"would be upgraded: {', '.join(crit[:8])}"
+              + (" ..." if len(crit) > 8 else ""))
+        ewarn("Applying these may restart X/Wayland and close running apps.")
 
 def print_unmerge_list(removals):
     print(f"\n{BGREEN(' These are the packages that would be unmerged:')}\n")
