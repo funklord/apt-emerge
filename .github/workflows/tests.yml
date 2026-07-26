@@ -1,0 +1,103 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # The spread of interpreters. emerge is stdlib-only by design, so the point
+  # here is that it keeps working on whatever Python a target box happens to
+  # ship -- an embedded Debian is not necessarily current.
+  unit:
+    name: python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # dpkg-scanpackages (dpkg-dev) builds the test repository; diff3 and
+      # dpkg back the differential tests; gpgv backs signature verification.
+      - name: Install the Debian tooling the tests shell out to
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            dpkg-dev diffutils gpgv
+
+      - name: Byte-compile the shipped script
+        run: python3 -m py_compile emerge
+
+      - name: Unit tests
+        run: python3 -m unittest test_emerge -v
+
+      - name: Integration tests
+        run: python3 -m unittest test_integration -v
+
+      # These pass locally by accident of CPython refcounting if a handle is
+      # left open; make that a failure rather than a warning.
+      - name: Tests must not leak file handles
+        run: python3 -W error::ResourceWarning -m unittest test_emerge test_integration
+
+  # The actual target platform. Ubuntu runners are close, but the version
+  # quirks this project exists for (+debNuN, binNMU) are Debian's.
+  debian:
+    name: debian trixie
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            python3 dpkg-dev diffutils gpgv ca-certificates
+
+      - name: Byte-compile the shipped script
+        run: python3 -m py_compile emerge
+
+      - name: Full suite
+        run: python3 -m unittest test_emerge test_integration -v
+
+  # Hard rule 1: the shipped artifact is a single stdlib-only file. That is
+  # the whole deploy story for apt-less boxes, and it is easy to break by
+  # reaching for a convenient dependency.
+  stdlib-only:
+    name: stdlib-only
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The shipped script must import nothing outside the stdlib
+        run: |
+          python3 - <<'EOF'
+          import ast, sys
+          mods = set()
+          for node in ast.walk(ast.parse(open("emerge").read())):
+              if isinstance(node, ast.Import):
+                  mods.update(a.name.split(".")[0] for a in node.names)
+              elif (isinstance(node, ast.ImportFrom)
+                    and node.level == 0 and node.module):
+                  mods.add(node.module.split(".")[0])
+          extra = sorted(mods - set(sys.stdlib_module_names))
+          print("imports:", ", ".join(sorted(mods)))
+          if extra:
+              sys.exit(f"non-stdlib imports in the shipped script: {extra}")
+          EOF
+
+      - name: The shipped artifact must stay a single file
+        run: |
+          test -f emerge || { echo "emerge is missing"; exit 1; }
+          stray=$(ls *.py 2>/dev/null | grep -v '^test_' || true)
+          if [ -n "$stray" ]; then
+            echo "non-test .py files alongside emerge -- did the shipped" \
+                 "artifact stop being one file?"
+            echo "$stray"
+            exit 1
+          fi
