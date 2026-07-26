@@ -1133,6 +1133,105 @@ class TestPolicyBatch(unittest.TestCase):
         self.assertNotIn("nosuchpkg", got)
 
 
+class TestArgParsing(unittest.TestCase):
+    """A mistyped safety flag must not be silently dropped. `emerge
+    --no-dep-upgrades pkg` -- one letter off -- used to run an ordinary
+    unprotected install and say nothing."""
+
+    class Reached(Exception):
+        """Raised in place of backend construction: parsing got that far."""
+
+    def setUp(self):
+        self.mod = load()
+        self.errors = []
+        self.mod.eerror = self.errors.append
+        self.mod.ewarn = lambda m: None
+
+        def stop(_flag):
+            raise self.Reached()
+        self.mod.pick_backend = stop
+
+    def parse(self, argv):
+        """Run the parser only. Returns normally if it rejected the input."""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.mod.main(argv)
+        return buf.getvalue()
+
+    def assertAccepted(self, argv):
+        with self.assertRaises(self.Reached, msg=f"{argv} was rejected"):
+            self.parse(argv)
+
+    def assertRejected(self, argv):
+        with self.assertRaises(SystemExit, msg=f"{argv} was accepted"):
+            self.parse(argv)
+
+    # -- unknown options -----------------------------------------------------
+
+    def test_unknown_long_option_is_rejected(self):
+        self.assertRejected(["--nonsense", "nano"])
+        self.assertTrue(any("--nonsense" in e for e in self.errors))
+
+    def test_mistyped_safety_flag_is_rejected(self):
+        self.assertRejected(["--no-dep-upgrades", "libsdl3-dev"])
+
+    def test_unknown_short_option_is_rejected(self):
+        self.assertRejected(["-Z", "nano"])
+
+    # -- --with token consumption -------------------------------------------
+
+    def test_with_followed_by_an_option_is_rejected(self):
+        """The pending-token check runs before flag parsing, so without a
+        guard `--with -a pkg` swallowed the -a."""
+        self.assertRejected(["--no-dep-upgrade", "--with", "-a", "nano"])
+
+    def test_with_followed_by_a_long_option_is_rejected(self):
+        self.assertRejected(["--with", "--help"])
+
+    def test_trailing_with_is_rejected(self):
+        self.assertRejected(["--no-dep-upgrade", "nano", "--with"])
+
+    def test_with_takes_the_next_token(self):
+        self.assertAccepted(["--no-dep-upgrade", "--with", "libgbm1", "nano"])
+
+    def test_with_equals_form_is_accepted(self):
+        self.assertAccepted(["--no-dep-upgrade", "--with=libgbm1", "nano"])
+
+    # -- everything that must keep working -----------------------------------
+
+    def test_all_long_flags_are_accepted(self):
+        for flag in sorted(em.LONG_FLAGS):
+            with self.subTest(flag=flag):
+                self.setUp()
+                self.assertAccepted([flag, "nano"])
+
+    def test_standalone_long_options_are_accepted(self):
+        for flag in ("--no-dep-upgrade", "--depclean", "--no-verify",
+                     "--backend=apt"):
+            with self.subTest(flag=flag):
+                self.setUp()
+                self.assertAccepted([flag, "nano"])
+
+    def test_bundled_short_flags_are_accepted(self):
+        self.assertAccepted(["-pv1", "nano"])
+
+    def test_ignored_compatibility_flags_are_accepted(self):
+        self.assertAccepted(["-Nqt", "nano"])
+
+    def test_set_names_are_accepted(self):
+        for name in ("world", "system", "@world", "@system", "@selected"):
+            with self.subTest(name=name):
+                self.setUp()
+                self.assertAccepted(["-u", name])
+
+    def test_help_returns_without_building_a_backend(self):
+        out = self.parse(["--help"])
+        self.assertIn("--oneshot", out)
+
+    def test_no_arguments_prints_help(self):
+        self.assertIn("--oneshot", self.parse([]))
+
+
 class TestStreamApt(unittest.TestCase):
     """Portage-style output means suppressing most of apt's chatter, but a
     run that fails has to explain itself. dpkg reports the real cause on
