@@ -965,6 +965,7 @@ class TestUnmergeShowsTheCascade(unittest.TestCase):
         self.be._installed_version = staticmethod(lambda p: None)
         self.warnings = []
         self.mod.ewarn = self.warnings.append   # keep test output quiet
+        self.mod.eerror = self.warnings.append
 
     def sim(self, stdout, returncode=0):
         class R:
@@ -1057,6 +1058,63 @@ class TestPrintUnmergeList(unittest.TestCase):
         out = self.render([("a", "1"), ("b", "2")])
         self.assertNotIn("would also be removed", out)
         self.assertIn("a-1 b-2", out)
+
+
+class TestConfigWrite(unittest.TestCase):
+    """_write installs a merged file into /etc, so it has to be atomic,
+    durable, and leave nothing behind when it fails."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.path = os.path.join(self.dir, "conf")
+        with open(self.path, "w") as f:
+            f.write("original\n")
+        os.chmod(self.path, 0o600)
+
+    def test_replaces_the_content(self):
+        em._write(self.path, ["new\n", "lines\n"])
+        with open(self.path) as f:
+            self.assertEqual(f.read(), "new\nlines\n")
+
+    def test_preserves_mode(self):
+        em._write(self.path, ["x\n"])
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+
+    def test_leaves_no_temporary_file(self):
+        em._write(self.path, ["x\n"])
+        self.assertEqual(os.listdir(self.dir), ["conf"])
+
+    def test_contents_are_flushed_before_the_rename(self):
+        """A rename is atomic against readers but not against power loss."""
+        synced = []
+        real_fsync = os.fsync
+        os.fsync = lambda fd: (synced.append(fd), real_fsync(fd))[1]
+        try:
+            em._write(self.path, ["x\n"])
+        finally:
+            os.fsync = real_fsync
+        self.assertGreaterEqual(len(synced), 2)   # the file, and its directory
+
+    def failing_lines(self):
+        """Lines that blow up partway through writelines, as a full disk
+        would. The failure has to happen inside _write, not before it."""
+        class Exploding(list):
+            def __iter__(inner):
+                yield "partial\n"
+                raise OSError(28, "No space left on device")
+        return Exploding()
+
+    def test_a_failed_write_leaves_the_original_intact(self):
+        with self.assertRaises(OSError):
+            em._write(self.path, self.failing_lines())
+        with open(self.path) as f:
+            self.assertEqual(f.read(), "original\n")
+
+    def test_a_failed_write_cleans_up_its_temporary(self):
+        with self.assertRaises(OSError):
+            em._write(self.path, self.failing_lines())
+        self.assertEqual(os.listdir(self.dir), ["conf"])
 
 
 class TestAptIndexHas(unittest.TestCase):

@@ -1302,6 +1302,7 @@ class DpkgBackend:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, WORLD)
+        _fsync_dir(WORLD)
 
     # -- sync ---------------------------------------------------------------
 
@@ -2572,18 +2573,49 @@ def run_mergetool(conf, base, mine, theirs, output):
         cmd = tmpl % (output, mine, theirs)
     return subprocess.call(cmd, shell=True) == 0
 
+def _fsync_dir(path):
+    """Make a rename durable. The file's own fsync does not cover the
+    directory entry, so without this the replace itself can still be lost."""
+    try:
+        fd = os.open(os.path.dirname(path) or "/", os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
 def _write(path, lines):
-    """Replace in place, preserving mode/owner of the existing file."""
+    """Replace in place, preserving mode/owner of the existing file.
+
+    Durability matters more here than anywhere else in the script: this is
+    the step that installs a merged file into /etc. os.replace is atomic
+    against a concurrent reader but not against power loss -- without the
+    fsync the file can come back empty afterwards, and an empty sshd_config
+    is worse than either version we were choosing between."""
     st = os.stat(path)
     tmp = path + ".emerge-tmp"
-    with open(tmp, "w") as f:
-        f.writelines(lines)
-    os.chmod(tmp, st.st_mode)
     try:
-        os.chown(tmp, st.st_uid, st.st_gid)
-    except PermissionError:
-        pass
-    os.replace(tmp, path)
+        with open(tmp, "w") as f:
+            f.writelines(lines)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, st.st_mode)
+        try:
+            os.chown(tmp, st.st_uid, st.st_gid)
+        except PermissionError:
+            pass
+        os.replace(tmp, path)
+    except BaseException:
+        # never leave a half-written .emerge-tmp lying about in /etc
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    _fsync_dir(path)
 
 def _retire(conf, target, pending):
     """The parked file is what the package now ships: it becomes the ancestor
