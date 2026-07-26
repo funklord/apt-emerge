@@ -188,9 +188,10 @@ _OPS = {"<<": lambda r: r < 0, "<=": lambda r: r <= 0, "=": lambda r: r == 0,
 def meets(version, op, want):
     return _OPS[op](vercmp(version, want))
 
-def _dep_ok(alt, inst, chosen, iprov, prov_index):
+def _dep_ok(alt, inst, chosen, iprov, provides_of):
     """Is a single dependency alternative (name, op, ver) already satisfied
-    by an installed or already-chosen package (or a Provides of one)?"""
+    by an installed or already-chosen package (or a Provides of one)?
+    `provides_of` is a callable: name -> [(provider, version|None), ...]."""
     name, op, ver = alt
     if name in chosen:
         return op is None or meets(chosen[name]["Version"], op, ver)
@@ -200,13 +201,263 @@ def _dep_ok(alt, inst, chosen, iprov, prov_index):
     if op is None:
         if name in iprov:
             return True
-        if any(p in chosen for p, _ in prov_index.get(name, [])):
+        if any(p in chosen for p, _ in provides_of(name)):
             return True
     else:
         for _, pv in iprov.get(name, []):
             if pv and meets(pv, op, ver):
                 return True
     return False
+
+def ndu_solve(index, inst, iprov, worklist, atoms, update, allow=None):
+    """Shared --no-dep-upgrade closure solver, used by both backends.
+
+    `index` abstracts the package source with three methods:
+      index.all_versions(name) -> [stanza,...] newest-first (may be lazy)
+      index.has(name)          -> bool, name is a real package
+      index.provides_of(name)  -> [(provider, version|None), ...]
+
+    Rule: an installed dependency that satisfies its constraints is kept at
+    exactly its installed version (never version-searched). A not-installed
+    dependency takes the newest version whose subtree upgrades nothing
+    installed, stepping back to older versions as conflicts are found. An
+    installed package that cannot satisfy a constraint is a genuine wall.
+
+    `allow` is a set of installed package names the caller has permitted to
+    move; these are treated as not-installed for the no-upgrade check, so
+    their dependents may pull them up.
+
+    Returns (plan, merges). Raises NduWall (carrying the structured list of
+    packages that would have to move) when no combination avoids upgrading
+    an installed package outside `allow`."""
+    allow = allow or set()
+    # a permitted package is treated as absent from the installed set for
+    # the purpose of the no-upgrade checks, but its installed version is
+    # still remembered for reporting the eventual move
+    inst_v = {n: st["Version"] for n, st in inst.items()}
+    eff_inst = {n: st for n, st in inst.items() if n not in allow}
+
+    constraints = {}
+    chosen = {}
+    forced = {}
+    rejected = {}
+    clash_blame = {}
+
+    def satisfies(ver, cons):
+        return all(meets(ver, op, v) for op, v in cons if op)
+
+    def pick(name):
+        cons = constraints.get(name, [])
+        iv = eff_inst.get(name, {}).get("Version")
+        if iv is not None:
+            if satisfies(iv, cons):
+                return {"Package": name, "Version": iv, "_installed": True}
+            return None
+        bad = rejected.get(name, set())
+        cands = [s for s in index.all_versions(name)
+                 if satisfies(s["Version"], cons) and s["Version"] not in bad]
+        return cands[0] if cands else None
+
+    def forces_installed_upgrade(st):
+        for field in ("Pre-Depends", "Depends"):
+            for alts in parse_depends(st.get(field, "")):
+                if any(_dep_ok(a, eff_inst, chosen, iprov, index.provides_of)
+                       for a in alts):
+                    continue
+                dn, op, dv = alts[0]
+                if op and dn in eff_inst \
+                   and not meets(eff_inst[dn]["Version"], op, dv):
+                    return (dn, op, dv)
+        return None
+
+    def make_wall(primary_name, primary_iv, why, cons):
+        """Assemble the structured mover list for a wall. The primary is the
+        package that couldn't be kept; there may be more if `allow` lets some
+        through. We report the primary plus its forcing constraint."""
+        wanted = None
+        for op, v in cons or []:
+            if op in ("=", ">=", ">>", ">"):
+                wanted = v
+        movers = [{
+            "name": primary_name,
+            "installed": primary_iv,
+            "wanted": wanted or "(newer)",
+            "why": why,
+            "same_upstream": bool(wanted and primary_iv not in ("?", None)
+                                  and same_upstream(primary_iv, wanted)),
+            "session_critical": is_session_critical(primary_name),
+        }]
+        msg_lines = ["--no-dep-upgrade: cannot install without moving an "
+                     "already-installed package:"]
+        msg_lines += _format_movers(movers)
+        movable = ",".join(m["name"] for m in movers)
+        msg_lines.append("")
+        msg_lines.append(f"    to allow just this: {BOLD('--with ' + movable)} "
+                         f"(or answer the prompt under -a)")
+        return NduWall(movers, "\n".join(msg_lines))
+
+    stack = list(dict.fromkeys(worklist))
+    guard = 0
+    while stack:
+        guard += 1
+        if guard > 200000:
+            raise RuntimeError("--no-dep-upgrade: resolution did not "
+                               "converge (dependency cycle?)")
+        name = stack.pop(0)
+        if not index.has(name):
+            if name in atoms:
+                raise RuntimeError(f'there are no packages to satisfy "{name}"')
+            continue
+        st = pick(name)
+        if st is None:
+            iv = eff_inst.get(name, {}).get("Version", "?")
+            blame = clash_blame.get(name)
+            if blame and iv in ("?", None):
+                biv = eff_inst.get(blame, {}).get("Version",
+                                                  inst_v.get(blame, "?"))
+                raise make_wall(blame, biv, name, constraints.get(blame, []))
+            raise make_wall(name, iv, forced.get(name),
+                            constraints.get(name, []))
+
+        if "_installed" not in st and name not in eff_inst:
+            clash = forces_installed_upgrade(st)
+            if clash is not None:
+                cn, cop, cv = clash
+                rejected.setdefault(name, set()).add(st["Version"])
+                clash_blame[name] = cn
+                forced[cn] = name
+                cons = constraints.setdefault(cn, [])
+                if (cop, cv) not in cons:
+                    cons.append((cop, cv))
+                chosen.pop(name, None)
+                stack.insert(0, name)
+                continue
+
+        if chosen.get(name) is st:
+            continue
+        chosen[name] = st
+        for field in ("Pre-Depends", "Depends"):
+            for alts in parse_depends(st.get(field, "")):
+                if any(_dep_ok(a, eff_inst, chosen, iprov, index.provides_of)
+                       for a in alts):
+                    continue
+                dn, op, dv = alts[0]
+                real = dn
+                if not index.has(dn):
+                    prov = index.provides_of(dn)
+                    if prov:
+                        real = prov[0][0]
+                    else:
+                        raise RuntimeError(f'cannot satisfy "{dn}" '
+                                           f'(required by {name})')
+                if op:
+                    prev = constraints.setdefault(real, [])
+                    if (op, dv) not in prev:
+                        prev.append((op, dv))
+                        forced[real] = name
+                        if real in chosen:
+                            del chosen[real]
+                if real not in chosen and real not in stack:
+                    stack.append(real)
+
+    plan, merges = [], []
+    ordered = list(dict.fromkeys(
+        list(worklist) + [n for n in chosen if n not in worklist]))
+    for name in ordered:
+        st = chosen.get(name)
+        if st is None:
+            continue
+        old = inst.get(name, {}).get("Version")
+        if old and vercmp(st["Version"], old) == 0:
+            if not (name in atoms and not update):
+                continue
+        plan.append(st)
+        merges.append((name, st["Version"], old,
+                       int(st.get("Size", 0)), "ebuild", ""))
+
+    ups = [n for n, nv, old, *_ in merges
+           if old is not None and vercmp(nv, old) > 0 and n not in allow]
+    if ups:
+        # a package outside the allow-set still had to move: report as a wall
+        movers = []
+        for n in sorted(set(ups)):
+            row = next(m for m in merges if m[0] == n)
+            movers.append({
+                "name": n, "installed": row[2], "wanted": row[1],
+                "why": forced.get(n, "dependency"),
+                "same_upstream": same_upstream(row[2], row[1]),
+                "session_critical": is_session_critical(n),
+            })
+        lines = ["--no-dep-upgrade: cannot install without moving an "
+                 "already-installed package:"]
+        lines += _format_movers(movers)
+        lines.append("")
+        lines.append(f"    to allow: {BOLD('--with ' + ','.join(m['name'] for m in movers))}")
+        raise NduWall(movers, "\n".join(lines))
+    return plan, merges
+
+
+class _DpkgIndex:
+    """ndu_solve index backed by the dpkg backend's in-memory tree."""
+    def __init__(self, backend):
+        self.b = backend
+    def all_versions(self, name):
+        v = self.b.versions.get(name)
+        if v is not None:
+            return v
+        st = self.b.pkgs.get(name)
+        return [st] if st else []
+    def has(self, name):
+        return name in self.b.pkgs or name in self.b.versions
+    def provides_of(self, name):
+        return self.b.provides.get(name, [])
+
+
+def upstream_version(ver):
+    """Upstream part of a Debian version: strip epoch and Debian revision.
+    25.0.7-2+deb13u1 -> 25.0.7 ; 2:9.1-1ubuntu7.18 -> 9.1"""
+    v = ver.split(":", 1)[-1]          # drop epoch
+    return v.rsplit("-", 1)[0]         # drop Debian revision
+
+def same_upstream(v1, v2):
+    """True if two versions share an upstream and differ only in the Debian
+    revision / binNMU / stable-update suffix -- i.e. a rebuild, not a real
+    version change."""
+    return (upstream_version(v1) == upstream_version(v2)
+            and vercmp(v1, v2) != 0)
+
+# Packages whose rebuild can restart the display server / session even
+# though it is not a reboot-class change. A same-upstream bump here is the
+# dangerous kind: allowing it may kill X/Wayland and every GUI app running.
+_SESSION_CRITICAL_EXACT = {
+    "libgl1", "libglx-mesa0", "libglapi-mesa", "libgbm1", "libegl1",
+    "libegl-mesa0", "libgles2", "libvulkan1", "libdrm2", "libgallium",
+    "mesa-libgallium", "mesa-va-drivers", "mesa-vdpau-drivers",
+    "libwayland-client0", "libwayland-server0", "libwayland-egl1",
+    "xserver-xorg-core", "xwayland", "libx11-6", "libxcb1",
+    "gdm3", "sddm", "lightdm", "systemd-logind",
+}
+_SESSION_CRITICAL_PREFIX = ("libgl1-mesa", "libgl1-amber", "xserver-xorg-video-",
+                            "libmutter-", "libgtk-", "libqt5gui", "libqt6gui")
+
+def is_session_critical(name):
+    if name in _SESSION_CRITICAL_EXACT:
+        return True
+    return any(name.startswith(p) for p in _SESSION_CRITICAL_PREFIX)
+
+
+class NduWall(Exception):
+    """Raised when --no-dep-upgrade cannot avoid moving installed packages.
+    Carries the movers so the caller can offer an escape hatch (--with /
+    interactive) instead of only printing a dead end.
+
+    movers: list of dicts {name, installed, wanted, why, same_upstream,
+                           session_critical}
+    """
+    def __init__(self, movers, message):
+        super().__init__(message)
+        self.movers = movers
+
 
 def _ndu_blocker(name, iv, why, cons):
     consread = ", ".join(f"{op} {v}" for op, v in cons if op) or "any"
@@ -220,6 +471,24 @@ def _ndu_blocker(name, iv, why, cons):
             f"upgrading an already-installed package.\n"
             f"    every version new enough to satisfy {consread} pulls an "
             f"installed dependency up.")
+
+def _format_movers(movers):
+    """Human-readable, per-package block for a wall, with same-upstream and
+    session-critical annotations."""
+    lines = []
+    for m in movers:
+        note = ""
+        if m["same_upstream"]:
+            up = upstream_version(m["wanted"])
+            note = f"  (same upstream {up}; Debian revision bump)"
+        line = f"    {BOLD(m['name'])} {m['installed']} -> {m['wanted']}{note}"
+        lines.append(line)
+        if m["why"]:
+            lines.append(f"        pulled in by {m['why']}")
+        if m["session_critical"]:
+            lines.append(f"        {YELLOW('! session-critical')}: a rebuild "
+                         f"here may restart X/Wayland and close running apps")
+    return lines
 
 # ---------------------------------------------------------------------------
 # Control-file parsing
@@ -313,6 +582,14 @@ def ask_continue(verb="merge"):
     except (EOFError, KeyboardInterrupt):
         print(); return False
     return ans.strip().lower() in ("", "y", "yes")
+
+def ask_yesno(prompt):
+    """Yes/No prompt defaulting to No (used for risky confirmations)."""
+    try:
+        ans = input(f"{prompt} [{RED('yes')}/{GREEN('No')}] ")
+    except (EOFError, KeyboardInterrupt):
+        print(); return False
+    return ans.strip().lower() in ("y", "yes")
 
 def calc_deps_start():
     print("Calculating dependencies... ", end="", flush=True)
@@ -417,8 +694,15 @@ class DpkgBackend:
 
     def _write_world(self, names):
         os.makedirs(LIB_DIR, exist_ok=True)
-        with open(WORLD, "w") as f:
+        # atomic: write a temp file then rename, so a crash mid-write can
+        # never truncate the world file (only pins are transient; this
+        # record should survive)
+        tmp = WORLD + ".tmp"
+        with open(tmp, "w") as f:
             f.write("\n".join(sorted(names)) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, WORLD)
 
     # -- sync ---------------------------------------------------------------
 
@@ -599,7 +883,7 @@ class DpkgBackend:
         return keep
 
     def resolve(self, targets, update=False, deep=False,
-                no_dep_upgrade=False):
+                no_dep_upgrade=False, allow=None):
         self._load_index(all_versions=no_dep_upgrade)
         inst = installed_state()
         iprov = self._inst_provides(inst)
@@ -614,7 +898,7 @@ class DpkgBackend:
 
         if no_dep_upgrade:
             return self._resolve_no_upgrade(worklist, atoms, inst, iprov,
-                                            update)
+                                            update, allow)
         return self._resolve_inner(worklist, atoms, inst, iprov, update,
                                    pins={})
 
@@ -732,184 +1016,11 @@ class DpkgBackend:
         return [n for n, newv, old, *_ in merges
                 if old is not None and vercmp(newv, old) > 0]
 
-    def _resolve_no_upgrade(self, worklist, atoms, inst, iprov, update):
-        """Portage-style downgrade search over the WHOLE closure, not just
-        the targets. For every package that must be selected -- target or
-        dependency -- choose the LOWEST version that satisfies the
-        constraints gathered so far and is not older than any installed
-        copy, preferring the installed version itself when it qualifies.
-
-        A package is therefore upgraded only when some constraint genuinely
-        forces it past the installed version; if an older version of an
-        intermediate dependency keeps the graph on already-installed
-        versions, that older one is taken. When a newly discovered
-        constraint rules out an earlier greedy pick, the offending package
-        is re-selected upward and its subtree recomputed. If a package is
-        driven above its installed version with no way down, it is a
-        genuine blocker and reported."""
-        versions = self.versions          # name -> [stanza] newest-first
-
-        def all_versions(name):
-            v = versions.get(name)
-            if v is not None:
-                return v
-            st = self.pkgs.get(name)
-            return [st] if st else []
-
-        # constraints[name] = list of (op, ver) that must all hold
-        constraints = {}
-        chosen = {}                       # name -> stanza
-        forced = {}                       # name -> why (for blocker report)
-
-        def satisfies(ver, cons):
-            return all(meets(ver, op, v) for op, v in cons if op)
-
-        rejected = {}     # name -> set of versions ruled out (force upgrades)
-        clash_blame = {}  # not-installed name -> installed pkg it keeps hitting
-
-        def pick(name):
-            """The no-dep-upgrade version rule:
-              * installed & satisfies the constraints -> keep exactly the
-                installed version (never version-searched);
-              * installed & does NOT satisfy -> None (a genuine wall);
-              * not installed -> newest satisfying version not yet rejected
-                for forcing an installed upgrade; the loop rejects and
-                re-picks downward as it discovers such conflicts."""
-            cons = constraints.get(name, [])
-            iv = inst.get(name, {}).get("Version")
-            if iv is not None:
-                if satisfies(iv, cons):
-                    return {"Package": name, "Version": iv, "_installed": True}
-                return None
-            bad = rejected.get(name, set())
-            cands = [s for s in all_versions(name)
-                     if satisfies(s["Version"], cons)
-                     and s["Version"] not in bad]
-            if not cands:
-                return None
-            return cands[0]      # all_versions is newest-first
-
-        def forces_installed_upgrade(st):
-            """If choosing st requires upgrading an installed package, return
-            (installed_pkg, op, ver) for the constraint that forces it, else
-            None."""
-            for field in ("Pre-Depends", "Depends"):
-                for alts in parse_depends(st.get(field, "")):
-                    if any(_dep_ok(a, inst, chosen, iprov, self.provides)
-                           for a in alts):
-                        continue
-                    dn, op, dv = alts[0]
-                    if op and dn in inst and not meets(inst[dn]["Version"],
-                                                       op, dv):
-                        return (dn, op, dv)
-            return None
-
-        # worklist of packages to (re)select
-        stack = list(dict.fromkeys(worklist))
-        guard = 0
-        while stack:
-            guard += 1
-            if guard > 200000:
-                raise RuntimeError("--no-dep-upgrade: resolution did not "
-                                   "converge (dependency cycle?)")
-            name = stack.pop(0)
-            if name not in self.pkgs and name not in versions:
-                if name in atoms:
-                    raise RuntimeError(f'there are no packages to satisfy '
-                                       f'"{name}"')
-                continue
-            st = pick(name)
-            if st is None:
-                iv = inst.get(name, {}).get("Version", "?")
-                # if this package bottomed out because every version forces
-                # an installed package up, name that installed package
-                blame = clash_blame.get(name)
-                if blame and iv in ("?", None):
-                    biv = inst.get(blame, {}).get("Version", "?")
-                    raise RuntimeError(_ndu_blocker(
-                        blame, biv, name, constraints.get(blame, [])))
-                raise RuntimeError(_ndu_blocker(name, iv, forced.get(name),
-                                                constraints.get(name, [])))
-
-            # For a NOT-installed package, if this version would force an
-            # installed package to upgrade, reject it and step to an older
-            # version instead (the core of --no-dep-upgrade).
-            if "_installed" not in st and name not in inst:
-                clash = forces_installed_upgrade(st)
-                if clash is not None:
-                    cn, cop, cv = clash
-                    rejected.setdefault(name, set()).add(st["Version"])
-                    clash_blame[name] = cn
-                    forced[cn] = name
-                    # record the constraint so the blocker message is precise
-                    cons = constraints.setdefault(cn, [])
-                    if (cop, cv) not in cons:
-                        cons.append((cop, cv))
-                    # drop anything we'd chosen under the rejected version and
-                    # re-pick this package from its next-older candidate
-                    chosen.pop(name, None)
-                    stack.insert(0, name)
-                    continue
-
-            if chosen.get(name) is st:
-                continue
-            chosen[name] = st
-            for field in ("Pre-Depends", "Depends"):
-                for alts in parse_depends(st.get(field, "")):
-                    if any(_dep_ok(a, inst, chosen, iprov, self.provides)
-                           for a in alts):
-                        continue
-                    dn, op, dv = alts[0]
-                    real = dn
-                    if dn not in self.pkgs and dn not in versions:
-                        prov = self.provides.get(dn)
-                        if prov:
-                            real = prov[0][0]
-                        else:
-                            raise RuntimeError(f'cannot satisfy "{dn}" '
-                                               f'(required by {name})')
-                    if op:
-                        prev = constraints.setdefault(real, [])
-                        if (op, dv) not in prev:
-                            prev.append((op, dv))
-                            forced[real] = name
-                            if real in chosen:
-                                del chosen[real]
-                    if real not in chosen and real not in stack:
-                        stack.append(real)
-
-        # Build the merge plan from chosen versions, excluding no-ops
-        plan, merges = [], []
-        # deterministic order: targets first, then deps, matching install need
-        ordered = list(dict.fromkeys(
-            list(worklist) + [n for n in chosen if n not in worklist]))
-        for name in ordered:
-            st = chosen.get(name)
-            if st is None:
-                continue
-            old = inst.get(name, {}).get("Version")
-            if old and vercmp(st["Version"], old) == 0:
-                if not (name in atoms and not update):
-                    continue              # already satisfied; skip unless remerge
-            plan.append(st)
-            merges.append((name, st["Version"], old,
-                           int(st.get("Size", 0)), "ebuild", ""))
-
-        # Safety net: assert we truly upgrade nothing installed
-        ups = [n for n, nv, old, *_ in merges
-               if old is not None and vercmp(nv, old) > 0]
-        if ups:
-            # a constraint forced an unavoidable upgrade after all
-            details = {}
-            for n in ups:
-                details[n] = forced.get(n, "dependency")
-            lines = ["--no-dep-upgrade: no available version avoids "
-                     "upgrading already-installed dependencies."]
-            for n in sorted(set(ups)):
-                lines.append(f"    {BOLD(n)} must upgrade "
-                             f"(required by {details[n]})")
-            raise RuntimeError("\n".join(lines))
-
+    def _resolve_no_upgrade(self, worklist, atoms, inst, iprov, update,
+                            allow=None):
+        """Whole-closure downgrade search via the shared solver."""
+        plan, merges = ndu_solve(_DpkgIndex(self), inst, iprov,
+                                 worklist, atoms, update, allow)
         self._plan = plan
         return merges
 
@@ -1077,6 +1188,65 @@ class DpkgBackend:
 # apt backend
 # ---------------------------------------------------------------------------
 
+class _AptIndex:
+    """ndu_solve index backed by apt-cache, fetching each package's versions
+    (with full Depends/Provides) lazily and caching them."""
+    def __init__(self):
+        self._cache = {}          # name -> [stanza,...] newest-first
+        self._provides = {}       # virtual -> [(provider, ver|None)]
+        self._known = {}          # name -> bool
+
+    def _load(self, name):
+        if name in self._cache:
+            return self._cache[name]
+        r = capture(["apt-cache", "show", name])
+        stanzas = [st for st in parse_stanzas(r.stdout)
+                   if st.get("Package") == name and "Version" in st]
+        seen, ordered = set(), []
+        for st in sorted(stanzas,
+                         key=lambda s: functools.cmp_to_key(vercmp)
+                         (s["Version"]), reverse=True):
+            if st["Version"] not in seen:
+                seen.add(st["Version"]); ordered.append(st)
+        self._cache[name] = ordered
+        for st in ordered:
+            for clauses in parse_depends(st.get("Provides", "")):
+                for (v, _, ver) in clauses:
+                    self._provides.setdefault(v, []).append((name, ver))
+        return ordered
+
+    def all_versions(self, name):
+        return self._load(name)
+
+    def has(self, name):
+        if name in self._known:
+            return self._known[name]
+        ok = bool(self._load(name)) or name in self._provides
+        self._known[name] = ok
+        return ok
+
+    def provides_of(self, name):
+        if name not in self._provides:
+            # discover providers of a virtual not yet seen, via showpkg's
+            # "Reverse Provides" section, then load each so we learn versions
+            r = capture(["apt-cache", "showpkg", name])
+            in_rev = False
+            found = []
+            for line in r.stdout.splitlines():
+                if line.startswith("Reverse Provides:"):
+                    in_rev = True
+                    continue
+                if in_rev and line.strip():
+                    prov = line.split()[0]
+                    if prov and prov != name:
+                        found.append(prov)
+            for p in found:
+                self._load(p)          # registers its Provides mapping
+            # mark as probed even if nothing found, so we don't re-shell
+            self._provides.setdefault(name, self._provides.get(name, []))
+        return self._provides.get(name, [])
+
+
 class AptBackend:
     name = "apt"
 
@@ -1160,85 +1330,36 @@ class AptBackend:
                 ups.append(m.group(1))
         return ups, None
 
-    def _resolve_no_upgrade(self, atoms, members, update):
-        """Choose versions so nothing already installed is upgraded.
+    def _resolve_no_upgrade(self, atoms, members, update, allow=None):
+        """Full-closure downgrade search using the shared solver, fed by an
+        apt-cache-backed index. Resolves exact version pins that avoid
+        upgrading anything installed, then hands them to apt to execute.
 
-        Per target, walk versions newest-first. For each candidate, if the
-        simulation would upgrade installed packages, retry with those held
-        at their installed versions (pkg=installed_ver) -- this lets apt
-        step an intermediate dependency DOWN to an older version that keeps
-        the graph on installed libs, the same search the dpkg backend does
-        over the whole closure. Only if apt cannot satisfy the target with
-        the offending packages held is it a genuine wall."""
-        pins, blockers = [], []
-        for t in atoms + members:
-            iv = self._installed_version(t)
-            versions = self._madison_versions(t)
-            if not versions:
-                if t in atoms:
-                    blockers.append((t, "?", ["(not found)"]))
-                continue
-            chosen, last_bad = None, None
-            for v in versions:
-                if iv and vercmp(v, iv) < 0:
-                    break                              # don't downgrade target
-                if iv and vercmp(v, iv) == 0 and update:
-                    chosen = None                      # already current, -u
-                    break
-                # iteratively hold whatever this candidate tries to upgrade
-                held = {}
-                spec = [f"{t}={v}"]
-                for _ in range(40):                    # bounded refinement
-                    ups, err = self._simulate(pins + spec
-                                              + [f"{h}={hv}"
-                                                 for h, hv in held.items()])
-                    if err is not None:
-                        break                          # holds made it unsat
-                    ups = [u for u in ups if u != t and u not in held]
-                    if not ups:
-                        chosen = spec + [f"{h}={hv}"
-                                         for h, hv in held.items()]
-                        break
-                    # hold each newly-upgraded installed package at its
-                    # current version and re-simulate
-                    progressed = False
-                    for u in ups:
-                        uiv = self._installed_version(u)
-                        if uiv and u not in held:
-                            held[u] = uiv; progressed = True
-                    if not progressed:
-                        last_bad = (v, ups)
-                        break
-                if chosen:
-                    break
-                if last_bad is None:
-                    last_bad = (v, ["(unsatisfiable with deps held)"])
-            if chosen:
-                pins.extend(chosen)
-            elif last_bad:
-                blockers.append((t, last_bad[0], last_bad[1]))
-        if blockers:
-            lines = ["--no-dep-upgrade: no available version avoids "
-                     "upgrading already-installed dependencies."]
-            for t, ver, ups in blockers:
-                ups = sorted(set(ups))
-                lines.append(f"    {BOLD(t)} (newest tried: {ver}) could not "
-                             f"be installed while holding:")
-                for u in ups:
-                    lines.append(f"        {u}")
-            raise RuntimeError("\n".join(lines))
-        # de-dup pins (a held dep may recur across targets), last wins
-        seen = {}
-        for p in pins:
-            seen[p.split("=")[0]] = p
-        self._action = ["install"] + list(seen.values())
-        return list(seen.values())
+        This replaces the earlier hold-and-retry heuristic (which pinned
+        conflicting deps to their installed versions and gave up when apt
+        could not satisfy the target with them frozen). The solver instead
+        steps intermediate not-installed dependencies down through their own
+        older versions -- exhausting real alternatives -- exactly as the
+        dpkg backend does."""
+        inst = installed_state()
+        iprov = DpkgBackend._inst_provides(inst)
+        index = _AptIndex()
+        worklist = atoms + members
+        plan, merges = ndu_solve(index, inst, iprov, worklist, atoms, update,
+                                 allow)
+        # Turn the chosen stanzas into explicit apt version pins
+        pins = []
+        for st in plan:
+            pins.append(f"{st['Package']}={st['Version']}")
+        self._action = ["install"] + pins if pins else ["install"] + atoms
+        self._merges = merges
+        return merges
 
     def resolve(self, targets, update=False, deep=False,
-                no_dep_upgrade=False):
+                no_dep_upgrade=False, allow=None):
         atoms, members, had_world = self.expand_sets(targets)
         if no_dep_upgrade:
-            self._resolve_no_upgrade(atoms, members, update)
+            self._resolve_no_upgrade(atoms, members, update, allow)
         elif had_world and update and deep:
             # emerge -uD @world: the full-tree upgrade apt's solver owns
             self._action = ["dist-upgrade"]
@@ -2081,6 +2202,21 @@ Options:
                  the search is per-target, so on a large set it runs many
                  dependency simulations and can be slow.
 
+                 When the only obstacle is a same-upstream Debian revision
+                 bump (e.g. libgbm1 25.0.7-2 -> 25.0.7-2+deb13u1, a stable-
+                 update rebuild of the same upstream), the wall says so, and
+                 flags any session-critical package (Mesa, Xorg, Wayland,
+                 display managers) whose rebuild could restart your desktop.
+                 Under --ask you are then offered to allow just those
+                 packages to move; otherwise use --with (below).
+
+   --with <pkg[,pkg...]>
+                 Under --no-dep-upgrade, permit these already-installed
+                 packages to be upgraded, while everything else still gets
+                 the no-upgrade treatment. Use it to accept a specific
+                 revision bump the resolver walled on:
+                 emerge --no-dep-upgrade --with libgbm1 libsdl3-dev
+
    --oneshot (-1)
                  Emerge as normal, but do not add the packages to the world
                  file for later updating. (dpkg backend; the apt backend
@@ -2165,6 +2301,24 @@ def main(argv):
             opts["dispatch"] = True; continue
         if arg == "--no-dep-upgrade":
             opts["no_dep_upgrade"] = True; continue
+        if arg == "--with" or arg.startswith("--with="):
+            # --with pkg,pkg  or  --with=pkg,pkg : permit these installed
+            # packages to move under --no-dep-upgrade
+            if "=" in arg:
+                val = arg.split("=", 1)[1]
+            else:
+                val = "\x00NEXT"     # consume next token
+            opts.setdefault("allow", set())
+            if val == "\x00NEXT":
+                opts["_with_pending"] = True
+            else:
+                opts["allow"] |= {p for p in val.split(",") if p}
+            continue
+        if opts.get("_with_pending"):
+            opts["_with_pending"] = False
+            opts.setdefault("allow", set())
+            opts["allow"] |= {p for p in arg.split(",") if p}
+            continue
         if arg in ("--help", "-h"):
             print(HELP); return
         if arg == "--version":
@@ -2277,15 +2431,49 @@ def main(argv):
     if not pkgs:
         eerror("no targets given."); sys.exit(1)
     calc_deps_start()
+    allow = opts.get("allow", set())
     try:
         merges = be.resolve(pkgs, update=opts["update"], deep=opts["deep"],
-                            no_dep_upgrade=opts["no_dep_upgrade"])
+                            no_dep_upgrade=opts["no_dep_upgrade"], allow=allow)
+    except NduWall as w:
+        calc_deps_done(ok=False)
+        print()
+        eblock(str(w))
+        # Interactive escape hatch under -a: offer to allow the movers.
+        crit = [m for m in w.movers if m["session_critical"]]
+        if opts["ask"]:
+            if crit:
+                print()
+                ewarn("Some packages above are session-critical; allowing "
+                      "them may close your running graphical session.")
+            names = ",".join(m["name"] for m in w.movers)
+            if ask_yesno(f"\nAllow {BOLD(names)} to move and continue?"):
+                allow = allow | {m["name"] for m in w.movers}
+                try:
+                    merges = be.resolve(pkgs, update=opts["update"],
+                                        deep=opts["deep"],
+                                        no_dep_upgrade=opts["no_dep_upgrade"],
+                                        allow=allow)
+                except NduWall as w2:
+                    print()
+                    eblock(str(w2))
+                    sys.exit(1)
+                except RuntimeError as e:
+                    print(); eblock(str(e)); sys.exit(1)
+                # fall through to the normal ask/merge below with allow applied
+                calc_deps_done()
+                _finish_merge(be, merges, pkgs, opts)
+                return
+        sys.exit(1)
     except RuntimeError as e:
         calc_deps_done(ok=False)
         print()
         eblock(str(e))
         sys.exit(1)
     calc_deps_done()
+    _finish_merge(be, merges, pkgs, opts)
+
+def _finish_merge(be, merges, pkgs, opts):
     if not merges:
         einfo("No outdated packages were found on your system."
               if any(p.startswith("@") for p in pkgs) else
