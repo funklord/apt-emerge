@@ -135,6 +135,48 @@ def stream_lines(pipe):
     if tail:
         yield tail
 
+# Lines that explain a failure. dpkg reports the actual cause -- a failing
+# maintainer script, an unpack conflict -- on its own "dpkg: ..." lines, none
+# of which look like apt's E:/W: output.
+_FAILURE_RE = re.compile(r"^(E:|W:|dpkg:|dpkg-\w+:|Errors were encountered)"
+                         r"|error processing|returned an error code")
+
+def stream_apt(proc, handler, keep=400):
+    """Relay an apt/dpkg run, translating what we recognise and remembering
+    what we don't, so a failure can still be explained.
+
+    `handler(line)` returns True when it has dealt with a line. Portage-style
+    output means suppressing most of apt's chatter, but a run that fails has
+    to show why -- swallowing dpkg's reason left "emerge failed; see output
+    above" pointing at nothing at all. Anything that looks like a failure is
+    printed as it arrives; the rest is buffered and dumped only if the run
+    actually fails. Returns the exit status."""
+    buffered = []
+    in_error = False
+    for line in stream_lines(proc.stdout):
+        if handler(line):
+            in_error = False
+            continue
+        # dpkg continues an error onto indented lines, and that continuation
+        # carries the actual message ("... subprocess returned error exit
+        # status 1"). Keep it with the error it belongs to.
+        if _FAILURE_RE.search(line) or (in_error and line[:1].isspace()):
+            print(line)
+            in_error = True
+            continue
+        in_error = False
+        buffered.append(line)
+        if len(buffered) > keep:
+            del buffered[0]
+    rc = proc.wait()
+    if rc != 0 and buffered:
+        print()
+        ewarn(f"apt output leading up to the failure (last {len(buffered)} "
+              f"lines):")
+        for line in buffered:
+            print("  " + line)
+    return rc
+
 # ---------------------------------------------------------------------------
 # Debian version comparison (policy 5.6.12), pure Python
 # ---------------------------------------------------------------------------
@@ -2054,22 +2096,26 @@ class AptBackend:
              "-o", "Dpkg::Options::=--force-confdef"] + self._action,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"})
-        for line in stream_lines(proc.stdout):
-            m = re.match(r"^(Unpacking|Setting up) (\S+?)(?::\S+)? ", line)
+        def translate(line):
+            m = re.match(r"^(Unpacking|Setting up) ([^\s:]+)(?::\S+)? ", line)
             if m:
                 verb, pkg = m.groups()
                 i = order.get(pkg)
                 if not i:
-                    continue
+                    return False
                 pv = f"{pkg}-{vers[pkg]}"
                 if verb == "Unpacking":
                     print(f"{ARROW} Emerging ({i} of {total}) {BGREEN(pv)}")
                 else:
                     print(f"{ARROW} Installing ({i} of {total}) {BGREEN(pv)}")
                     print(f"{ARROW} Completed ({i} of {total}) {BGREEN(pv)}")
-            elif re.match(r"^(Get:|Fetched|Removing|E:|W:)", line):
+                return True
+            if re.match(r"^(Get:|Fetched|Removing)", line):
                 print(line)
-        rc = proc.wait()
+                return True
+            return False
+
+        rc = stream_apt(proc, translate)
         print()
         if rc == 0:
             print(f"{ARROW} Recording targets in \"world\" favorites file "
@@ -2145,14 +2191,18 @@ class AptBackend:
                                 stderr=subprocess.STDOUT,
                                 env={**os.environ,
                                      "DEBIAN_FRONTEND": "noninteractive"})
-        i = 0
-        for line in stream_lines(proc.stdout):
-            m = re.match(r"^Removing (\S+?)(?::\S+)? \(([^)]+)\)", line)
+        seen = [0]
+
+        def translate(line):
+            m = re.match(r"^Removing ([^\s:]+)(?::\S+)? \(([^)]+)\)", line)
             if m:
-                i += 1
-                print(f"{ARROW} Unmerging ({i} of {total}) "
+                seen[0] += 1
+                print(f"{ARROW} Unmerging ({seen[0]} of {total}) "
                       f"{RED(m.group(1) + '-' + m.group(2))}...")
-        rc = proc.wait()
+                return True
+            return False
+
+        rc = stream_apt(proc, translate)
         if rc != 0:
             print(f"{RED('!!!')} unmerge failed."); sys.exit(rc)
         print(f"\n{ARROW} {BGREEN('Auto-cleaning packages...')}")

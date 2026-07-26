@@ -1060,6 +1060,115 @@ class TestPrintUnmergeList(unittest.TestCase):
         self.assertIn("a-1 b-2", out)
 
 
+class TestStreamApt(unittest.TestCase):
+    """Portage-style output means suppressing most of apt's chatter, but a
+    run that fails has to explain itself. dpkg reports the real cause on
+    "dpkg: ..." lines that look nothing like apt's E:/W:, so filtering for
+    those left `emerge failed; see output above` pointing at nothing."""
+
+    FAILING = (b"Get:1 http://mirror trixie/main amd64 foo 1.0 [10 kB]\n"
+               b"Unpacking foo (1.0) ...\n"
+               b"Setting up foo (1.0) ...\n"
+               b"Job for foo.service failed.\n"
+               b"dpkg: error processing package foo (--configure):\n"
+               b" installed foo post-installation script returned error 1\n"
+               b"Errors were encountered while processing:\n"
+               b" foo\n"
+               b"E: Sub-process /usr/bin/dpkg returned an error code (1)\n")
+
+    class Proc:
+        def __init__(self, data, rc):
+            self.stdout = io.BytesIO(data)
+            self._rc = rc
+
+        def wait(self):
+            return self._rc
+
+    def relay(self, data, rc, handler=lambda line: False):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            status = em.stream_apt(self.Proc(data, rc), handler)
+        return status, buf.getvalue()
+
+    def immediate(self, out):
+        """Only what was printed as it arrived. Asserting against the whole
+        output proves nothing: a swallowed line still turns up in the context
+        dump, so both the fixed and the broken version would pass."""
+        return out.split("leading up to the failure")[0]
+
+    def test_returns_the_exit_status(self):
+        self.assertEqual(self.relay(self.FAILING, 100)[0], 100)
+
+    def test_dpkg_error_is_shown_as_an_error(self):
+        _, out = self.relay(self.FAILING, 100)
+        self.assertIn("dpkg: error processing package foo",
+                      self.immediate(out))
+
+    def test_the_actual_reason_is_shown_as_an_error(self):
+        """The continuation line carries the message that says what broke,
+        and has to stay with the error it belongs to."""
+        _, out = self.relay(self.FAILING, 100)
+        self.assertIn("post-installation script returned error 1",
+                      self.immediate(out))
+
+    def test_apt_summary_error_is_shown_as_an_error(self):
+        _, out = self.relay(self.FAILING, 100)
+        self.assertIn("E: Sub-process", self.immediate(out))
+
+    def test_dpkg_summary_line_is_shown_as_an_error(self):
+        """"Errors were encountered while processing:" names which packages
+        actually broke, and matches none of the other error patterns."""
+        _, out = self.relay(self.FAILING, 100)
+        self.assertIn("Errors were encountered while processing:",
+                      self.immediate(out))
+        self.assertIn(" foo", self.immediate(out))   # its continuation
+
+    def test_ordinary_chatter_is_not_shown_as_an_error(self):
+        _, out = self.relay(self.FAILING, 100)
+        self.assertNotIn("Job for foo.service", self.immediate(out))
+
+    def test_context_is_dumped_on_failure(self):
+        _, out = self.relay(self.FAILING, 100)
+        self.assertIn("leading up to the failure", out)
+        self.assertIn("Job for foo.service failed.", out)
+
+    def test_nothing_extra_is_printed_on_success(self):
+        _, out = self.relay(b"Selecting previously unselected package foo.\n"
+                          b"Unpacking foo (1.0) ...\n", 0)
+        self.assertNotIn("leading up to the failure", out)
+        self.assertNotIn("Selecting previously", out)
+
+    def test_handled_lines_are_left_to_the_handler(self):
+        seen = []
+
+        def handler(line):
+            if line.startswith("Unpacking"):
+                seen.append(line)
+                return True
+            return False
+        _, out = self.relay(b"Unpacking foo (1.0) ...\n", 0, handler)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(out, "")
+
+    def test_a_handled_line_ends_an_error_block(self):
+        """An indented line only continues an error if an error preceded it;
+        after the handler takes over, indentation is just formatting."""
+        data = (b"dpkg: error processing package foo (--configure):\n"
+                b"Unpacking bar (1.0) ...\n"
+                b"  indented but unrelated\n")
+        _, out = self.relay(data, 0, lambda l: l.startswith("Unpacking"))
+        self.assertNotIn("indented but unrelated", out)
+
+    def test_buffer_is_bounded(self):
+        noise = b"".join(b"chatter line %d\n" % i for i in range(1000))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            em.stream_apt(self.Proc(noise, 1), lambda line: False, keep=10)
+        out = buf.getvalue()
+        self.assertIn("chatter line 999", out)
+        self.assertNotIn("chatter line 100\n", out)
+
+
 class TestConfigWrite(unittest.TestCase):
     """_write installs a merged file into /etc, so it has to be atomic,
     durable, and leave nothing behind when it fails."""
