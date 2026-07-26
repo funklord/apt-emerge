@@ -2944,32 +2944,43 @@ def main(argv):
         calc_deps_done(ok=False)
         print()
         eblock(str(w))
-        # Interactive escape hatch under -a: offer to allow the movers.
-        crit = [m for m in w.movers if m["session_critical"]]
-        if opts["ask"]:
-            if crit:
+        # Interactive escape hatch under -a: offer to allow the movers, and
+        # keep offering. Packages that pin each other with '=' (the Mesa and
+        # Qt stacks) surface one at a time, so a single retry dead-ends part
+        # way through a stack that cannot be granted in one answer.
+        if not opts["ask"]:
+            sys.exit(1)
+        while True:
+            new_names = {m["name"] for m in w.movers} - allow
+            if not new_names:
+                # granting these changed nothing; asking again would loop
+                eerror("--no-dep-upgrade: no progress is possible here.")
+                sys.exit(1)
+            if any(m["session_critical"] for m in w.movers):
                 print()
                 ewarn("Some packages above are session-critical; allowing "
                       "them may close your running graphical session.")
-            names = ",".join(m["name"] for m in w.movers)
-            if ask_yesno(f"\nAllow {BOLD(names)} to move and continue?"):
-                allow = allow | {m["name"] for m in w.movers}
-                try:
-                    merges = be.resolve(pkgs, update=opts["update"],
-                                        deep=opts["deep"],
-                                        no_dep_upgrade=opts["no_dep_upgrade"],
-                                        allow=allow)
-                except NduWall as w2:
-                    print()
-                    eblock(str(w2))
-                    sys.exit(1)
-                except RuntimeError as e:
-                    print(); eblock(str(e)); sys.exit(1)
-                # fall through to the normal ask/merge below with allow applied
-                calc_deps_done()
-                _finish_merge(be, merges, pkgs, opts)
-                return
-        sys.exit(1)
+            names = ",".join(sorted(new_names))
+            if not ask_yesno(f"\nAllow {BOLD(names)} to move and continue?"):
+                print("\nQuitting."); sys.exit(1)
+            allow = allow | new_names
+            try:
+                merges = be.resolve(pkgs, update=opts["update"],
+                                    deep=opts["deep"],
+                                    no_dep_upgrade=opts["no_dep_upgrade"],
+                                    allow=allow)
+            except NduWall as w2:
+                print()
+                eblock(str(w2))
+                w = w2
+                continue
+            except RuntimeError as e:
+                print(); eblock(str(e)); sys.exit(1)
+            break
+        # fall through to the normal ask/merge below with allow applied
+        calc_deps_done()
+        _finish_merge(be, merges, pkgs, opts)
+        return
     except RuntimeError as e:
         calc_deps_done(ok=False)
         print()
