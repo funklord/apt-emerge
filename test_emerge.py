@@ -10,6 +10,7 @@ when those tools are absent, so the suite still runs on a non-Debian box.
 """
 
 import base64
+import contextlib
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -943,6 +944,83 @@ class TestDepOk(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# How session impact is presented
+# ---------------------------------------------------------------------------
+
+class TestSessionWarningTiers(unittest.TestCase):
+    """A rebuild and a real version change must not read the same. Telling a
+    user their session may close over a Debian point-release rebuild makes
+    them plan downtime they do not need."""
+
+    def setUp(self):
+        self.mod = load()
+        self.mod._session_critical_cache = {"libgbm1"}
+        self.mod._session_blind = False
+
+    def render(self, merges, verbose=False):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.mod.print_merge_list(merges, verbose)
+        return buf.getvalue()
+
+    def row(self, name, newver, oldver):
+        return (name, newver, oldver, 0, "ebuild", "")
+
+    def test_rebuild_is_marked_and_described_as_survivable(self):
+        out = self.render([self.row("libgbm1", "25.0.7-2+deb13u1",
+                                    "25.0.7-2")])
+        self.assertIn("(session rebuild)", out)
+        self.assertNotIn("(session)", out)
+        self.assertIn("keeps running", out)
+        self.assertNotIn("close running apps", out)
+
+    def test_real_upgrade_keeps_the_hard_warning(self):
+        out = self.render([self.row("libgbm1", "25.1.0-1", "25.0.7-2")])
+        self.assertIn("(session)", out)
+        self.assertNotIn("(session rebuild)", out)
+        self.assertIn("close running apps", out)
+
+    def test_both_kinds_are_reported_separately(self):
+        self.mod._session_critical_cache = {"libgbm1", "libegl1"}
+        out = self.render([self.row("libgbm1", "25.0.7-2+deb13u1", "25.0.7-2"),
+                           self.row("libegl1", "2.0-1", "1.0-1")])
+        self.assertIn("would be rebuilt: libgbm1", out)
+        self.assertIn("would be upgraded: libegl1", out)
+
+    def test_new_installs_are_never_flagged(self):
+        out = self.render([self.row("libgbm1", "25.0.7-2+deb13u1", None)])
+        self.assertNotIn("session", out)
+
+    def test_non_session_package_is_not_flagged(self):
+        out = self.render([self.row("nano", "2.0", "1.0")])
+        self.assertNotIn("session", out)
+
+    def test_headless_flags_nothing(self):
+        self.mod._session_critical_cache = set()
+        out = self.render([self.row("libgbm1", "25.1.0-1", "25.0.7-2")])
+        self.assertNotIn("session", out)
+
+    # -- the same split inside a --no-dep-upgrade wall -----------------------
+
+    def mover(self, same_upstream):
+        return [{"name": "libgbm1", "installed": "25.0.7-2",
+                 "wanted": "25.0.7-2+deb13u1" if same_upstream else "25.1.0-1",
+                 "why": "libgbm-dev", "same_upstream": same_upstream,
+                 "session_critical": True}]
+
+    def test_wall_softens_for_a_rebuild(self):
+        text = "\n".join(self.mod._format_movers(self.mover(True)))
+        self.assertIn("session in use", text)
+        self.assertIn("keeps running", text)
+        self.assertNotIn("close running apps", text)
+
+    def test_wall_stays_loud_for_a_real_upgrade(self):
+        text = "\n".join(self.mod._format_movers(self.mover(False)))
+        self.assertIn("session-critical", text)
+        self.assertIn("close running apps", text)
+
+
+# ---------------------------------------------------------------------------
 # Repository signature verification
 # ---------------------------------------------------------------------------
 
@@ -1465,6 +1543,37 @@ class TestSessionCritical(unittest.TestCase):
         self.fake_maps(MAPS_LIBS_ONLY)
         files = self.mod._proc_mapped_code("1", "gdm-session-wor")
         self.assertEqual(files, {"/usr/lib/libfoo.so.1"})
+
+    # -- how much a move actually disturbs the session -----------------------
+
+    def test_impact_none_when_not_session_code(self):
+        self.force({"libgbm1"}, False)
+        self.assertIsNone(self.mod.session_impact("nano", "1.0", "2.0"))
+
+    def test_same_upstream_bump_is_only_a_rebuild(self):
+        """Mesa 25.0.7-2 -> 25.0.7-2+deb13u1 is a point-release rebuild. A
+        running process keeps the inodes it already mapped, so nothing
+        restarts and nothing closes."""
+        self.force({"libgbm1"}, False)
+        self.assertEqual(
+            self.mod.session_impact("libgbm1", "25.0.7-2", "25.0.7-2+deb13u1"),
+            "rebuild")
+
+    def test_real_version_change_is_an_upgrade(self):
+        self.force({"libgbm1"}, False)
+        self.assertEqual(
+            self.mod.session_impact("libgbm1", "25.0.7-2", "25.1.0-1"),
+            "upgrade")
+
+    def test_binnmu_is_a_rebuild(self):
+        self.force({"libgbm1"}, False)
+        self.assertEqual(
+            self.mod.session_impact("libgbm1", "1.0-1", "1.0-1+b1"), "rebuild")
+
+    def test_missing_versions_are_treated_as_an_upgrade(self):
+        self.force({"libgbm1"}, False)
+        self.assertEqual(self.mod.session_impact("libgbm1", None, "1.0"),
+                         "upgrade")
 
     def test_leaders_are_returned_with_their_comm(self):
         self.patch(self.mod.os, "listdir", lambda _p: ["1", "2", "self"])

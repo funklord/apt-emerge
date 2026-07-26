@@ -604,6 +604,28 @@ def compute_session_critical_packages():
     _session_critical_cache = pkgs
     return pkgs
 
+def session_impact(name, oldver, newver):
+    """How much moving a package actually disturbs the running session.
+
+    None      -- not code the session is using.
+    "rebuild" -- same upstream, only the Debian revision/binNMU/security
+                 suffix moved.
+    "upgrade" -- a real upstream version change.
+
+    The distinction is not cosmetic. dpkg replaces the files, but a running
+    process keeps the inodes it already mapped, so a rebuild does not restart
+    the display server and does not close anything -- Mesa 25.0.7-2 ->
+    25.0.7-2+deb13u1 is a point-release rebuild, not a session teardown.
+    What a rebuild does leave is a window until the next login where anything
+    the session loads *later* (DRI drivers, VA-API, Vulkan ICDs are all
+    dlopen'd on demand) is the new build inside a process still holding the
+    old one. Worth saying, not worth planning downtime around."""
+    if not is_session_critical(name):
+        return None
+    if oldver and newver and same_upstream(oldver, newver):
+        return "rebuild"
+    return "upgrade"
+
 def is_session_critical(name):
     """True if moving `name` could disturb the running session.
 
@@ -662,8 +684,15 @@ def _format_movers(movers):
         if m["why"]:
             lines.append(f"        pulled in by {m['why']}")
         if m["session_critical"]:
-            lines.append(f"        {YELLOW('! session-critical')}: a rebuild "
-                         f"here may restart X/Wayland and close running apps")
+            if m["same_upstream"]:
+                lines.append(f"        {BLUE('- session in use')}: same "
+                             f"upstream, so this is a rebuild -- the session "
+                             f"keeps running; drivers")
+                lines.append(f"          it loads later use the new build "
+                             f"until you log out")
+            else:
+                lines.append(f"        {YELLOW('! session-critical')}: this "
+                             f"may restart X/Wayland and close running apps")
     return lines
 
 # ---------------------------------------------------------------------------
@@ -711,7 +740,7 @@ def print_merge_list(merges, verbose):
     kind: 'ebuild' (source build / normal merge) | 'binary' (dep .deb)"""
     n_new = n_up = n_down = n_re = 0
     dl = 0
-    crit = []
+    rebuilt, upgraded = [], []
     for name, newver, oldver, size, kind, use in merges:
         if oldver is None:
             flag, col = "N", GREEN; n_new += 1
@@ -725,10 +754,16 @@ def print_merge_list(merges, verbose):
                 f"{BGREEN(name + '-' + newver)}")
         if flag in "UD":
             line += f" [{BLUE(oldver)}]"
-        # flag upgrades/downgrades of packages the running session is using
-        if flag in "UD" and is_session_critical(name):
-            line += f" {YELLOW('(session)')}"
-            crit.append(name)
+        # flag upgrades/downgrades of packages the running session is using,
+        # distinguishing a rebuild from a real version change
+        if flag in "UD":
+            impact = session_impact(name, oldver, newver)
+            if impact == "rebuild":
+                line += f" {BLUE('(session rebuild)')}"
+                rebuilt.append(name)
+            elif impact == "upgrade":
+                line += f" {YELLOW('(session)')}"
+                upgraded.append(name)
         if use:
             line += f' USE="{RED(use)}"'
         if verbose and size:
@@ -743,12 +778,20 @@ def print_merge_list(merges, verbose):
     if verbose and dl:
         s += f", Size of downloads: {dl / 2**20:,.1f} MiB"
     print(s)
-    if crit:
+    def _names(ns):
+        return ", ".join(ns[:8]) + (" ..." if len(ns) > 8 else "")
+
+    if upgraded:
         print()
-        ewarn(f"{len(crit)} package(s) in use by your graphical session "
-              f"would be upgraded: {', '.join(crit[:8])}"
-              + (" ..." if len(crit) > 8 else ""))
+        ewarn(f"{len(upgraded)} package(s) in use by your graphical session "
+              f"would be upgraded: {_names(upgraded)}")
         ewarn("Applying these may restart X/Wayland and close running apps.")
+    if rebuilt:
+        print()
+        einfo(f"{len(rebuilt)} package(s) in use by your graphical session "
+              f"would be rebuilt: {_names(rebuilt)}")
+        einfo("Same upstream version, so your session keeps running. Open apps "
+              "stay on the old build until you log out.")
 
 def print_unmerge_list(removals):
     print(f"\n{BGREEN(' These are the packages that would be unmerged:')}\n")
@@ -2956,10 +2999,16 @@ def main(argv):
                 # granting these changed nothing; asking again would loop
                 eerror("--no-dep-upgrade: no progress is possible here.")
                 sys.exit(1)
-            if any(m["session_critical"] for m in w.movers):
+            crit = [m for m in w.movers if m["session_critical"]]
+            if crit and not all(m["same_upstream"] for m in crit):
                 print()
                 ewarn("Some packages above are session-critical; allowing "
                       "them may close your running graphical session.")
+            elif crit:
+                print()
+                einfo("Those are rebuilds of libraries your session is using: "
+                      "it keeps running. Log out when convenient so "
+                      "everything is on the new build.")
             names = ",".join(sorted(new_names))
             if not ask_yesno(f"\nAllow {BOLD(names)} to move and continue?"):
                 print("\nQuitting."); sys.exit(1)
