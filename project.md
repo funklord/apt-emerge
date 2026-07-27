@@ -224,13 +224,29 @@ only resolves with an older version of an *earlier* dependency, and the
 give-away was a wall naming a package with installed version `?` (i.e. one that
 is not installed at all).
 
-**Still not complete, and don't claim otherwise:**
-- Alternatives within one dependency (`a | b`) are taken first-match, never
-  branched on.
-- The search is bounded by a 200,000-step budget. Hitting it raises
-  `RuntimeError` explaining that this is a solver limit, *not* a wall — giving
-  up early is not proof that no resolution exists. Do not turn that into an
-  `NduWall`; it would be a lie.
+**Two passes, escalating on demand** (`ndu_search`). The first takes the
+first alternative of every `a | b`, which is what apt and dpkg do and what
+almost every graph wants. Only if that reports a wall or runs out of budget
+does it run again with alternatives branched on as decisions of their own.
+So the common case never pays for a search it did not need, and a wall the
+user is shown has already survived an exhaustive pass.
+
+- The retry is **skipped when the closure contained no real choice** — `a |
+  b` where both resolve to the same package is not a decision, and retrying
+  would only double the time before reporting the same wall. `ndu_solve`
+  records this and tags the exception with `had_alternatives`.
+- If the second pass fails too, the **first** failure is raised: it names the
+  blocker the user can actually act on.
+- `--backtrack=N` (Portage's spelling) multiplies the step budget for the
+  retry; `--backtrack=0` disables it. Default 10.
+- Budget exhaustion raises `NduIncomplete`, a `RuntimeError` subclass so old
+  handlers still work, but distinguishable so the caller can try harder. Do
+  **not** turn it into an `NduWall`: giving up early is not proof that no
+  resolution exists.
+
+**Still not complete:** this branches over versions and alternatives, which
+covers the cases seen in practice, but it is not a SAT solver and makes no
+completeness guarantee beyond the step budget.
 
 **Two semantics worth knowing before editing:**
 - A pinned (installed) package is represented by a synthetic stanza with no
@@ -589,6 +605,39 @@ write surface ever needs testing.
    auto after the install, never touching one that was already in `@world`.
    Verified end to end in `test_integration.py` against a real apt install.
 
+
+9. **Packaging from language package managers (pip / npm / gem / cargo).**
+   Not started; recorded because it addresses a live problem rather than a
+   hypothetical one — modern Debian refuses `pip install` into the system
+   (PEP 668 `externally-managed-environment`) precisely because of the
+   conflict this would avoid.
+
+   **Shape.** emerge orchestrates; it does not become a packager. Converters
+   already exist and are packaged: `stdeb`/`pybuild` (Python), `gem2deb`,
+   `npm2deb`, `debcargo`, and generic `fpm`. Fetch the upstream artefact,
+   drive the converter, build with the `dpkg-buildpackage` machinery `-b/-B`
+   already has, leave products in PKGDIR, install the `.deb`. That keeps hard
+   rule 1 intact: they are external programs, exactly like dpkg-buildpackage
+   is today.
+
+   **Suggested first pass: Python only.** `stdeb` is mature, PEP 668 makes it
+   the most-wanted, and it exercises the whole pipeline before anyone has to
+   face npm's dependency graphs.
+
+   **The hard parts, none of them optional:**
+   - *Name mapping.* PyPI `PyYAML` is Debian `python3-yaml`. Either keep a
+     mapping or vendor everything and accept the duplication.
+   - *Version translation.* PEP 440 `1.0.0rc1` must become `1.0.0~rc1` or it
+     sorts **above** the final release. `vercmp` already gets `~` right, so
+     this is mechanical — but getting it wrong is silent.
+   - *Collision with archive packages*, which is the problem being solved
+     reappearing in new clothes. A self-built `python3-requests` shadowing
+     Debian's is no better than pip's mess. Needs a namespace
+     (`pypi-requests`) or strict Provides/Conflicts, plus the existing
+     `+local1` bump so `@world` will not clobber it.
+   - *Transitive closure size*, npm especially.
+   - *apt backend only*, like `-b/-B`: it needs build tooling, and the dpkg
+     backend is binary-only by design.
 ---
 
 ## Backend parity is the main source of bugs

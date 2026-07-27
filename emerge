@@ -287,6 +287,16 @@ class _NduNoSolution(Exception):
 class _NduBudget(Exception):
     """The search hit its step budget without deciding either way."""
 
+class NduIncomplete(RuntimeError):
+    """The search gave up on its budget rather than proving anything. A
+    RuntimeError so existing handlers still report it, but distinguishable
+    so the caller can decide to try harder."""
+
+# Steps one pass may take before giving up. --backtrack multiplies it for the
+# exhaustive retry; 0 disables the retry entirely.
+STEP_BUDGET = 200000
+BACKTRACK = 10                    # Portage's default, and its spelling
+
 def _with_arg(allow, movers):
     """The --with argument to suggest in a wall message.
 
@@ -326,7 +336,46 @@ def _wall_from_merges(merges, allow, why=None):
     lines.append(f"    to allow: {BOLD('--with ' + _with_arg(allow, movers))}")
     raise NduWall(movers, "\n".join(lines))
 
-def ndu_solve(index, inst, iprov, worklist, atoms, update, allow=None):
+def _tag(exc, saw_alternatives):
+    """Mark a failure with whether an exhaustive retry could differ."""
+    exc.had_alternatives = saw_alternatives
+    return exc
+
+def ndu_search(index, inst, iprov, worklist, atoms, update, allow=None,
+               backtrack=None):
+    """Solve, and if that fails, solve again trying harder.
+
+    The cheap pass takes the first alternative of every `a | b` dependency,
+    which is what apt and dpkg do and what almost every graph wants. Only
+    when it reports a wall or runs out of budget is it worth branching on
+    those alternatives too -- so the common case never pays for a search it
+    did not need, and a wall is no longer reported until the exhaustive pass
+    has agreed with it.
+
+    If the second pass also fails, the *first* failure is what gets raised:
+    it names the blocker the user is most likely to act on."""
+    backtrack = BACKTRACK if backtrack is None else backtrack
+    try:
+        return ndu_solve(index, inst, iprov, worklist, atoms, update, allow)
+    except (NduWall, NduIncomplete) as first:
+        if backtrack <= 0:
+            raise
+        if not getattr(first, "had_alternatives", True):
+            # Nothing in the closure offered a choice of alternative, so the
+            # thorough pass would explore exactly the same graph. Re-running
+            # it would only double the time before reporting the same wall.
+            raise
+        einfo("no first-choice resolution; retrying with an exhaustive "
+              "search over dependency alternatives...")
+        try:
+            return ndu_solve(index, inst, iprov, worklist, atoms, update,
+                             allow, thorough=True,
+                             budget=STEP_BUDGET * backtrack)
+        except (NduWall, NduIncomplete):
+            raise first from None
+
+def ndu_solve(index, inst, iprov, worklist, atoms, update, allow=None,
+              thorough=False, budget=None):
     """Shared --no-dep-upgrade closure solver, used by both backends.
 
     `index` abstracts the package source with three methods:
@@ -364,6 +413,7 @@ def ndu_solve(index, inst, iprov, worklist, atoms, update, allow=None):
 
     forced = {}          # package -> whatever put a constraint on it (blame)
     wall = None          # best blocker seen, reported if the search runs dry
+    saw_alternatives = False   # did any `a | b` offer a real choice?
     dead_end = None      # name that could not be resolved at all
 
     def satisfies(ver, cons):
@@ -435,11 +485,47 @@ def ndu_solve(index, inst, iprov, worklist, atoms, update, allow=None):
                          f"(or answer the prompt under -a)")
         return NduWall(movers, "\n".join(msg_lines))
 
+    def resolve_alt(dn):
+        """An alternative's real package name, substituting a provider when
+        nothing ships under that name. None when it cannot be satisfied.
+
+        Asking index.has() here would never fire: has() is true for a virtual
+        name *because* something provides it, so the name would go on the
+        stack as if it were real and then fail to resolve -- reported as an
+        installed package that must move, which --with can never release
+        because it is not installed at all."""
+        if index.all_versions(dn):
+            return dn
+        prov = index.provides_of(dn)
+        return prov[0][0] if prov else None
+
+    def apply_target(real, op, dv, why, chosen, cons, pending):
+        """Record one dependency choice into `cons`/`pending`, which the
+        caller must already own. Returns False when it contradicts something
+        already chosen -- which kills this branch, not the whole search.
+
+        Mutates rather than copying: a closure has thousands of dependency
+        clauses, and copying both structures for each of them is the whole
+        cost of the pass."""
+        if op:
+            prev = cons.get(real, ())
+            if (op, dv) not in prev:
+                cons[real] = prev + ((op, dv),)
+                forced.setdefault(real, why)
+                if real in chosen and not satisfies(chosen[real]["Version"],
+                                                    cons[real]):
+                    if real in eff_inst:
+                        note_wall(real, eff_inst[real]["Version"], why,
+                                  cons[real])
+                    return False
+        if real not in chosen and real not in pending:
+            pending.append(real)
+        return True
+
     def extend(name, st, chosen, cons, pending):
-        """Queue `st`'s dependencies and record their constraints. Returns the
-        new (cons, pending), or None if a constraint contradicts a choice
-        already made -- which kills this branch, not the whole search."""
-        nonlocal wall
+        """Queue `st`'s dependencies. Returns the new (cons, pending), or
+        None if the branch is already dead."""
+        nonlocal saw_alternatives
         cons = dict(cons)
         pending = list(pending)
         for field in ("Pre-Depends", "Depends"):
@@ -447,35 +533,32 @@ def ndu_solve(index, inst, iprov, worklist, atoms, update, allow=None):
                 if any(_dep_ok(a, eff_inst, chosen, iprov, index.provides_of)
                        for a in alts):
                     continue
-                dn, op, dv = alts[0]
-                real = dn
-                if not index.all_versions(dn):
-                    # Nothing ships a package under this name, so it is purely
-                    # virtual and has to be resolved to a provider. Asking
-                    # index.has() instead would never fire: has() is true for a
-                    # virtual name *because* something provides it, so the name
-                    # would go on the stack as if it were real and then fail to
-                    # resolve -- reported as an installed package that must
-                    # move, which --with can never release because it is not
-                    # installed at all.
-                    prov = index.provides_of(dn)
-                    if not prov:
-                        raise RuntimeError(f'cannot satisfy "{dn}" '
-                                           f'(required by {name})')
-                    real = prov[0][0]
-                if op:
-                    prev = cons.get(real, ())
-                    if (op, dv) not in prev:
-                        cons[real] = prev + ((op, dv),)
-                        forced.setdefault(real, name)
-                        if real in chosen and not satisfies(
-                                chosen[real]["Version"], cons[real]):
-                            if real in eff_inst:
-                                note_wall(real, eff_inst[real]["Version"],
-                                          name, cons[real])
-                            return None
-                if real not in chosen and real not in pending:
-                    pending.append(real)
+                # Resolve every alternative, not just the first. It costs a
+                # little in the cheap pass, but it is what makes the
+                # escalation decision precise: `a | b` where both resolve to
+                # the same package is not a choice, and treating it as one
+                # triggers an exhaustive retry that cannot find anything.
+                targets = []
+                for (dn, op, dv) in alts:
+                    real = resolve_alt(dn)
+                    if real is not None and (real, op, dv) not in targets:
+                        targets.append((real, op, dv))
+                if not targets:
+                    raise RuntimeError(f'cannot satisfy "{alts[0][0]}" '
+                                       f'(required by {name})')
+                if len(targets) > 1:
+                    saw_alternatives = True
+                if thorough and len(targets) > 1:
+                    # Which of `a | b` to use becomes a decision of its own,
+                    # so the search can come back and try the other one. The
+                    # cheap pass just takes the first, like apt and dpkg do.
+                    item = ("|", tuple(targets), name)
+                    if item not in pending:
+                        pending.append(item)
+                    continue
+                if not apply_target(*targets[0], name, chosen, cons,
+                                    pending):
+                    return None
         return cons, pending
 
     # Backtracking search. Each decision keeps the state that preceded it, so
@@ -485,19 +568,30 @@ def ndu_solve(index, inst, iprov, worklist, atoms, update, allow=None):
     # solvable solely by an older version of an *earlier* dependency was
     # reported as a wall that did not exist.
     steps = 0
-    STEP_BUDGET = 200000
+    limit = STEP_BUDGET if budget is None else budget
 
     def advance(frame):
         """Move a decision on to its next workable candidate, returning the
-        state that follows, or None once its candidates are spent."""
+        state that follows, or None once its candidates are spent.
+
+        Two kinds of decision: which version a package takes, and -- in
+        thorough mode -- which alternative of an `a | b` dependency to use."""
         nonlocal steps
         name = frame["name"]
         while frame["i"] < len(frame["cands"]):
-            st = frame["cands"][frame["i"]]
+            cand = frame["cands"][frame["i"]]
             frame["i"] += 1
             steps += 1
-            if steps > STEP_BUDGET:
+            if steps > limit:
                 raise _NduBudget()
+            if frame["kind"] == "clause":
+                cons = dict(frame["cons"])
+                pending = list(frame["pending"])
+                if not apply_target(*cand, name, frame["chosen"], cons,
+                                    pending):
+                    continue
+                return frame["chosen"], cons, pending
+            st = cand
             chosen = dict(frame["chosen"])
             if "_installed" not in st and name not in eff_inst:
                 clash = forces_installed_upgrade(st, chosen)
@@ -521,9 +615,19 @@ def ndu_solve(index, inst, iprov, worklist, atoms, update, allow=None):
     trail = []
     try:
         while True:
-            # skip names that need no decision of their own
+            # skip anything that needs no decision of its own
             while pending:
                 head = pending[0]
+                if isinstance(head, tuple):
+                    # a deferred `a | b`: settled if some alternative is
+                    # already chosen and satisfies its constraint
+                    if any(r in chosen
+                           and (o is None
+                                or satisfies(chosen[r]["Version"], ((o, v),)))
+                           for r, o, v in head[1]):
+                        pending = pending[1:]
+                        continue
+                    break
                 if not index.has(head):
                     if head in atoms:
                         raise RuntimeError(
@@ -535,16 +639,23 @@ def ndu_solve(index, inst, iprov, worklist, atoms, update, allow=None):
                     break
             if not pending:
                 break
-            name = pending[0]
-            cons = constraints.get(name, ())
-            frame = {"name": name, "i": 0, "cands": candidates(name, cons),
-                     "chosen": chosen, "cons": constraints,
-                     "pending": pending[1:]}
-            if not frame["cands"]:
-                dead_end = name
-                iv = eff_inst.get(name, {}).get("Version")
-                note_wall(name, iv if iv is not None else "?",
-                          forced.get(name), cons)
+            head = pending[0]
+            if isinstance(head, tuple):
+                _, targets, why = head
+                frame = {"kind": "clause", "name": why, "i": 0,
+                         "cands": list(targets), "chosen": chosen,
+                         "cons": constraints, "pending": pending[1:]}
+            else:
+                name = head
+                cons = constraints.get(name, ())
+                frame = {"kind": "version", "name": name, "i": 0,
+                         "cands": candidates(name, cons), "chosen": chosen,
+                         "cons": constraints, "pending": pending[1:]}
+                if not frame["cands"]:
+                    dead_end = name
+                    iv = eff_inst.get(name, {}).get("Version")
+                    note_wall(name, iv if iv is not None else "?",
+                              forced.get(name), cons)
             nxt = advance(frame)
             while nxt is None:
                 if not trail:
@@ -555,16 +666,18 @@ def ndu_solve(index, inst, iprov, worklist, atoms, update, allow=None):
             chosen, constraints, pending = nxt
     except _NduNoSolution:
         if wall is None:
-            raise RuntimeError(
+            raise _tag(RuntimeError(
                 f'cannot satisfy "{dead_end}"' if dead_end else
-                "--no-dep-upgrade: no resolution found") from None
-        raise make_wall(*wall) from None
+                "--no-dep-upgrade: no resolution found"),
+                       saw_alternatives) from None
+        raise _tag(make_wall(*wall), saw_alternatives) from None
     except _NduBudget:
-        raise RuntimeError(
+        raise _tag(NduIncomplete(
             f"--no-dep-upgrade: search did not converge within "
-            f"{STEP_BUDGET:,} steps. This is a limit of the solver, not "
-            f"proof that no resolution exists -- narrow the targets, or "
-            f"run without --no-dep-upgrade.") from None
+            f"{limit:,} steps. This is a limit of the solver, not proof "
+            f"that no resolution exists -- raise it with --backtrack=N, "
+            f"narrow the targets, or run without --no-dep-upgrade."
+        ), saw_alternatives) from None
 
     plan, merges = [], []
     ordered = list(dict.fromkeys(
@@ -582,7 +695,10 @@ def ndu_solve(index, inst, iprov, worklist, atoms, update, allow=None):
                        int(st.get("Size", 0)), "ebuild", ""))
 
     # a package outside the allow-set still had to move: report as a wall
-    _wall_from_merges(merges, allow, forced)
+    try:
+        _wall_from_merges(merges, allow, forced)
+    except NduWall as w:
+        raise _tag(w, saw_alternatives) from None
     return plan, merges
 
 
@@ -1731,8 +1847,8 @@ class DpkgBackend:
     def _resolve_no_upgrade(self, worklist, atoms, inst, iprov, update,
                             allow=None):
         """Whole-closure downgrade search via the shared solver."""
-        plan, merges = ndu_solve(_DpkgIndex(self), inst, iprov,
-                                 worklist, atoms, update, allow)
+        plan, merges = ndu_search(_DpkgIndex(self), inst, iprov,
+                                  worklist, atoms, update, allow)
         self._plan = plan
         return merges
 
@@ -2077,8 +2193,8 @@ class AptBackend:
         iprov = DpkgBackend._inst_provides(inst)
         index = _AptIndex()
         worklist = atoms + members
-        plan, merges = ndu_solve(index, inst, iprov, worklist, atoms, update,
-                                 allow)
+        plan, merges = ndu_search(index, inst, iprov, worklist, atoms,
+                                  update, allow)
         # Turn the chosen stanzas into explicit apt version pins
         pins = []
         for st in plan:
@@ -3132,6 +3248,19 @@ Options:
                  Under --ask you are then offered to allow just those
                  packages to move; otherwise use --with (below).
 
+   --backtrack=<n>
+                 How hard to search when a --no-dep-upgrade resolution is not
+                 found first time (default 10; 0 disables the retry).
+
+                 The first pass takes the first alternative of every `a | b`
+                 dependency, as apt and dpkg do. If that reports a wall, and
+                 the closure actually contained a choice of alternative, the
+                 search runs again branching on those alternatives before the
+                 wall is believed -- so a wall you are shown has survived an
+                 exhaustive search, while a resolution that works first time
+                 costs nothing extra. <n> also multiplies the step budget for
+                 that second pass.
+
    --with <pkg[,pkg...]>
                  Under --no-dep-upgrade, permit these already-installed
                  packages to be upgraded, while everything else still gets
@@ -3229,6 +3358,14 @@ def main(argv):
             opts["no_dep_upgrade"] = True; continue
         if arg == "--no-verify":
             opts["no_verify"] = True; continue
+        if arg.startswith("--backtrack="):
+            val = arg.split("=", 1)[1]
+            if not val.isdigit():
+                eerror("--backtrack takes a number of attempts, "
+                       f"got '{val}'.")
+                sys.exit(1)
+            globals()["BACKTRACK"] = int(val)
+            continue
         if arg == "--with" or arg.startswith("--with="):
             # --with pkg,pkg  or  --with=pkg,pkg : permit these installed
             # packages to move under --no-dep-upgrade
@@ -3298,6 +3435,13 @@ def main(argv):
                 pkgs.append("@system")
             elif arg == "@selected":
                 pkgs.append("@selected")
+            elif arg.startswith("@"):
+                # otherwise this falls through as an atom and the resolver
+                # reports "no packages to satisfy @nosuchset", which answers
+                # a question nobody asked
+                eerror(f"unknown set: {arg} "
+                       f"(known sets: @world, @selected, @system)")
+                sys.exit(1)
             else:
                 pkgs.append(arg)
 

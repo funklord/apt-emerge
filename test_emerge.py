@@ -837,6 +837,108 @@ class TestNduSolve(unittest.TestCase):
 # The --no-dep-upgrade guarantee, independent of any solver
 # ---------------------------------------------------------------------------
 
+class TestNduSearch(unittest.TestCase):
+    """The escalating wrapper. The cheap pass takes the first alternative of
+    every `a | b`, as apt and dpkg do; only when that fails is it worth
+    branching on them. So a wall the user is shown has survived an exhaustive
+    search, and a resolution that works first time pays nothing."""
+
+    def setUp(self):
+        self.mod = load()
+        self.mod._session_critical_cache = set()
+        self.mod._session_blind = False
+        self.said = []
+        self.mod.einfo = self.said.append
+
+    # app needs `liba | libb`. liba, the first choice, demands a newer libc
+    # than is installed; libb is fine. Only branching resolves it.
+    def alternative_graph(self):
+        return FakeIndex({
+            "app": [stanza("app", "1.0", depends="liba | libb")],
+            "liba": [stanza("liba", "1.0", depends="libc (>= 2.0)")],
+            "libb": [stanza("libb", "1.0")],
+            "libc": [stanza("libc", "2.0"), stanza("libc", "1.0")],
+        })
+
+    def no_alternative_graph(self):
+        return FakeIndex({
+            "app": [stanza("app", "1.0", depends="libc (>= 2.0)")],
+            "libc": [stanza("libc", "2.0"), stanza("libc", "1.0")],
+        })
+
+    def search(self, idx, **kw):
+        return self.mod.ndu_search(idx, installed(("libc", "1.0")), {},
+                                   ["app"], {"app"}, False, **kw)
+
+    def test_the_cheap_pass_alone_walls_on_this_graph(self):
+        with self.assertRaises(self.mod.NduWall):
+            self.mod.ndu_solve(self.alternative_graph(),
+                               installed(("libc", "1.0")), {}, ["app"],
+                               {"app"}, False)
+
+    def test_escalating_finds_the_other_alternative(self):
+        _, merges = self.search(self.alternative_graph())
+        names = {m[0] for m in merges}
+        self.assertIn("libb", names)
+        self.assertNotIn("liba", names)
+        self.assertNotIn("libc", names, "and it moves nothing installed")
+
+    def test_the_retry_is_announced(self):
+        self.search(self.alternative_graph())
+        self.assertTrue(any("exhaustive" in s for s in self.said))
+
+    def test_backtrack_zero_disables_the_retry(self):
+        with self.assertRaises(self.mod.NduWall):
+            self.search(self.alternative_graph(), backtrack=0)
+        self.assertFalse(self.said)
+
+    def test_a_graph_with_no_choice_is_not_retried(self):
+        """Nothing to branch on means the second pass would walk exactly the
+        same graph, so running it only doubles the time before reporting the
+        same wall."""
+        with self.assertRaises(self.mod.NduWall):
+            self.search(self.no_alternative_graph())
+        self.assertFalse(self.said, "should not have escalated")
+
+    def test_a_genuine_wall_survives_the_exhaustive_pass(self):
+        """Both alternatives need a newer libc, so there is no way through
+        and the wall is real."""
+        idx = FakeIndex({
+            "app": [stanza("app", "1.0", depends="liba | libb")],
+            "liba": [stanza("liba", "1.0", depends="libc (>= 2.0)")],
+            "libb": [stanza("libb", "1.0", depends="libc (>= 2.0)")],
+            "libc": [stanza("libc", "2.0"), stanza("libc", "1.0")],
+        })
+        with self.assertRaises(self.mod.NduWall) as cm:
+            self.search(idx)
+        self.assertTrue(any("exhaustive" in s for s in self.said))
+        self.assertEqual([m["name"] for m in cm.exception.movers], ["libc"])
+
+    def test_the_first_failure_is_the_one_reported(self):
+        """It names the blocker the user is most likely to act on."""
+        idx = self.no_alternative_graph()
+        with self.assertRaises(self.mod.NduWall) as cm:
+            self.search(idx)
+        self.assertEqual([m["name"] for m in cm.exception.movers], ["libc"])
+
+    def test_a_clean_resolve_never_escalates(self):
+        idx = FakeIndex({"app": [stanza("app", "1.0")]})
+        self.mod.ndu_search(idx, installed(), {}, ["app"], {"app"}, False)
+        self.assertFalse(self.said)
+
+    def test_budget_exhaustion_is_not_reported_as_a_wall(self):
+        """Giving up early is not proof that no resolution exists."""
+        idx = self.alternative_graph()
+        with self.assertRaises(self.mod.NduIncomplete) as cm:
+            self.mod.ndu_solve(idx, installed(("libc", "1.0")), {}, ["app"],
+                               {"app"}, False, budget=1)
+        self.assertIn("--backtrack", str(cm.exception))
+
+    def test_incomplete_is_still_a_runtime_error(self):
+        """Existing handlers catch RuntimeError; they must keep working."""
+        self.assertTrue(issubclass(self.mod.NduIncomplete, RuntimeError))
+
+
 class TestWithArg(unittest.TestCase):
     def test_names_the_new_mover(self):
         self.assertEqual(em._with_arg(set(), [{"name": "libgbm1"}]),
@@ -1365,6 +1467,21 @@ class TestArgParsing(unittest.TestCase):
             with self.subTest(flag=flag):
                 self.setUp()
                 self.assertAccepted([flag, "nano"])
+
+    def test_backtrack_is_accepted_and_parsed(self):
+        original = em.BACKTRACK
+        try:
+            self.assertAccepted(["--backtrack=25", "nano"])
+            self.assertEqual(self.mod.BACKTRACK, 25)
+        finally:
+            em.BACKTRACK = original
+
+    def test_backtrack_zero_is_valid(self):
+        self.assertAccepted(["--backtrack=0", "nano"])
+        self.assertEqual(self.mod.BACKTRACK, 0)
+
+    def test_backtrack_rejects_a_non_number(self):
+        self.assertRejected(["--backtrack=lots", "nano"])
 
     def test_bundled_short_flags_are_accepted(self):
         self.assertAccepted(["-pv1", "nano"])
