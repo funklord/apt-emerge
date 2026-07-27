@@ -4,9 +4,28 @@ A Gentoo Portage–flavoured package manager for Debian/Ubuntu, implemented as a
 single stdlib-only Python 3 script. It speaks emerge's CLI dialect and paints
 Portage-style output, but drives real Debian tooling underneath.
 
-The current artifact is one file: `emerge` (~2900 lines), plus `test_emerge.py`
-(a dev-only test suite — not shipped, and it loads `emerge` by path rather than
-importing it, so the single-file rule is intact).
+The shipped artifact is still one file, `emerge` (~3600 lines). Everything
+else in the repository is development scaffolding and is not installed:
+
+| file | |
+|---|---|
+| `emerge` | the whole program; the only thing that ships |
+| `test_emerge.py` | unit tests (~3200 lines) |
+| `test_integration.py` | end-to-end tests against throwaway roots |
+| `README.md` | user-facing front page |
+| `LICENSE` | GPL-2, verbatim from `/usr/share/common-licenses/GPL-2` |
+| `.github/workflows/tests.yml` | CI |
+| `project.md` | this file |
+
+Both test files load `emerge` **by path** rather than importing it, so the
+single-file rule survives having tests at all.
+
+**Licensed GPL-2.0-or-later** (owner's decision). Each source file carries
+the standard notice plus an SPDX tag — that per-file notice, not `LICENSE`,
+is what makes the "or later" grant effective. `AUTHOR`, `COPYRIGHT`,
+`LICENCE` and `VERSION` are module constants driving `emerge -V`; the notice
+at the top of the file is a comment and cannot share them, so a test reads
+the header back and fails if the two drift apart.
 
 Originally developed and tested chat-side without system access. It has since
 been run against a real Debian 13 (trixie) desktop with `trixie-updates` and
@@ -66,9 +85,9 @@ been run against a real Debian 13 (trixie) desktop with `trixie-updates` and
 
 ## File layout (single file, top to bottom)
 
-Line numbers below are from the ~2619-line version and have all shifted by a
-few hundred since (the file is ~2900 lines now). Treat the *order* as the map
-and re-grep for anything specific.
+Line numbers below are from the ~2619-line version and are now roughly 1,000
+lines out (the file is ~3600 lines). Treat the *order* as the map and re-grep
+for anything specific — the sequence has not changed, only the offsets.
 
 - **Imports + path constants** (~11–39): stdlib only; `lzma` is optional
   (minimal builds strip it — code falls back to `.gz`/plain). Paths:
@@ -503,6 +522,31 @@ both reimplement something with an existing reference — keep them that way:
 
 Both skip themselves if the tool is missing, so the suite runs off a Debian box.
 
+## CI
+
+`.github/workflows/tests.yml`, on every push and pull request (the remote
+carried both `main` and `master` at one point, so it is not branch-pinned).
+Free on GitHub for a suite this size. Four jobs:
+
+- **`unit`** — both suites on Python 3.9, 3.11 and 3.13, plus a run under
+  `-W error::ResourceWarning`, because a leaked file handle otherwise passes
+  by accident of CPython refcounting. That is exactly how five leaks in
+  `emerge` went unnoticed until CI ran.
+- **`debian`** — the same suites in a `debian:trixie` container. This runs as
+  **root**, which is the one condition not reproducible on a normal
+  workstation and the only reason a test reading real `/proc` was ever
+  caught. Its unit and integration steps are deliberately separate so a
+  failure says which half broke without needing the logs — job logs need repo
+  admin rights, which a helper may not have.
+- **`stdlib-only`** — walks the AST for imports outside
+  `sys.stdlib_module_names` and fails if a non-test `.py` appears beside
+  `emerge`. This guards hard rule 1.
+
+**The first CI run failed three times, and all three were test defects, not
+product bugs** — every one invisible on the development machine. See the
+testing section: they are the reason the local-matrix recipe and
+`TestPortability` exist.
+
 **Run the CI matrix locally before pushing.** `uv` fetches real
 interpreters in seconds, which is the only honest way to check portability:
 
@@ -703,6 +747,15 @@ apart and drift silently because nothing enforces the shared contract.
   depth is nowhere near that (plasma-desktop's 1,484 packages are breadth),
   so this is a documented bound rather than a bug to fix — `ndu_solve` was
   made iterative because `@world` genuinely is deep, and this is not.
+- An unrecognised **long** option used to match nothing and fall through both
+  arms of the final branch, so it was silently discarded. Harmless for a typo
+  like `--nonsense`; dangerous for `--no-dep-upgrades`, one letter off, which
+  ran an ordinary unprotected install. Short options always rejected unknown
+  letters; long ones now do too. Likewise a bare `--with` consumed the next
+  token before flag parsing, so `--with -a pkg` silently ate the `-a`.
+- Anything beginning with `@` that is not a known set is an error. Letting it
+  fall through to the resolver produced "no packages to satisfy @nosuchset",
+  which answers a question nobody asked.
 - Never fork per search result. `emerge -s '^lib'` matches 29,185 packages;
   one `apt-cache policy` per hit meant the search never finished. Batch it.
 
@@ -719,6 +772,29 @@ escape hatch (`--with` + interactive + session flag) → world-file atomic write
 → live session-critical detection applied to all `-a/-p` merges.
 
 First pass on a real Debian 13 box: session detection reads binaries and
-survives hardened processes → unit test suite (147 tests, differential against
-dpkg and diff3) → three `--no-dep-upgrade` fixes found by running the real
-libsdl3-dev case → gpgv Release verification on the dpkg backend.
+survives hardened processes → unit test suite (differential against dpkg and
+diff3) → three `--no-dep-upgrade` fixes found by running the real libsdl3-dev
+case → gpgv Release verification on the dpkg backend.
+
+Then, mostly driven by auditing rather than by a feature list — the recurring
+theme being that the **apt backend** lagged the dpkg one on everything the
+two share:
+
+- **`--no-dep-upgrade` usability**: the `-a` escape hatch loops until it
+  resolves instead of retrying once; a same-upstream bump reads as
+  `(session rebuild)` rather than a restart warning; `ndu_solve` gained real
+  backtracking, then an on-demand exhaustive pass (`ndu_search`,
+  `--backtrack`).
+- **Honesty about destructive actions**: `emerge -C` showed one package while
+  apt would have removed 868; failures were filtered out of the output so
+  "see output above" pointed at nothing; config writes were not durable;
+  `.deb`s with no index checksum installed silently.
+- **Parity sweep**: archiving on failure, `--oneshot` (which needed hard
+  rule 3 relaxed), search that forked per result and never finished on
+  `^lib`.
+- **Arg parsing**: unknown long options were silently discarded — including
+  a mistyped `--no-dep-upgrades`.
+- **Coverage**: end-to-end tests against throwaway dpkg *and* apt roots, the
+  dispatch-conf interactive loop, and the archiving half of config merging.
+- **Repository**: README, GPL-2.0-or-later, `-V`, and CI — whose first run
+  failed three times, all of them test defects invisible on the dev machine.
