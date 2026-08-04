@@ -19,8 +19,16 @@ indent_names = ["Makefile", "emerge", "rules"]
 # or either test module does.
 floor = 8
 
-# The defaults, restated because a table replaces rather than extends them.
-# `dist` is ours: git discovery already drops it as ignored, but the gate
-# falls back to a plain walk in a tree with no .git -- which is exactly how
-# the container CI recipe runs.
-exclude = ["attic", "third_party", "vendor", "build", "target", "dist"]
+# The defaults, restated because a table replaces rather than extends them,
+# plus the three this tree needs.
+#
+# They exist because the gate has two discovery paths and they must agree.
+# Git is preferred, and `--exclude-standard` drops all of these on its own;
+# but in a tree with no .git it falls back to a plain walk, which is exactly
+# how the container CI recipe runs (`rm -rf .git` after copying the source
+# in). Without these the walk checks twelve files rather than ten, two of
+# them nobody's business here: pytest's own cache README, and the local
+# Claude settings. They happen to conform, so the gate passed on luck --
+# and a generated file that did not would be a failure with no defect.
+exclude = ["attic", "third_party", "vendor", "build", "target",
+           "dist", ".pytest_cache", ".claude"]

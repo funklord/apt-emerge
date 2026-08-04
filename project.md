@@ -690,6 +690,14 @@ Two things about that config are worth knowing before trusting the gate:
   measured at `8 files conform`, exit 0, with `emerge` and `debian/rules`
   silently outside it. `make style` refuses to run on such an interpreter,
   and the CI job pins 3.13 rather than trusting the runner's default.
+- **The gate has two discovery paths and they must be made to agree.** Git
+  is preferred and drops ignored files on its own; with no `.git` it falls
+  back to a plain walk, which is exactly how the container recipe below runs
+  it. That walk found twelve files rather than ten — pytest's cache README
+  and `.claude/settings.local.json`, neither of them this project's content.
+  Both conformed, so the gate passed on luck; a generated file that did not
+  would have failed CI with no defect behind it. The `exclude` list closes
+  it, and the two paths now list the same ten files.
 
 Mutation-tested rather than assumed, all five confirmed by running them: a
 4-space-indented function appended to `emerge` is caught at the line
