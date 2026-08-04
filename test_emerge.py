@@ -2138,6 +2138,41 @@ class TestPackaging(unittest.TestCase):
 		                 "the script and the Makefile disagree about the "
 		                 "names it should be installed under")
 
+	def test_the_readme_shows_output_the_program_actually_prints(self):
+		"""The README opens with console output, and it is the first thing
+		anyone reads. A format change that leaves it behind makes the
+		project advertise something it no longer does -- and the examples
+		are real captures, so they can simply be re-rendered and compared."""
+		readme = self.read("README.md")
+		mod = load()
+		mod.USE_COLOR = False
+		mod._session_critical_cache = {"libgl1-mesa-dri", "libglx-mesa0"}
+		mod._session_blind = False
+		buf = io.StringIO()
+		with contextlib.redirect_stdout(buf):
+			mod.print_merge_list(
+			    [("libgl1-mesa-dri", "25.0.7-2+deb13u1", "25.0.7-2",
+			      46284, "ebuild", ""),
+			     ("libglx-mesa0", "25.0.7-2+deb13u1", "25.0.7-2",
+			      143360, "ebuild", "")], True)
+		for line in buf.getvalue().splitlines()[:2]:
+			self.assertIn(line, readme,
+			              "the README's session example is not what "
+			              "print_merge_list produces any more")
+
+	def test_the_readme_install_example_matches_the_merge_list_format(self):
+		readme = self.read("README.md")
+		mod = load()
+		mod.USE_COLOR = False
+		buf = io.StringIO()
+		with contextlib.redirect_stdout(buf):
+			mod.print_merge_list([("sl", "5.02-1+b1", None, 13210,
+			                       "ebuild", "")], True)
+		lines = [l for l in buf.getvalue().splitlines() if l.strip()]
+		for line in lines:
+			self.assertIn(line, readme,
+			              f"README no longer shows what -pv prints: {line!r}")
+
 	def test_the_installed_paths_are_system_ones(self):
 		"""A .deb may not install into /usr/local; that belongs to the
         local admin, and dpkg must not own anything there."""

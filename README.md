@@ -123,24 +123,40 @@ end to end against a throwaway root — real `.debs`, a real repository, real
 installs — and needs no privileges, because dpkg is given `--root` and
 apt's state is redirected. It skips itself where that is unavailable.
 
-Two suites are differential rather than hand-written: `vercmp` reimplements
-Debian policy 5.6.12, so every version pair is also run through
-`dpkg --compare-versions` and must agree; the 3-way merge documents itself
-as `diff3 -m` equivalent, so its output is compared against `diff3`.
+The parts that reimplement something are checked against a reference or an
+oracle rather than against hand-written expectations, because a hand-written
+case only encodes what its author believed:
+
+- `vercmp` is Debian policy 5.6.12 in Python, so every pair — a fixed table
+  and a seeded fuzz over generated versions — is run through
+  `dpkg --compare-versions` and must agree.
+- `merge3` is held to the four rules it documents, property-tested over tens
+  of thousands of random inputs, and its clean merges are compared against
+  real `diff3`.
+- The `--no-dep-upgrade` solver is checked against brute force on random
+  package graphs small enough to enumerate: a plan may never move an
+  installed package, it must satisfy every dependency it pulls in, and a
+  wall may only be reported where exhaustive search agrees there is none.
 
 ## Status and limits
 
 Developed and used against Debian 13 (trixie). Honest about what is not
 covered:
 
-- The dependency search is not a complete SAT solver. It backtracks properly
-  across versions, but alternatives within one dependency (`a | b`) are
-  taken first-match, and the search is bounded by a step budget — exceeding
-  it reports a solver limit rather than claiming no solution exists.
+- The dependency search is not a complete SAT solver. The first pass takes
+  the first alternative of every `a | b`, as apt and dpkg do; only if that
+  hits a wall does it search again branching on them, so a wall you are
+  shown has survived that second pass. The search is bounded by a step
+  budget, and exceeding it reports a solver limit rather than claiming no
+  solution exists.
 - The dpkg backend is exercised end to end in tests, but has not been run on
   a real machine that lacks `apt-get`.
 - Session detection is verified on KDE Plasma with sddm; GNOME and the
-  various greeters are not.
+  various greeters are not. Process names are matched against
+  `/proc/PID/comm`, which the kernel truncates to 15 characters, so a
+  greeter whose binary name is longer has to be listed in its truncated
+  spelling — a rule the tests enforce, after SDDM 0.21 renamed its greeter
+  and went undetected.
 - `--no-dep-upgrade` searches per target, so on a large set it runs many
   dependency simulations and can be slow.
 
