@@ -66,7 +66,8 @@ jobs:
         run: |
           apt-get update -qq
           apt-get install -y --no-install-recommends \
-            python3 dpkg-dev diffutils gpgv gnupg ca-certificates
+            python3 dpkg-dev build-essential diffutils gpgv gnupg \
+            ca-certificates
 
       - name: Byte-compile the shipped script
         run: python3 -m py_compile emerge
@@ -142,7 +143,10 @@ jobs:
           man -w etc-update
 
       - name: Lintian
-        run: lintian --no-tag-display-limit dist/*.changes || true
+        # informational, but not silent: lintian is why the
+        # uses-dpkg-database-directly override exists, and a *new* tag is
+        # something to look at rather than scroll past
+        run: lintian --tag-display-limit 0 dist/*.changes || true
 
       - name: Removing it leaves nothing behind
         run: |

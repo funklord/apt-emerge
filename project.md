@@ -668,6 +668,35 @@ pages, and removes the package again. `lintian` runs informationally
 (`|| true`) — it has never been run against this package by the author, so
 treat its first output as a to-do list rather than a regression.
 
+## Running CI locally
+
+The `debian` and `package` jobs can be run for real, and should be before
+touching either:
+
+```sh
+docker run --rm -v "$PWD":/src:ro debian:trixie bash -c '
+  apt-get update -qq
+  apt-get install -y --no-install-recommends python3 dpkg-dev \
+    build-essential diffutils gpgv gnupg ca-certificates
+  cp -r /src /work && cd /work && rm -rf .git dist debian/apt-emerge
+  python3 -m unittest test_emerge
+  EMERGE_TESTS_REQUIRE_ALL=1 python3 -m unittest test_integration'
+```
+
+**This is worth the trouble, because the container runs as root and a
+workstation does not.** Doing it for the first time found four defects that
+every local run had reported green:
+
+- the world file was seeded at the wrong moment, so the first install pulled
+  its own dependencies into `@world` (see `_seed_world` — the guard returns
+  early for non-root, which is why nothing local saw it);
+- the unit suite wrote a real `/var/lib/emerge-dpkg/world`, 135 entries, on
+  the machine running the tests;
+- `SourceBuildEndToEnd` needs `build-essential`, which `apt-get build-dep`
+  pulls in implicitly whatever the source package asks for. A developer box
+  has it; the container did not, and the failure reads as a resolver bug;
+- `emerge --help | head` printed a `BrokenPipeError` and exited 120.
+
 ## CI
 
 `.github/workflows/tests.yml`, on every push and pull request (the remote
@@ -985,6 +1014,17 @@ apart and drift silently because nothing enforces the shared contract.
 - Anything beginning with `@` that is not a known set is an error. Letting it
   fall through to the resolver produced "no packages to satisfy @nosuchset",
   which answers a question nobody asked.
+- **Python ignores SIGPIPE**, so a closed pipe becomes a `BrokenPipeError`
+  at interpreter shutdown — "Exception ignored on flushing sys.stdout" and
+  exit status 120. `emerge -pv @world | head` is the normal way to read a
+  long list, so `__main__` restores the default handler and it dies quietly
+  like any other Unix tool.
+- **`lintian` flags `uses-dpkg-database-directly`**, and it is right that
+  parsing `/var/lib/dpkg/status` is unusual. It is deliberate: the dpkg
+  backend exists for boxes with no apt, so libapt is not available to it by
+  definition, and the alternative is a `dpkg-query` fork per package on
+  every run. `debian/apt-emerge.lintian-overrides` records that, so the
+  package lints clean and a *new* tag is visible rather than lost in noise.
 - Never fork per search result. `emerge -s '^lib'` matches 29,185 packages;
   one `apt-cache policy` per hit meant the search never finished. Batch it.
   The same mistake reappeared in `archive_settled`, which forked

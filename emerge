@@ -1498,16 +1498,27 @@ class DpkgBackend:
 		self.versions = None  # name -> [stanza,...] (built lazily on demand)
 		self._plan = []       # resolver output stanzas, kept for merge()
 		self._seeded = False
+		self._seed_world()
 
 	# -- world file ---------------------------------------------------------
 
 	def _seed_world(self):
-		"""Populate the world file on first use.
+		"""Populate the world file when the backend is constructed.
 
-        Deferred rather than done in __init__: constructing a backend is not
-        an operation, and pick_backend() runs for `emerge -V` too -- which
-        has no business creating /var/lib/emerge-dpkg, let alone announcing
-        that it seeded it."""
+        A first run has no world file, and everything already installed is
+        what the user chose, so that is the seed.
+
+        The timing is load-bearing and was briefly wrong: deferring this to
+        the first _read_world() looked tidier, but merge() reads the world
+        file *after* dpkg has run, so the seed then captured the packages
+        the merge had just installed -- pulling every dependency of the very
+        first install into @world permanently. Invisible unless you are
+        root, because the guard below returns early otherwise, so it passed
+        on a workstation and failed in a debian:trixie container.
+
+        Construction is the right moment: it happens before anything is
+        installed. `emerge -V` does not construct a backend at all -- see
+        backend_name() -- so a version query still creates nothing."""
 		if self._seeded:
 			return
 		self._seeded = True
@@ -1520,7 +1531,6 @@ class DpkgBackend:
 		einfo(f"Seeded world file with {len(inst)} currently installed packages.")
 
 	def _read_world(self):
-		self._seed_world()
 		if not os.path.exists(WORLD):
 			return set()
 		with open(WORLD) as f:
@@ -3478,17 +3488,25 @@ LONG_FLAGS = {"--ask": "a", "--verbose": "v", "--pretend": "p", "--update": "u",
               "--oneshot": "1", "--quiet": "q",
               "--buildpkg": "b", "--buildpkgonly": "B"}
 
-def pick_backend(forced):
+def backend_name(forced):
+	"""Which backend would be used, without constructing it.
+
+	`emerge -V` wants only the name, and constructing the dpkg backend is
+	not free -- it seeds the world file. A version query must not create
+	state, so it asks this instead."""
 	choice = forced or os.environ.get("EMERGE_BACKEND")
-	if choice == "apt":
+	if choice in ("apt", "dpkg"):
+		return choice
+	if choice:
+		eerror(f"unknown backend '{choice}' (use apt or dpkg)"); sys.exit(1)
+	return "apt" if shutil.which("apt-get") else "dpkg"
+
+def pick_backend(forced):
+	if backend_name(forced) == "apt":
 		if not shutil.which("apt-get"):
 			eerror("apt backend requested but apt-get not found."); sys.exit(1)
 		return AptBackend()
-	if choice == "dpkg":
-		return DpkgBackend()
-	if choice:
-		eerror(f"unknown backend '{choice}' (use apt or dpkg)"); sys.exit(1)
-	return AptBackend() if shutil.which("apt-get") else DpkgBackend()
+	return DpkgBackend()
 
 def main(argv):
 	opts = {k: False for k in ("ask", "verbose", "pretend", "update", "deep",
@@ -3550,9 +3568,8 @@ def main(argv):
 		if arg in ("--help", "-h"):
 			print(HELP); return
 		if arg in ("--version", "-V"):
-			b = pick_backend(backend_flag)
 			print(f"Portage {VERSION} (python {sys.version.split()[0]}, "
-			      f"{b.name} backend)")
+			      f"{backend_name(backend_flag)} backend)")
 			print(f"emerge for Debian -- {COPYRIGHT}")
 			print(f"Licence {LICENCE}: GNU GPL version 2 or later. This is "
 			      f"free software;")
@@ -3757,6 +3774,18 @@ def _finish_merge(be, merges, pkgs, opts):
 	be.merge(merges, pkgs, opts)
 
 if __name__ == "__main__":
+	# Die on a closed pipe the way every other Unix tool does. Python
+	# ignores SIGPIPE and raises BrokenPipeError instead, which surfaces at
+	# interpreter shutdown as "Exception ignored on flushing sys.stdout" plus
+	# exit status 120 -- so `emerge -pv @world | head` printed a traceback
+	# and returned an error for doing something entirely ordinary. This
+	# script prints long package lists; piping them to head or less is how
+	# people read them.
+	try:
+		import signal
+		signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+	except (ImportError, AttributeError, ValueError):
+		pass                      # no SIGPIPE here, or not the main thread
 	try:
 		# `ln -s emerge /usr/sbin/dispatch-conf` (or etc-update) just works
 		_self = os.path.basename(sys.argv[0])

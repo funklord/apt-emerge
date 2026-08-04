@@ -1185,10 +1185,21 @@ class ConfigMergingEndToEnd(unittest.TestCase):
 
 
 def _source_build_works():
-	return bool(HAVE_DPKG_ROOT and shutil.which("apt-get")
-	            and shutil.which("dpkg-source")
-	            and shutil.which("dpkg-scansources")
-	            and shutil.which("dpkg-buildpackage"))
+	if not (HAVE_DPKG_ROOT and shutil.which("apt-get")
+	        and shutil.which("dpkg-source")
+	        and shutil.which("dpkg-scansources")
+	        and shutil.which("dpkg-buildpackage")):
+		return False
+	# `apt-get build-dep` pulls build-essential in implicitly, whatever the
+	# source package's own Build-Depends say. Without it installed there is
+	# nothing to satisfy that from -- the test repository carries sources
+	# only -- and build-dep fails with "you have held broken packages",
+	# which reads as a bug in resolve_source rather than a missing package.
+	# Found by running the suite in a debian:trixie container, where it is
+	# absent; a developer box has it and never sees this.
+	r = subprocess.run(["dpkg-query", "-W", "-f=${Status}", "build-essential"],
+	                   capture_output=True, text=True)
+	return r.stdout.startswith("install ok installed")
 
 
 HAVE_SOURCE_BUILD = _source_build_works()
@@ -1590,7 +1601,8 @@ class SignatureVerificationEndToEnd(unittest.TestCase):
 		self.assertIsNotNone(text, f"Release did not verify; {self.warnings}")
 		self.assertIn("Suite: trixie", text)
 
-		raw = open(os.path.join(self.repo, "Packages"), "rb").read()
+		with open(os.path.join(self.repo, "Packages"), "rb") as f:
+			raw = f.read()
 		self.assertTrue(v.check_index("file://" + self.repo, "./", None,
 		                              "Packages", raw))
 		self.assertEqual(v.checked, 1,

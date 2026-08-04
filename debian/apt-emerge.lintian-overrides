@@ -1,0 +1,13 @@
+# emerge parses /var/lib/dpkg/status directly, in installed_state(). Lintian
+# is right that this is unusual, and it is deliberate:
+#
+#   - the dpkg backend exists for systems with no apt at all, so libapt is
+#     not available to it by definition;
+#   - it is read-only, and it is the same file dpkg-query would read;
+#   - the alternative is a dpkg-query fork per package. That was measured on
+#     the neighbouring conffile path at 163x slower than one batched call,
+#     and installed_state() is called on every single run.
+#
+# Nothing here writes to the database; every modification goes through dpkg
+# or apt-get as a subprocess.
+apt-emerge: uses-dpkg-database-directly [usr/bin/emerge]

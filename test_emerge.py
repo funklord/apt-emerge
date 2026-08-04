@@ -76,6 +76,8 @@ def setUpModule():
 
 
 def tearDownModule():
+	if _SCRATCH_ROOT is not None:
+		shutil.rmtree(_SCRATCH_ROOT, ignore_errors=True)
 	changed = [name for name in _WATCHED if _resolve(name) is not _SNAPSHOT[name]]
 	if changed:
 		raise AssertionError(
@@ -85,11 +87,41 @@ def tearDownModule():
 		      "with addCleanup, or the damage lands in whatever runs next.")
 
 
+_SCRATCH_ROOT = None
+_SCRATCH_SEQ = 0
+
+
+def _scratch():
+	"""A unique, unwritten path under one temp root, cleaned up at the end.
+
+	Unit tests must never touch system state, and one silently did: as root,
+	constructing DpkgBackend seeds the world file, so a bare `python3 -m
+	unittest test_emerge` created a real /var/lib/emerge-dpkg/world with 135
+	entries. Invisible as an ordinary user -- the seed guard returns early --
+	and found by running the suite in a container as root.
+
+	The paths are handed out rather than created; the code under test makes
+	whatever it actually needs."""
+	global _SCRATCH_ROOT, _SCRATCH_SEQ
+	if _SCRATCH_ROOT is None:
+		_SCRATCH_ROOT = tempfile.mkdtemp(prefix="emerge-unit-")
+	_SCRATCH_SEQ += 1
+	return os.path.join(_SCRATCH_ROOT, str(_SCRATCH_SEQ))
+
+
 def load():
 	loader = importlib.machinery.SourceFileLoader("emerge_under_test", SCRIPT)
 	spec = importlib.util.spec_from_loader(loader.name, loader)
 	mod = importlib.util.module_from_spec(spec)
 	loader.exec_module(mod)
+	# every path the dpkg backend writes to, out of the way of the system
+	scratch = _scratch()
+	mod.LIB_DIR = os.path.join(scratch, "lib")
+	mod.TREE_DIR = os.path.join(scratch, "lib", "tree")
+	mod.WORLD = os.path.join(scratch, "lib", "world")
+	mod.DISTFILES = os.path.join(scratch, "distfiles")
+	mod.BINPKGS = os.path.join(scratch, "binpkgs")
+	mod.PORTAGE_TMPDIR = os.path.join(scratch, "portage")
 	# Pretend we are headless: keeps tests off /proc and away from a
 	# dpkg-query fork, and makes session annotations deterministic.
 	mod._session_critical_cache = set()
@@ -1509,12 +1541,15 @@ class TestDpkgBackendDrivesDpkg(unittest.TestCase):
 
 	def setUp(self):
 		self.mod = load()
-		self.be = self.mod.DpkgBackend()
 		self.mod.need_root = lambda: None
 		self.mod.load_conf = lambda: {}
 		self.mod.archive_settled = lambda conf, pkgs: 0
 		self.mod.pending_notice = lambda conf: None
 		self.mod.einfo = lambda m: None
+		# after einfo is silenced, not before: constructing the backend seeds
+		# the world file and announces it, which as root put "Seeded world
+		# file with 170 packages" in the middle of the test output
+		self.be = self.mod.DpkgBackend()
 		self.calls = []
 
 		class R:
@@ -1625,29 +1660,32 @@ class TestDpkgBackendDrivesDpkg(unittest.TestCase):
 		self.assertEqual(written, [{"keep"}])
 
 
-class TestSeedWorldIsDeferred(unittest.TestCase):
-	"""Constructing a backend is not an operation. pick_backend() runs for
-    `emerge -V` too, and creating /var/lib/emerge-dpkg -- and announcing it
-    -- is not something a version query should do."""
+class TestSeedWorldTiming(unittest.TestCase):
+	"""When the world file is seeded, which is load-bearing.
+
+	A first run has no world file, and everything installed is what the user
+	chose, so that is the seed. It has to be taken *before* the run installs
+	anything: merge() reads the world file after dpkg has run, so seeding
+	lazily on first read captured the packages the merge had just installed
+	and pulled every dependency of the first install into @world for good.
+
+	That is invisible unless you are root -- the guard returns early
+	otherwise -- so it passed on a workstation and only failed in a
+	debian:trixie container. These tests fake root so they see it here."""
 
 	def setUp(self):
 		self.mod = load()
-		self.seeded, self.made, self.opened = [], [], []
-		self.mod.installed_state = lambda: {"bash": {"Package": "bash"}}
+		self.seeded, self.made, self.written = [], [], {}
+		self.installed = {"bash": {"Package": "bash"},
+		                  "coreutils": {"Package": "coreutils"}}
+		self.mod.installed_state = lambda: dict(self.installed)
 		self.mod.einfo = self.seeded.append
-		# Force the exact conditions under which seeding *would* happen:
-		# running as root, with no world file yet. Without this the guard at
-		# the top of _seed_world returns early for an ordinary user and every
-		# assertion below holds whether the fix is present or not.
-		#
-		# `mod.os` is the real os module, not a copy, so each original has to
-		# be captured *before* it is replaced -- reading it back inside the
-		# addCleanup call would restore the patch over itself and leak a
-		# crippled os.makedirs into every test that runs afterwards.
 		real_exists = self.mod.os.path.exists
+		self.world_exists = False
 		self.patch(self.mod.os, "geteuid", lambda: 0)
 		self.patch(self.mod.os.path, "exists",
-		           lambda p: False if p == self.mod.WORLD else real_exists(p))
+		           lambda p: (self.world_exists if p == self.mod.WORLD
+		                      else real_exists(p)))
 		self.patch(self.mod.os, "makedirs",
 		           lambda *a, **kw: self.made.append(a))
 		self.mod.open = self.fake_open
@@ -1657,48 +1695,67 @@ class TestSeedWorldIsDeferred(unittest.TestCase):
 		self.addCleanup(setattr, obj, attr, original)
 		setattr(obj, attr, value)
 
-	def fake_open(self, path, *a, **kw):
-		self.opened.append(path)
-		return io.StringIO()
+	def fake_open(self, path, mode="r", *a, **kw):
+		buf = io.StringIO()
+		if "w" in mode:
+			self.written[path] = buf
+			buf.close = lambda: None
+		return buf
 
-	def test_constructing_the_backend_seeds_nothing(self):
+	def seeded_names(self):
+		buf = self.written.get(self.mod.WORLD)
+		return sorted(buf.getvalue().split()) if buf else []
+
+	def test_the_seed_is_taken_at_construction(self):
 		self.mod.DpkgBackend()
-		self.assertEqual(self.made, [])
-		self.assertEqual(self.opened, [])
-		self.assertEqual(self.seeded, [])
+		self.assertEqual(self.seeded_names(), ["bash", "coreutils"])
 
-	def test_version_does_not_seed_the_world_file(self):
-		# shutil is a shared module object: patched without a cleanup this
-		# leaks a which() that finds nothing into every later test, which is
-		# how the gpgv suite started failing only when run after this one.
-		self.patch(self.mod.shutil, "which", lambda p: None)  # force dpkg
-		with contextlib.redirect_stdout(io.StringIO()):
+	def test_the_seed_predates_anything_the_run_installs(self):
+		"""The regression, stated directly: a package installed after the
+		backend exists must not appear in the seed."""
+		be = self.mod.DpkgBackend()
+		self.installed["freshly-installed-dep"] = {
+		    "Package": "freshly-installed-dep"}
+		be._read_world()
+		self.assertNotIn("freshly-installed-dep", self.seeded_names())
+
+	def test_seeding_happens_once(self):
+		be = self.mod.DpkgBackend()
+		for _ in range(4):
+			be._read_world()
+		self.assertEqual(len(self.seeded), 1)
+
+	def test_an_existing_world_file_is_never_reseeded(self):
+		self.world_exists = True
+		self.mod.DpkgBackend()
+		self.assertEqual(self.seeded, [])
+		self.assertEqual(self.made, [])
+
+	def test_version_creates_nothing(self):
+		"""-V wants the backend's name, not a backend. Constructing one
+		seeds the world file, and a version query must not write to
+		/var/lib."""
+		self.mod.shutil = self.mod.shutil
+		self.patch(self.mod.shutil, "which", lambda p: None)   # force dpkg
+		out = io.StringIO()
+		with contextlib.redirect_stdout(out):
 			self.mod.main(["-V"])
+		self.assertIn("dpkg backend", out.getvalue())
 		self.assertEqual(self.made, [])
-		self.assertEqual(self.opened, [])
 		self.assertEqual(self.seeded, [])
+		self.assertEqual(self.written, {})
 
-	def test_help_does_not_seed_it_either(self):
+	def test_help_creates_nothing_either(self):
 		self.patch(self.mod.shutil, "which", lambda p: None)
 		with contextlib.redirect_stdout(io.StringIO()):
 			self.mod.main(["--help"])
 		self.assertEqual(self.made, [])
 
-	def test_the_first_real_operation_still_seeds_it(self):
-		"""Deferred, not removed: an actual operation must still get a world
-        file seeded from what is installed, or @selected starts out empty and
-        --depclean proposes removing the entire system."""
-		be = self.mod.DpkgBackend()
-		self.assertEqual(self.opened, [], "not seeded before it is needed")
-		be._read_world()
-		self.assertIn(self.mod.WORLD, self.opened)
-		self.assertTrue(self.seeded)
-
-	def test_seeding_happens_once_however_often_world_is_read(self):
-		be = self.mod.DpkgBackend()
-		for _ in range(4):
-			be._read_world()
-		self.assertEqual(len(self.seeded), 1)
+	def test_backend_name_agrees_with_the_backend_it_would_build(self):
+		for forced in ("apt", "dpkg"):
+			with self.subTest(forced=forced):
+				self.assertEqual(self.mod.backend_name(forced),
+				                 self.mod.pick_backend(forced).name)
 
 
 class TestPrintUnmergeList(unittest.TestCase):
@@ -1877,6 +1934,53 @@ class TestPrompts(unittest.TestCase):
 				self.assertFalse(self.ask_continue())
 				self.refuse(exc)
 				self.assertFalse(self.ask_yesno())
+
+
+class TestPipeBehaviour(unittest.TestCase):
+	"""`emerge -pv @world | head` is how people read a long package list.
+
+	Python ignores SIGPIPE and raises BrokenPipeError instead, which surfaces
+	at interpreter shutdown as "Exception ignored on flushing sys.stdout" and
+	exit status 120 -- a traceback and an error for doing something entirely
+	ordinary. Restoring the default handler makes it behave like every other
+	Unix tool. This drives the real script through a real pipe, because the
+	failure only happens at shutdown and no in-process test would see it."""
+
+	def piped(self, args, take=2):
+		head = subprocess.Popen(["head", f"-{take}"],
+		                        stdin=subprocess.PIPE,
+		                        stdout=subprocess.DEVNULL)
+		proc = subprocess.Popen([sys.executable, SCRIPT] + args,
+		                        stdout=head.stdin,
+		                        stderr=subprocess.PIPE, text=True)
+		head.stdin.close()
+		_, err = proc.communicate()
+		head.wait()
+		return proc.returncode, err
+
+	def test_help_through_a_closed_pipe_is_silent(self):
+		rc, err = self.piped(["--help"])
+		self.assertEqual(err, "", f"noise on stderr: {err}")
+
+	def test_it_does_not_report_a_python_traceback(self):
+		rc, err = self.piped(["--help"])
+		self.assertNotIn("BrokenPipeError", err)
+		self.assertNotIn("Traceback", err)
+
+	def test_the_exit_status_is_not_pythons_flush_failure(self):
+		"""120 is the interpreter failing to flush at shutdown. Anything
+		else -- 0, or 141 for a SIGPIPE death -- is a shell-normal answer."""
+		rc, _ = self.piped(["--help"])
+		self.assertNotEqual(rc, 120)
+		self.assertIn(rc, (0, 141, -13))
+
+	def test_a_full_read_is_unaffected(self):
+		"""The fix must not change the ordinary case."""
+		r = subprocess.run([sys.executable, SCRIPT, "--help"],
+		                   capture_output=True, text=True)
+		self.assertEqual(r.returncode, 0)
+		self.assertIn("Usage:", r.stdout)
+		self.assertEqual(r.stderr, "")
 
 
 class TestPackaging(unittest.TestCase):
