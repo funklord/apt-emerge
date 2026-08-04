@@ -36,6 +36,7 @@ Usage:
     style_gate.py check [--root DIR] [PATH...]
     style_gate.py fix   [--root DIR] PATH...
     style_gate.py list  [--root DIR]      # what would be checked, and why
+    style_gate.py docs  [--root DIR]      # hold project.md to the tree
 
 Configuration is `.style-gate.toml` at the project root; every key is
 optional. See DEFAULTS below for the meaning and the shipped values.
@@ -106,6 +107,20 @@ DEFAULTS = {
 	# Files that get the text checks (trailing space, final newline, and
 	# ASCII when enabled) but not necessarily the tab rule.
 	"text_suffixes": [".md", ".json", ".toml", ".cfg", ".map"],
+
+	# The design document `docs` mode holds to the tree, and the backticked
+	# paths in it that are known not to be files -- globs, examples, things
+	# named before they exist. Listing one is a claim that it is deliberate.
+	"doc_file": "project.md",
+	"doc_ignore": [],
+	# The path half of the doc gate is opt-in. Duplicate headings are a
+	# defect in any document, but "this backticked token is a file that
+	# should exist" needs a document written to be read that way: prose
+	# naming `main.c` as an example, or `platform_android.cpp` without the
+	# `src/` it lives under, is not wrong. Enabling it without tuning
+	# produces dozens of entries in doc_ignore, which is noise wearing the
+	# costume of rigour.
+	"doc_check_paths": False,
 }
 
 SKIP_DIR_NAMES = frozenset({"__pycache__", ".git"})
@@ -776,11 +791,73 @@ def fix_file(path: Path, cfg: dict, write: bool) -> tuple[bool, str | None]:
 	return True, None
 
 
+# ------------------------------------------------------------ doc gate
+
+# A backticked token worth testing as a path: no globs, no placeholders, no
+# URLs, no shell. Anything with a directory separator, or a bare filename
+# carrying a suffix we recognise.
+_DOC_TOKEN = re.compile(r"`([A-Za-z0-9._/-]+)`")
+_DOC_SUFFIX = (".c", ".h", ".cpp", ".hpp", ".cc", ".hh", ".py", ".rs", ".situ",
+               ".ebnf", ".lua", ".md", ".toml", ".json", ".sh", ".pro", ".txt")
+
+
+def doc_paths(text: str) -> list[tuple[int, str]]:
+	found = []
+	for number, line in enumerate(text.splitlines(), start=1):
+		for token in _DOC_TOKEN.findall(line):
+			if token.startswith(("http", "-", "/")) or token.endswith("/"):
+				continue
+			if "/" in token and not token.startswith("."):
+				found.append((number, token))
+	return found
+
+
+def check_docs(root: Path, cfg: dict) -> list[Problem]:
+	"""Hold the design document to the tree it describes.
+
+	A map with a module missing from it is worse than no map: a reader looking
+	for where something happens concludes there is nowhere, and writes a
+	second copy. The same goes for a heading that appears twice -- whichever
+	one you find, the other is the one with the answer.
+	"""
+	doc = root / cfg["doc_file"]
+	problems: list[Problem] = []
+	if not doc.is_file():
+		return problems
+	rel = Path(cfg["doc_file"])
+	text = doc.read_text(encoding="utf-8", errors="replace")
+
+	seen: dict[str, int] = {}
+	for number, line in enumerate(text.splitlines(), start=1):
+		if line.startswith("#"):
+			if line in seen:
+				problems.append(Problem(rel, number, 1,
+					f"heading repeats line {seen[line]}: {line.strip()}"))
+			else:
+				seen[line] = number
+
+	if not cfg["doc_check_paths"]:
+		return problems
+
+	ignore = set(cfg["doc_ignore"])
+	for number, token in doc_paths(text):
+		if token in ignore or (root / token).exists():
+			continue
+		# Only complain when the directory it names is real. A path under a
+		# directory that does not exist is describing a layout rather than
+		# pointing at a file, and flagging those buries the real findings.
+		parent = (root / token).parent
+		if parent != root and not parent.is_dir():
+			continue
+		problems.append(Problem(rel, number, 1, f"names a missing file: {token}"))
+	return problems
+
+
 # ----------------------------------------------------------------- main
 
 def resolve(argv: list[str]) -> tuple[str, Path, list[Path]]:
 	mode = argv[0] if argv else "check"
-	if mode not in ("check", "fix", "list"):
+	if mode not in ("check", "fix", "list", "docs"):
 		print(__doc__, file=sys.stderr)
 		raise SystemExit(2)
 	rest = argv[1:]
@@ -804,6 +881,17 @@ def main(argv: list[str]) -> int:
 	mode, root, explicit = resolve(argv)
 	cfg = load_config(root)
 	files = explicit or discover(root, cfg)
+
+	if mode == "docs":
+		problems = check_docs(root, cfg)
+		for problem in problems:
+			print(problem, file=sys.stderr)
+		if problems:
+			print(f"\n{len(problems)} documentation inconsistency(ies)", file=sys.stderr)
+			return 1
+		print(f"style-gate: {cfg['doc_file']} says nothing twice and names no "
+		      f"missing file")
+		return 0
 
 	if mode == "list":
 		for f in files:

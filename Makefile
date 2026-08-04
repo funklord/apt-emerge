@@ -36,7 +36,7 @@ INSTALL_DATA    = $(INSTALL) -m 644
 ALIASES = dispatch-conf etc-update
 
 .PHONY: all check check-unit check-integration check-isolation style install \
-        uninstall deb clean version-check help
+        uninstall deb clean version-check help test veryclean distclean
 
 all:
 	@:
@@ -101,6 +101,7 @@ style:
 		exit 1; \
 	}
 	$(PYTHON) tools/style_gate.py check
+	$(PYTHON) tools/style_gate.py docs
 
 # The Portage-dialect version the program reports and the Debian package
 # version are two different things, and both are hand-written. This stops
@@ -192,3 +193,14 @@ clean:
 		esac; \
 		if [ -d "$$d" ]; then echo "rm -r $$d"; rm -r "$$d"; fi; \
 	done
+
+# `test` is the suite alone; `check` above is everything that must pass first.
+test: check-unit check-integration
+
+# The clean ladder, matching the sibling projects.
+veryclean: clean
+	rm -rf $(BUILD_DIR)
+
+distclean: veryclean
+	find . -name '*~' -o -name '*.swp' -o -name '*.orig' | xargs -r rm -f
+	find . -name __pycache__ -o -name .pytest_cache -type d -prune -exec rm -rf {} +
