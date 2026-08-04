@@ -28,7 +28,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            dpkg-dev diffutils gpgv
+            dpkg-dev diffutils gpgv gnupg
 
       - name: Byte-compile the shipped script
         run: python3 -m py_compile emerge
@@ -66,7 +66,7 @@ jobs:
         run: |
           apt-get update -qq
           apt-get install -y --no-install-recommends \
-            python3 dpkg-dev diffutils gpgv ca-certificates
+            python3 dpkg-dev diffutils gpgv gnupg ca-certificates
 
       - name: Byte-compile the shipped script
         run: python3 -m py_compile emerge
@@ -76,8 +76,17 @@ jobs:
       - name: Unit tests
         run: python3 -m unittest test_emerge -v
 
+      # Strict here and only here. Every integration class skips itself when
+      # the tool it drives is missing, which is what lets the suite run off
+      # a Debian box -- and is also how a whole capability goes untested
+      # while the run still reports OK. This job is the one that is meant to
+      # cover everything, so a skip is a failure naming what is absent.
+      # It found a real gap: CI installed gpgv but not gpg, so the entire
+      # signature-verification suite had never run here.
       - name: Integration tests
         run: python3 -m unittest test_integration -v
+        env:
+          EMERGE_TESTS_REQUIRE_ALL: "1"
 
       - name: Tests must not leak state between modules
         run: python3 -m unittest test_emerge test_integration
@@ -97,7 +106,7 @@ jobs:
           apt-get update -qq
           apt-get install -y --no-install-recommends \
             build-essential debhelper lintian python3 \
-            dpkg-dev diffutils gpgv ca-certificates man-db groff-base
+            dpkg-dev diffutils gpgv gnupg ca-certificates man-db groff-base
 
       - name: Build the package
         run: make deb

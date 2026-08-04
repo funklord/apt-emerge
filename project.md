@@ -509,6 +509,18 @@ load — measured between 14s and 115s for the same suite on the same machine,
 so treat a slow run as load rather than a hang. `make check-unit` is the fast
 loop.
 
+**Every integration class skips itself when the tool it drives is missing**,
+which is what lets the suite run off a Debian box — and is also how a whole
+capability goes untested while the run still reports `OK`, because a skip is
+as green as a pass. `EMERGE_TESTS_REQUIRE_ALL=1` turns a missing capability
+into one failure naming it, and the `debian` CI job sets it because that job
+is the one meant to cover everything.
+
+It found a real gap the moment it existed: **CI installed `gpgv` but not
+`gpg`**, so the eleven tests covering the dpkg backend's entire trust anchor
+had never run there once. They were written, they passed locally, and CI
+reported green without executing any of them.
+
 **Every module carries a `tearDownModule` sentinel** that fails the run if it
 left `os`, `shutil` or `subprocess` patched. `load()` gives each test a fresh
 copy of the *script*, but those modules are the same objects the test process

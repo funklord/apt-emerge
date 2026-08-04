@@ -33,6 +33,16 @@ import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Every class here skips itself when the tool it drives is missing, so the
+# suite runs on a machine that is not Debian. That is also how a whole
+# capability goes silently untested: a skipped class reports OK exactly as
+# loudly as a passing one, and CI installed gpgv but not gpg for a while, so
+# the signature suite never ran there at all.
+#
+# Set EMERGE_TESTS_REQUIRE_ALL=1 -- CI does -- and the check below turns a
+# missing capability into one clear failure naming it, instead of silence.
+STRICT = bool(os.environ.get("EMERGE_TESTS_REQUIRE_ALL"))
 SCRIPT = os.path.join(HERE, "emerge")
 # dpkg wants start-stop-daemon and friends, which live in sbin
 SBIN_PATH = os.environ.get("PATH", "") + ":/usr/sbin:/sbin"
@@ -1714,6 +1724,24 @@ class SignatureVerificationEndToEnd(unittest.TestCase):
 		self.m = self.load()
 		with self.assertRaises(SystemExit):
 			self.sync()
+
+
+class TestEveryCapabilityIsPresent(unittest.TestCase):
+	"""Fails only under EMERGE_TESTS_REQUIRE_ALL, and only to say what is
+	missing. A green run of this file means nothing if half of it skipped."""
+
+	def test_nothing_is_silently_skipped(self):
+		if not STRICT:
+			self.skipTest("set EMERGE_TESTS_REQUIRE_ALL=1 to enforce")
+		missing = [name for name, ok in (
+		    ("rootless dpkg --root", HAVE_DPKG_ROOT),
+		    ("rootless apt", HAVE_APT_ROOT),
+		    ("source-build tooling (dpkg-dev)", HAVE_SOURCE_BUILD),
+		    ("gpg and gpgv", HAVE_GPG),
+		) if not ok]
+		self.assertEqual(missing, [],
+		                 f"these capabilities are unavailable, so the tests "
+		                 f"that need them skipped: {missing}")
 
 
 if __name__ == "__main__":
