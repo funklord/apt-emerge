@@ -680,12 +680,21 @@ write surface ever needs testing.
    dir exist — see **Packaging** below. What is still open is only the module
    split, and there is no pressure for it: at ~3,700 lines the file is
    navigable and the layout map above is enough.
-2. ~~A real test suite~~ — **done**, see above. No CI wired up yet; that and a
-   `make test` target are the obvious next step (item 1 covers the Makefile).
+2. ~~A real test suite~~ — **done**, and so is everything this entry listed as
+   next: `make check` (plus `check-unit` / `check-integration`) and four CI
+   jobs, including one that builds the package, installs it and runs the
+   installed binary. See **Packaging** and **CI**.
 3. ~~`ndu_solve` completeness~~ — the greedy false wall is **fixed** (real
-   backtracking, see above). What remains open is narrower: `a | b`
-   alternatives are still first-match rather than branched on, and the step
-   budget bounds the search. Neither has been observed to bite in practice.
+   backtracking), and so is the alternatives half: `ndu_search` escalates to
+   an exhaustive pass that branches on `a | b` before a wall is believed, so
+   a wall the user is shown has survived that pass. What remains open is
+   narrower still:
+   - the *cheap* pass is first-match, deliberately — that is what makes the
+     common case free, and the escalation is what makes it safe;
+   - the step budget bounds the search, so `NduIncomplete` means "not
+     proven", never "no solution exists". `--backtrack=N` raises it.
+
+   Neither has been observed to bite in practice.
 4. ~~GPG verification~~ — **done**, see the verification section.
 5. ~~`_SESSION_LEADER_COMMS` truncation audit~~ — done for KDE Plasma/sddm.
    Still unverified on GNOME/gdm and the greeter entries.
@@ -797,6 +806,12 @@ apart and drift silently because nothing enforces the shared contract.
 - `is_protected` (Essential + `Priority: required`) does **not** cover
   `libc6` — Debian ships it `Priority: optional` now. What stops
   `emerge -C libc6` is apt refusing to break `dpkg`'s Pre-Depends, not us.
+- **`apt-get dist-upgrade` does take package arguments**, despite its synopsis
+  in apt-get(8) showing them only for `install`. Verified:
+  `apt-get -s dist-upgrade sl` emits `Inst sl`. This matters because the
+  `emerge -uD @world foo` branch appends the atoms to `dist-upgrade`, and the
+  synopsis is exactly the sort of thing that gets someone to "fix" that back —
+  reintroducing the bug where `foo` was silently dropped.
 - Anything parsing apt's `Inst`/`Remv` lines must stop the package name at
   `:` — `(\S+)` swallows the `:arch` qualifier apt emits on multiarch, and a
   name captured as `tree:amd64` then matches nothing you asked for.

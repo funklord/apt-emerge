@@ -513,6 +513,9 @@ class AptBackendEndToEnd(unittest.TestCase):
 		be = self.m.AptBackend()
 		merges = be.resolve(atoms, **kw)
 		be.merge(merges, atoms, {"fetchonly": False, "oneshot": oneshot})
+		# kept so a test can assert what apt was actually told, which is what
+		# decides the manual-install marks
+		self.last_backend = be
 		return merges
 
 	# -- the scenario ------------------------------------------------------
@@ -579,6 +582,54 @@ class AptBackendEndToEnd(unittest.TestCase):
 		self.merge(["emtest-app"], oneshot=True)
 		with self.subTest("--oneshot never removes an existing world entry"):
 			self.assertIn("emtest-app", self.manual())
+
+	def test_no_dep_upgrade_does_not_drag_dependencies_into_world(self):
+		"""The @world leak, against a real apt and a real apt-mark.
+
+		--no-dep-upgrade resolves the closure itself and hands apt every
+		package as an explicit `pkg=version` pin. apt marks everything named
+		on its command line as manually installed -- apt-mark(8): "the
+		package you installed explicitly is marked as manually installed" --
+		and on this backend @selected *is* `apt-mark showmanual`. So one
+		`emerge --no-dep-upgrade libsdl3-dev` moved 32 dependencies into
+		@world, where --depclean could never reclaim them again.
+
+		The unit tests cover this with a faked apt-mark. This is the same
+		claim made against the real one, which is where it actually has to
+		hold: the whole bug was a fact about apt's behaviour, not ours."""
+		self.make_deb("emtest-lib", "1.0")
+		self.make_deb("emtest-app", "1.0", depends="emtest-lib (>= 1.0)")
+		self.publish()
+		self.m = self.load()
+
+		merges = self.merge(["emtest-app"], no_dep_upgrade=True)
+
+		with self.subTest("the closure really was resolved and installed"):
+			self.assertEqual({m[0] for m in merges},
+			                 {"emtest-app", "emtest-lib"})
+			self.assertEqual(self.installed().get("emtest-app"), "1.0")
+			self.assertEqual(self.installed().get("emtest-lib"), "1.0")
+
+		with self.subTest("apt was told about the dependency explicitly"):
+			# The precondition for the bug, asserted rather than assumed: if
+			# the dependency were never named on apt's command line, apt
+			# would not have marked it manual, and the assertion below would
+			# hold no matter what _apply_marks did.
+			self.assertIn("emtest-lib",
+			              [p.split("=")[0]
+			               for p in self.last_backend._named_packages()])
+
+		manual = self.manual()
+		with self.subTest("the target the user asked for is in @world"):
+			self.assertIn("emtest-app", manual)
+		with self.subTest("the dependency is not"):
+			self.assertNotIn("emtest-lib", manual)
+
+		with self.subTest("so the dependency is reclaimable by depclean"):
+			self.sh("apt-get", *self.apt_opts, "-y", "remove", "emtest-app")
+			self.assertIn("emtest-lib",
+			              [c[0] for c in
+			               self.m.AptBackend().depclean_candidates()])
 
 
 if __name__ == "__main__":
