@@ -70,6 +70,66 @@ jobs:
       - name: Integration tests
         run: python3 -m unittest test_integration -v
 
+  # The package has to build, install, and produce a working emerge. Building
+  # it proves very little on its own -- a .deb full of the wrong paths builds
+  # perfectly -- so this installs the result and runs it.
+  package:
+    name: debian package
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the build tooling
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            build-essential debhelper lintian python3 \
+            dpkg-dev diffutils gpgv ca-certificates man-db groff-base
+
+      - name: Build the package
+        run: make deb
+
+      - name: Install it, resolving dependencies as a user would
+        run: |
+          apt-get install -y ./dist/apt-emerge_*_all.deb
+
+      # The point of the job. A package that installs but ships a broken
+      # entry point is not a working install.
+      - name: The installed emerge runs
+        run: |
+          set -e
+          command -v emerge
+          emerge --version
+          emerge --help > /dev/null
+          emerge -pv bash
+
+      - name: argv[0] dispatch works through the packaged symlinks
+        run: |
+          set -e
+          test -L /usr/bin/dispatch-conf
+          test -L /usr/bin/etc-update
+          # not root-gated under --help, and must not be the merge path
+          dispatch-conf --help | grep -q 'dispatch-conf'
+
+      - name: The man pages are installed and render
+        run: |
+          set -e
+          man -w emerge
+          man emerge | head -5
+          man -w dispatch-conf
+          man -w etc-update
+
+      - name: Lintian
+        run: lintian --no-tag-display-limit dist/*.changes || true
+
+      - name: Removing it leaves nothing behind
+        run: |
+          set -e
+          apt-get remove -y apt-emerge
+          test ! -e /usr/bin/emerge
+          test ! -e /usr/bin/dispatch-conf
+
   # Hard rule 1: the shipped artifact is a single stdlib-only file. That is
   # the whole deploy story for apt-less boxes, and it is easy to break by
   # reaching for a convenient dependency.

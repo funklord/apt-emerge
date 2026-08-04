@@ -1,0 +1,49 @@
+Source: apt-emerge
+Section: admin
+Priority: optional
+Maintainer: Nabeel Sowan <nabeel@vibes.se>
+Build-Depends: debhelper-compat (= 13),
+               python3
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: apt-emerge
+Architecture: all
+Depends: python3 (>= 3.9),
+         ${misc:Depends}
+Recommends: apt
+Suggests: gpgv,
+          dpkg-dev
+Description: Portage-flavoured package manager front-end for Debian
+ emerge speaks Gentoo Portage's command line and prints Portage-style output,
+ but everything underneath is real Debian tooling -- apt, dpkg and their
+ indexes. Nothing is emulated and it invents no state of its own: @selected
+ really is apt's set of manually-installed packages.
+ .
+ Beyond translating the familiar verbs (-av, -uD @world, -C, --depclean, -s,
+ --sync, -b) it adds three things Debian does not have:
+ .
+  * --no-dep-upgrade installs a package without upgrading anything already
+    on the system. It is not a pin: it searches, taking the newest version of
+    each not-yet-installed dependency whose whole subtree leaves installed
+    packages alone. When nothing fits it names the package that formed the
+    wall, and --with permits that one to move. Useful for installing a leaf
+    without dragging up libc, the kernel, or your graphics stack.
+  * --dispatch-conf reviews the config files dpkg parks as .dpkg-dist. It
+    archives each package's as-shipped config at install time and uses it as
+    the common ancestor for a real 3-way merge of your edits against the new
+    version, so only genuine conflicts are put to you. Also reachable as
+    dispatch-conf and etc-update.
+  * It warns when an upgrade touches the running graphical session, derived
+    from the live session rather than a hardcoded list, and distinguishes a
+    same-upstream rebuild (your session keeps running) from a real version
+    change (it may not).
+ .
+ Two backends are selected automatically: apt where apt-get is present, and a
+ self-contained dpkg-only backend -- with its own sources parsing, index sync,
+ gpgv verification, resolver and world file -- for embedded systems that carry
+ only dpkg.
+ .
+ It installs as a single stdlib-only Python file with no dependencies beyond
+ python3 itself, so a box it is installed on can be repaired with a text
+ editor.

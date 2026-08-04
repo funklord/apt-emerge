@@ -19,14 +19,29 @@ Total: 1 packages (0 upgrades, 1 new), Size of downloads: 0.0 MiB
 
 ## Install
 
-One file, no dependencies:
+Build a package and install it the normal way:
+
+```sh
+make deb
+sudo apt install ./dist/apt-emerge_*_all.deb
+```
+
+That gives you `emerge`, the `dispatch-conf` and `etc-update` aliases, and
+`emerge(1)`. Building needs `debhelper` and `dpkg-dev`; the package itself
+depends on nothing but `python3` (3.9 or newer).
+
+Or skip packaging entirely, because there is nothing to build:
 
 ```sh
 sudo install -m 755 emerge /usr/local/sbin/emerge
 ```
 
-Python 3.9 or newer. That is the whole install — the single-file constraint
-exists so an embedded box can be fixed with one `scp` and a text editor.
+The single-file constraint exists so an embedded box can be fixed with one
+`scp` and a text editor — the packaging is a convenience on top of that, never
+a requirement.
+
+Other targets: `make check` runs everything, `make check-unit` runs the fast
+half, `make install` takes the usual `DESTDIR` and `prefix`.
 
 ## What it does
 
@@ -100,7 +115,7 @@ Force either with `--backend=apt|dpkg` or `EMERGE_BACKEND=`.
 ## Tests
 
 ```sh
-python3 -m unittest test_emerge test_integration
+make check          # or: python3 -m unittest test_emerge test_integration
 ```
 
 `test_emerge.py` is unit-level. `test_integration.py` drives both backends

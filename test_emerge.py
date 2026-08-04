@@ -25,6 +25,7 @@ import importlib.machinery
 import importlib.util
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1612,6 +1613,102 @@ class TestPrompts(unittest.TestCase):
                 self.assertFalse(self.ask_continue())
                 self.refuse(exc)
                 self.assertFalse(self.ask_yesno())
+
+
+class TestPackaging(unittest.TestCase):
+    """The packaging carries three copies of things the script also knows:
+    the version, the option list, and the names it answers to. Nothing at
+    build time compares them, so an option added to --help and forgotten in
+    the man page ships as a documented feature nobody can look up."""
+
+    def read(self, name):
+        path = os.path.join(HERE, name)
+        if not os.path.exists(path):
+            self.skipTest(f"{name} is not present in this tree")
+        with open(path) as f:
+            return f.read()
+
+    def test_the_package_version_matches_the_script(self):
+        """debian/changelog and VERSION are both hand-written. `make deb`
+        enforces this too, but failing here is faster and works without
+        dpkg-dev installed."""
+        head = self.read("debian/changelog").splitlines()[0]
+        m = re.match(r"^apt-emerge \(([^)]+)\)", head)
+        self.assertIsNotNone(m, f"unparsable changelog header: {head}")
+        self.assertEqual(m.group(1), em.VERSION.replace("-deb", ""),
+                         "debian/changelog and emerge's VERSION disagree")
+
+    def man_entries(self):
+        """Long options the man page gives an entry of their own.
+
+        Deliberately not a substring search over the whole page: options are
+        cross-referenced from each other's prose all the time, so "is the
+        string present" passes for an option that has no entry at all. Only
+        a .TP tagged paragraph counts as documenting it."""
+        man = self.read("emerge.1")
+        tagged = re.findall(r"^\.TP\n(.*)$", man, re.M)
+        return {opt for line in tagged
+                for opt in re.findall(r"--[a-z][a-z-]*", line)}
+
+    def test_every_option_in_help_has_its_own_man_page_entry(self):
+        documented = set(re.findall(r"^ {3}(--[a-z][a-z-]*)", em.HELP, re.M))
+        self.assertGreater(len(documented), 15, "option scrape found too few")
+        missing = sorted(documented - self.man_entries())
+        self.assertEqual(missing, [],
+                         f"documented in --help but with no entry in "
+                         f"emerge.1: {missing}")
+
+    def test_the_man_page_documents_no_option_the_script_rejects(self):
+        """Drift in the other direction: an entry for a flag that was
+        renamed or removed sends people to `unknown option: ...`."""
+        src = self.read("emerge")
+        for opt in sorted(self.man_entries()):
+            with self.subTest(option=opt):
+                self.assertIn(opt, src,
+                              f"emerge.1 documents {opt}, which the script "
+                              f"does not mention at all")
+
+    def test_every_name_the_script_answers_to_is_shipped(self):
+        """argv[0] selects the action, so a name the script recognises but
+        the package does not install is a feature that exists only for
+        people who symlink it by hand."""
+        src = self.read("emerge")
+        m = re.search(r"_self in \(([^)]*)\)", src)
+        self.assertIsNotNone(m)
+        answers_to = set(re.findall(r'"([^"]+)"', m.group(1)))
+        makefile = self.read("Makefile")
+        shipped = set(re.search(r"^ALIASES = (.*)$", makefile, re.M)
+                      .group(1).split())
+        self.assertEqual(answers_to, shipped,
+                         "the script and the Makefile disagree about the "
+                         "names it should be installed under")
+
+    def test_the_installed_paths_are_system_ones(self):
+        """A .deb may not install into /usr/local; that belongs to the
+        local admin, and dpkg must not own anything there."""
+        makefile = self.read("Makefile")
+        self.assertNotIn("/usr/local", makefile)
+
+    def test_the_script_is_installed_executable(self):
+        makefile = self.read("Makefile")
+        self.assertRegex(makefile,
+                         r"INSTALL_PROGRAM\s*=\s*\$\(INSTALL\) -m 755")
+        self.assertIn("$(INSTALL_PROGRAM) emerge", makefile)
+
+    def test_debian_rules_is_executable(self):
+        path = os.path.join(HERE, "debian", "rules")
+        if not os.path.exists(path):
+            self.skipTest("debian/rules is not present in this tree")
+        self.assertTrue(os.access(path, os.X_OK),
+                        "dpkg-buildpackage cannot run a non-executable rules")
+
+    def test_the_man_page_names_the_licence_the_script_reports(self):
+        self.assertIn(em.LICENCE, self.read("emerge.1"))
+
+    def test_the_author_is_the_same_everywhere(self):
+        for name in ("emerge.1", "debian/control", "debian/copyright"):
+            with self.subTest(file=name):
+                self.assertIn(em.AUTHOR, self.read(name))
 
 
 class TestPortability(unittest.TestCase):

@@ -1,2 +1,11 @@
 __pycache__/
 *.pyc
+
+# packaging build products
+/dist/
+/debian/apt-emerge/
+/debian/.debhelper/
+/debian/files
+/debian/debhelper-build-stamp
+/debian/*.substvars
+/debian/*.debhelper.log

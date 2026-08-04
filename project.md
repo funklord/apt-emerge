@@ -522,6 +522,48 @@ both reimplement something with an existing reference — keep them that way:
 
 Both skip themselves if the tool is missing, so the suite runs off a Debian box.
 
+## Packaging
+
+`make deb` builds `dist/apt-emerge_<version>_all.deb`. Source format is
+**`3.0 (native)`**: this repo *is* upstream, there is no separate tarball, and
+a quilt package would mean inventing an upstream/packaging split that does not
+exist.
+
+Layout decisions worth not re-litigating:
+
+- **The `Makefile` owns the file list**, and `debian/rules` reaches it through
+  `dh_auto_install`. A `debian/install` file would be a second list that
+  drifts from the first. `debian/rules` is otherwise plain `dh` with
+  `dh_auto_build` stubbed out — there is nothing to compile.
+- **Ships `/usr/bin/emerge`** plus `dispatch-conf` and `etc-update` symlinks,
+  because `argv[0]` selects the action (see the `__main__` block). A name the
+  script answers to but the package does not install is a feature that only
+  exists for people who symlink by hand. `TestPackaging` asserts the two lists
+  agree.
+- **Not `/usr/local`.** That belongs to the local admin and dpkg must not own
+  anything there. The manual install in the README still uses it, correctly —
+  that is the un-packaged path.
+- **`Rules-Requires-Root: no`**, so the build needs no fakeroot.
+- **Version.** `debian/changelog` carries `3.0.66`; the script reports
+  `3.0.66-deb`, the `-deb` marking it as the Debian reimplementation rather
+  than real Portage. These are two hand-written strings, so both `make
+  version-check` (wired into `dh_auto_test`) and a unit test assert they stay
+  in step. Bump both together.
+- **`emerge.1`** is hand-written, and `TestPackaging` checks it against
+  `--help` in *both* directions: every option documented in `--help` must have
+  its own `.TP` entry, and every option the man page gives an entry must exist
+  in the script. The first check deliberately does not do a substring search
+  over the whole page — options cross-reference each other constantly, so
+  "the string is present" passes for an option with no entry at all.
+
+The **`package` CI job** does the part that matters: building a `.deb` proves
+very little, since one full of wrong paths builds perfectly. So it installs
+the result with `apt-get`, runs `emerge --version`, `--help` and `-pv bash`,
+checks `argv[0]` dispatch through the installed symlinks, renders the man
+pages, and removes the package again. `lintian` runs informationally
+(`|| true`) — it has never been run against this package by the author, so
+treat its first output as a to-do list rather than a regression.
+
 ## CI
 
 `.github/workflows/tests.yml`, on every push and pull request (the remote
@@ -615,13 +657,15 @@ write surface ever needs testing.
 ## Open decisions / backlog
 
 1. **Project split.** Whether to break the single file into a `src/` module tree
-   + `Makefile` (build → amalgamated single file via a concat tool à la sqlite;
-   `make test`; `make deb` — which can be `emerge -B emerge`, it can package
-   itself) + `debian/` dir. Decision was pending. Recommended: modules for dev,
-   amalgamate to one file for ship. Do NOT use cpack (drags in CMake); use
-   `debian/` + `dpkg-buildpackage`, or `dpkg-deb --build` from a staging dir.
-   Skip `zipapp` — a `.pyz` isn't `vi`-able on an embedded box, which defeats
-   the single-file purpose.
+   + `Makefile` (build → amalgamated single file via a concat tool à la sqlite)
+   + `debian/` dir. Skip `zipapp` — a `.pyz` isn't `vi`-able on an embedded box,
+   which defeats the single-file purpose.
+
+   **Half of this is now done.** The owner chose to keep one file, so there is
+   no `src/` tree and no amalgamation step, but the `Makefile` and `debian/`
+   dir exist — see **Packaging** below. What is still open is only the module
+   split, and there is no pressure for it: at ~3,700 lines the file is
+   navigable and the layout map above is enough.
 2. ~~A real test suite~~ — **done**, see above. No CI wired up yet; that and a
    `make test` target are the obvious next step (item 1 covers the Makefile).
 3. ~~`ndu_solve` completeness~~ — the greedy false wall is **fixed** (real

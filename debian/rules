@@ -1,0 +1,22 @@
+#!/usr/bin/make -f
+#
+# Nothing to configure and nothing to compile: the shipped artifact is one
+# Python file. dh's default sequence is left alone except where that is
+# actually true, and the install step is delegated to the Makefile so the
+# file list lives in exactly one place.
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	@:
+
+# Unit tests only. They touch neither dpkg nor apt nor the filesystem, so
+# they are safe and fast in a build chroot; the integration suite drives real
+# dpkg and apt against throwaway roots and belongs in CI, not in a package
+# build that may be running under a restricted environment.
+override_dh_auto_test:
+	$(MAKE) version-check check-unit
+
+override_dh_auto_install:
+	$(MAKE) install DESTDIR=$(CURDIR)/debian/apt-emerge prefix=/usr

@@ -3432,7 +3432,8 @@ Debian notes:
    --newuse (-N), --quiet (-q) and --tree (-t) are accepted for
    muscle-memory compatibility and ignored.
 
-For more help consult the man page... which doesn't exist. This is it.
+For more help consult the man page, emerge(1), if you installed the package;
+otherwise this is it.
 """
 
 LONG_FLAGS = {"--ask": "a", "--verbose": "v", "--pretend": "p", "--update": "u",
