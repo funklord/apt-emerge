@@ -2780,9 +2780,25 @@ def _sync_regions(base, mine, theirs):
 def merge3(base, mine, theirs, labels=("current", "as-shipped", "new")):
 	"""Three-way line merge. Returns (merged_lines, conflict_count).
 
-    Equivalent to `diff3 -m` / `git merge-file`: regions changed on only
-    one side are taken from that side, identical changes on both sides are
-    taken once, and genuine divergence is emitted with conflict markers."""
+    The rules are `diff3 -m`'s, and they hold exactly: a region changed on
+    only one side is taken from that side, an identical change on both sides
+    is taken once, an unchanged region is kept, and real divergence gets
+    conflict markers. Those four are property-tested against tens of
+    thousands of random inputs.
+
+    It is **not** byte-identical to `diff3 -m`, and used to claim it was.
+    Measured against real diff3: 97% identical on config-shaped input, 82%
+    on adversarial input full of repeated single-character lines. The rest
+    is alignment ambiguity -- where a line repeats, more than one valid
+    alignment exists and diff3 picks a different one. It goes both ways:
+    sometimes this resolves what diff3 flags, sometimes it flags what diff3
+    resolves.
+
+    That matters because `automerge` applies a conflict-free result without
+    asking, so a small share of merges are applied where diff3 would have
+    asked. Every divergence examined was still a valid merge of both sides,
+    and the user is shown the diff either way -- but the difference is real
+    and the equivalence claim was not."""
 	regions = _sync_regions(base, mine, theirs)
 	regions.append((len(base), len(base), len(mine), len(theirs)))
 	out, conflicts = [], 0

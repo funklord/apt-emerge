@@ -25,6 +25,7 @@ import importlib.machinery
 import importlib.util
 import io
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -178,6 +179,37 @@ class TestVercmp(unittest.TestCase):
 		for a, b, _ in VERSION_PAIRS:
 			self.assertEqual(em.vercmp(a, a), 0)
 			self.assertEqual(em.vercmp(b, b), 0)
+
+	@unittest.skipUnless(HAVE_DPKG, "dpkg not available")
+	def test_random_versions_agree_with_dpkg(self):
+		"""The table above is hand-written, so it encodes what its author
+		believed policy 5.6.12 says. This generates versions instead and
+		asks dpkg, which encodes what policy actually is -- the same reason
+		the table is differential in the first place, applied to inputs
+		nobody chose.
+
+		Seeded, so a disagreement is reproducible. The alphabet is small and
+		full of the awkward characters (`~`, `+`, leading zeros, epochs) so
+		that collisions and edge cases turn up rather than being drowned in
+		random noise."""
+		rnd = random.Random(20260804)
+
+		def version():
+			body = "".join(rnd.choice("012ab.~+")
+			               for _ in range(rnd.randint(1, 6)))
+			if body[0] not in "012":
+				body = rnd.choice("012") + body
+			if rnd.random() < 0.35:
+				body += "-" + "".join(rnd.choice("012ab.~+")
+				                      for _ in range(rnd.randint(1, 3)))
+			if rnd.random() < 0.25:
+				body = f"{rnd.randint(0, 2)}:" + body
+			return body
+
+		for _ in range(120):
+			a, b = version(), version()
+			with self.subTest(a=a, b=b):
+				self.assertEqual(sign(em.vercmp(a, b)), dpkg_cmp(a, b))
 
 	def test_a_malformed_epoch_compares_instead_of_raising(self):
 		"""int() on a non-numeric epoch raised ValueError, and vercmp sits on
@@ -468,6 +500,63 @@ class TestMerge3(unittest.TestCase):
 	def test_empty_inputs(self):
 		out, n = em.merge3([], [], [])
 		self.assertEqual((out, n), ([], 0))
+
+	def _fuzz_lines(self, rnd, alphabet="abcde", lo=0, hi=8):
+		return [rnd.choice(alphabet) + "\n"
+		        for _ in range(rnd.randint(lo, hi))]
+
+	def _fuzz_mutate(self, rnd, lines):
+		out = list(lines)
+		for _ in range(rnd.randint(1, 4)):
+			if not out or rnd.random() < 0.3:
+				out.insert(rnd.randint(0, len(out)),
+				           rnd.choice("XYZW") + "\n")
+			elif rnd.random() < 0.5 and len(out) > 1:
+				out.pop(rnd.randrange(len(out)))
+			else:
+				out[rnd.randrange(len(out))] = rnd.choice("XYZW") + "\n"
+		return out
+
+	def test_the_stated_rules_hold_under_fuzzing(self):
+		"""The four rules merge3 documents, on random inputs.
+
+		This is the contract, and it is worth property-testing rather than
+		exampling: byte-equality with diff3 is *not* the contract and was
+		measured not to hold, but these four are absolute. A violation would
+		mean a config merge silently dropping one side's change.
+
+		Seeded, so a failure is reproducible rather than a rumour."""
+		rnd = random.Random(4242)
+		for i in range(600):
+			base = self._fuzz_lines(rnd)
+			other = self._fuzz_mutate(rnd, base)
+			with self.subTest(i=i, base=base, other=other):
+				out, n = em.merge3(base, list(base), other)
+				self.assertEqual((out, n), (other, 0), "only they changed it")
+
+				out, n = em.merge3(base, other, list(base))
+				self.assertEqual((out, n), (other, 0), "only you changed it")
+
+				out, n = em.merge3(base, other, list(other))
+				self.assertEqual((out, n), (other, 0), "same change both sides")
+
+				out, n = em.merge3(base, list(base), list(base))
+				self.assertEqual((out, n), (base, 0), "nobody changed anything")
+
+	def test_a_conflict_carries_all_three_sides(self):
+		"""Whatever alignment is chosen, a conflict block has to show what
+		you have, what was shipped, and what is new -- losing the ancestor
+		is what makes a conflict unresolvable by hand."""
+		out, n = em.merge3(L("a"), L("m"), L("t"),
+		                   labels=("MINE", "BASE", "THEIRS"))
+		self.assertEqual(n, 1)
+		text = "".join(out)
+		for marker in ("<<<<<<< MINE", "||||||| BASE", "=======",
+		               ">>>>>>> THEIRS"):
+			self.assertIn(marker, text)
+		self.assertIn("m\n", text)
+		self.assertIn("a\n", text)
+		self.assertIn("t\n", text)
 
 	@unittest.skipUnless(HAVE_DIFF3, "diff3 not available")
 	def test_clean_merges_match_diff3(self):

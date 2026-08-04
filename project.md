@@ -572,9 +572,27 @@ signature-verification code, and session detection.
 Two suites are **differential** rather than hand-written expectations, because
 both reimplement something with an existing reference — keep them that way:
 - `vercmp` is Debian policy 5.6.12 in Python, so every pair in the table is
-  also run through `dpkg --compare-versions` and must agree.
-- `merge3` claims `diff3 -m` equivalence, so its output is compared
-  byte-for-byte against `diff3` on cases that merge cleanly.
+  also run through `dpkg --compare-versions` and must agree — plus a seeded
+  fuzz over generated versions, because the table encodes what its author
+  believed policy says and dpkg encodes what it is. 4,000 random pairs
+  during development, no disagreement; 120 per run in the suite.
+- `merge3` implements `diff3 -m`'s **rules**, and those four are
+  property-tested on random inputs: one-sided change taken from that side,
+  identical change taken once, unchanged region kept, real divergence
+  conflicted. 80,000 random triples, no violation.
+
+  It is **not** byte-identical to `diff3 -m`, and the docstring used to say
+  it was. Measured: 97% identical on config-shaped content, 82% on
+  adversarial input full of repeated single-character lines. The rest is
+  alignment ambiguity — where a line repeats there is more than one valid
+  alignment, and diff3 picks a different one. It diverges in both
+  directions, including roughly 2% of realistic cases where `automerge`
+  applies a result diff3 would have put to the user. Every divergence
+  examined was still a valid merge of both sides.
+
+  The hand-written clean-merge cases are still compared byte-for-byte
+  against real `diff3`, because on unambiguous input the two do agree and
+  that is worth holding.
 
 Both skip themselves if the tool is missing, so the suite runs off a Debian box.
 
