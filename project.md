@@ -473,11 +473,23 @@ Chat-side testing used synthetic `Packages` trees under `TREE_DIR` and mocked
   exercised against real archives and a synthetic USB `file://` repo using a
   throwaway `TREE_DIR`, but install / depclean world-closure have never run on
   hardware without `apt-get`.
-- **Config merging** against real package upgrades that ship conffile changes —
-  still outstanding. Needs a real install, not a pretend run.
-- **Anything requiring a real install.** Everything validated so far has been
-  read-only (`-p`) or written to a throwaway root; `merge`, `unmerge` and
-  `dispatch_conf` have not been run against live system state on this box.
+- ~~**Config merging** against real package upgrades that ship conffile
+  changes.~~ Done — and it did not need a real box after all, which is worth
+  remembering before deferring something else as hardware-only. Two `.debs`
+  built with a `DEBIAN/conffiles` entry, installed into a throwaway root with
+  the exact flags `merge()` uses, is a real conffile upgrade in every respect
+  dpkg cares about. `ConfigMergingEndToEnd` proves the assumption the whole
+  feature rests on (`--force-confold` parks an edited conffile as
+  `.dpkg-dist`, and silently replaces an untouched one) and then runs the
+  round trip on top of it: archive, edit, upgrade, 3-way merge against the
+  archived ancestor.
+- **Anything requiring a real install** on *this* box. Everything validated so
+  far has been read-only (`-p`) or written to a throwaway root. That is a
+  deliberate limit, not a gap to close: the throwaway root exercises `merge`,
+  `unmerge`, `dispatch_conf`'s inputs, signature verification and the
+  conffile round trip against the real tools, and the remaining difference —
+  running as root against live system state — is the one thing worth *not*
+  testing on a machine somebody uses.
 
 Handy synthetic-test pattern used so far: write a `Packages` stanza file into
 `/var/lib/emerge-dpkg/tree/`, `dpkg -i` a hand-built `.deb` to simulate an

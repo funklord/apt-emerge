@@ -633,6 +633,236 @@ class AptBackendEndToEnd(unittest.TestCase):
 			               self.m.AptBackend().depclean_candidates()])
 
 
+@unittest.skipUnless(HAVE_DPKG_ROOT, "rootless `dpkg --root` unavailable")
+class ConfigMergingEndToEnd(unittest.TestCase):
+	"""The config-merging feature against real dpkg, from both ends.
+
+	Everything in this feature rests on one assumption about dpkg that
+	test_emerge.py cannot check, because it hand-places the parked files it
+	then reasons about: that `dpkg --force-confold --force-confdef` parks the
+	incoming version as `<file>.dpkg-dist` when you have edited a conffile,
+	and silently replaces it when you have not.
+
+	If that were wrong -- or conditional on something we do not set -- the
+	whole of dispatch-conf would be dead code that never fires, and every
+	unit test would still pass. So it is proven here first, and then the
+	round trip is run on top of it: archive at install time, edit, upgrade,
+	3-way merge against the archived ancestor.
+
+	The archive timing is the part that has been wrong before. Archiving the
+	*incoming* version instead of the settled one makes new == ancestor, so
+	the merge sees no incoming change and every update is silently
+	discarded."""
+
+	CONFFILE = "/etc/emtest.conf"
+
+	def setUp(self):
+		self.dir = tempfile.mkdtemp(prefix="emerge-cfg-itest-")
+		self.addCleanup(shutil.rmtree, self.dir, True)
+		self.sysroot = os.path.join(self.dir, "sysroot")
+		self.repo = os.path.join(self.dir, "repo")
+		for sub in ("info", "updates", "triggers"):
+			os.makedirs(os.path.join(self.sysroot, "var/lib/dpkg", sub))
+		for f in ("status", "available"):
+			open(os.path.join(self.sysroot, "var/lib/dpkg", f), "a").close()
+		os.makedirs(os.path.join(self.sysroot, "etc"))
+		os.makedirs(self.repo)
+		original_path = os.environ.get("PATH", "")
+		os.environ["PATH"] = SBIN_PATH
+		self.addCleanup(os.environ.__setitem__, "PATH", original_path)
+		self.env = {**os.environ, "PATH": SBIN_PATH}
+		self.m = self.load()
+		self.etc = os.path.join(self.sysroot, "etc")
+		self.conf = dict(self.m.DEFAULT_CONF)
+		self.conf["config-protect"] = self.etc
+		self.conf["archive-dir"] = os.path.join(self.dir, "archive")
+
+	# -- fixture -----------------------------------------------------------
+
+	def load(self):
+		loader = importlib.machinery.SourceFileLoader("emerge_cfg_itest",
+		                                              SCRIPT)
+		spec = importlib.util.spec_from_loader(loader.name, loader)
+		m = importlib.util.module_from_spec(spec)
+		loader.exec_module(m)
+		m.STATUS = os.path.join(self.sysroot, "var/lib/dpkg/status")
+		m.need_root = lambda: None
+		m.print = lambda *a, **k: None
+		admin = os.path.join(self.sysroot, "var/lib/dpkg")
+		real_capture = m.capture
+
+		def inject(cmd):
+			if cmd and cmd[0] == "dpkg-query":
+				return [cmd[0], f"--admindir={admin}"] + list(cmd[1:])
+			return cmd
+		m.capture = lambda cmd: real_capture(inject(cmd))
+		return m
+
+	def build(self, version, body):
+		d = os.path.join(self.dir, "build", version)
+		shutil.rmtree(d, ignore_errors=True)
+		os.makedirs(os.path.join(d, "DEBIAN"))
+		os.makedirs(os.path.join(d, "etc"))
+		with open(os.path.join(d, "DEBIAN", "control"), "w") as f:
+			f.write(f"Package: emtest-cfg\nVersion: {version}\n"
+			        f"Architecture: all\nMaintainer: t <t@t>\n"
+			        f"Description: config test\n")
+		with open(os.path.join(d, "DEBIAN", "conffiles"), "w") as f:
+			f.write(self.CONFFILE + "\n")
+		with open(os.path.join(d, "etc", "emtest.conf"), "w") as f:
+			f.write(body)
+		deb = os.path.join(self.repo, f"emtest-cfg_{version}.deb")
+		r = subprocess.run(["dpkg-deb", "--build", "-Znone", d, deb],
+		                   capture_output=True, text=True, env=self.env)
+		self.assertEqual(r.returncode, 0, r.stderr)
+		return deb
+
+	def dpkg_install(self, deb):
+		"""Exactly the flags DpkgBackend.merge uses."""
+		r = subprocess.run(
+		    ["dpkg", f"--root={self.sysroot}", "--force-not-root",
+		     f"--log={self.dir}/dpkg.log", "--force-confold",
+		     "--force-confdef", "-i", deb],
+		    capture_output=True, text=True, env=self.env)
+		self.assertEqual(r.returncode, 0, r.stderr)
+
+	def target(self):
+		return os.path.join(self.etc, "emtest.conf")
+
+	def archiver_sees_the_scratch_tree(self):
+		"""Point conffiles_of at where the file really is.
+
+		dpkg records conffile paths relative to `/`, and reports
+		`/etc/emtest.conf` no matter what `--root` it was given. Everything
+		downstream of it -- archive_settled, scan_pending, ancestor_for --
+		then works in absolute paths, which on a real system is correct and
+		here is the host's own /etc. Substituting the scratch path is the
+		only untruthful line in this class, and it is the offset `--root`
+		introduced rather than anything the code does.
+
+		The filtering archive_settled performs is still the real thing,
+		operating on files real dpkg really produced."""
+		path = self.target()
+		self.m.conffiles_of = lambda pkgs, **kw: {p: [path] for p in pkgs}
+
+	def read(self, path):
+		with open(path) as f:
+			return f.read()
+
+	def write(self, path, text):
+		with open(path, "w") as f:
+			f.write(text)
+
+	# -- the assumption the whole feature rests on -------------------------
+
+	def test_dpkg_parks_an_edited_conffile_under_our_flags(self):
+		self.dpkg_install(self.build("1.0", "setting = original\nshared = keep\n"))
+		self.write(self.target(), "setting = MY EDIT\nshared = keep\n")
+		self.dpkg_install(self.build(
+		    "2.0", "setting = original\nshared = keep\nnewkey = added\n"))
+
+		parked = self.target() + ".dpkg-dist"
+		self.assertTrue(os.path.exists(parked),
+		                "dpkg did not park the update; dispatch-conf would "
+		                "never have anything to do")
+		self.assertEqual(self.read(self.target()),
+		                 "setting = MY EDIT\nshared = keep\n",
+		                 "the edit must survive the upgrade")
+		self.assertIn("newkey = added", self.read(parked))
+
+	def test_an_untouched_conffile_is_replaced_with_no_parked_copy(self):
+		"""The other half, and what archive_settled's timing depends on: if
+		nothing is parked, what is on disk *is* the as-shipped version and is
+		safe to record as the next ancestor."""
+		self.dpkg_install(self.build("1.0", "setting = original\n"))
+		self.dpkg_install(self.build("2.0", "setting = updated\n"))
+		self.assertFalse(os.path.exists(self.target() + ".dpkg-dist"))
+		self.assertEqual(self.read(self.target()), "setting = updated\n")
+
+	def test_dpkg_reports_the_conffile_the_archiver_asks_about(self):
+		"""conffiles_of drives the archiver off dpkg's own database, so it
+		has to agree with what dpkg actually recorded."""
+		self.dpkg_install(self.build("1.0", "setting = original\n"))
+		self.assertEqual(self.m.conffiles_of(["emtest-cfg"]),
+		                 {"emtest-cfg": [self.CONFFILE]})
+
+	# -- the round trip ----------------------------------------------------
+
+	def test_archive_then_merge_keeps_both_sides_of_the_change(self):
+		"""The whole feature, end to end, with real dpkg doing the parking.
+
+		v1 is archived at install time. The user edits one line. v2 changes a
+		different line. The 3-way merge against the archived v1 must keep the
+		user's edit *and* take the new key -- which is exactly what dpkg
+		alone cannot do, and the reason this exists."""
+		self.archiver_sees_the_scratch_tree()
+		self.dpkg_install(self.build(
+		    "1.0", "setting = original\nshared = keep\n"))
+		# what merge() does after a successful install
+		self.assertEqual(self.m.archive_settled(self.conf, ["emtest-cfg"]), 1)
+
+		self.write(self.target(), "setting = MY EDIT\nshared = keep\n")
+		self.dpkg_install(self.build(
+		    "2.0", "setting = original\nshared = keep\nnewkey = added\n"))
+		# the parked file must not become the ancestor
+		self.assertEqual(self.m.archive_settled(self.conf, ["emtest-cfg"]), 0,
+		                 "a parked conffile must be skipped by the archiver")
+		archived = self.m.archive_path(self.conf, self.target())
+		self.assertEqual(self.read(archived),
+		                 "setting = original\nshared = keep\n",
+		                 "the ancestor must still be the previously shipped "
+		                 "version, not the incoming one")
+
+		pending = self.m.scan_pending(self.conf)
+		self.assertEqual([p for p, _ in pending], [self.target()])
+
+		base, src = self.m.ancestor_for(self.conf, self.target())
+		self.assertIsNotNone(base, "no ancestor found to merge against")
+		merged, conflicts = self.m.merge3(
+		    base,
+		    self.m.read_lines(self.target()),
+		    self.m.read_lines(self.target() + ".dpkg-dist"))
+		self.assertEqual(conflicts, 0,
+		                 "edits on different lines must merge cleanly")
+		text = "".join(merged)
+		self.assertIn("setting = MY EDIT", text, "the user's edit was lost")
+		self.assertIn("newkey = added", text, "the update was lost")
+
+	def test_a_genuine_conflict_is_not_merged_silently(self):
+		"""Both sides changed the same line. This is the case that has to
+		reach the user rather than be resolved by guessing."""
+		self.archiver_sees_the_scratch_tree()
+		self.dpkg_install(self.build("1.0", "setting = original\n"))
+		self.m.archive_settled(self.conf, ["emtest-cfg"])
+		self.write(self.target(), "setting = mine\n")
+		self.dpkg_install(self.build("2.0", "setting = theirs\n"))
+
+		base, _ = self.m.ancestor_for(self.conf, self.target())
+		merged, conflicts = self.m.merge3(
+		    base,
+		    self.m.read_lines(self.target()),
+		    self.m.read_lines(self.target() + ".dpkg-dist"))
+		self.assertEqual(conflicts, 1)
+		self.assertIn("<<<<<<<", "".join(merged))
+
+	def test_the_archive_is_refreshed_once_the_update_is_accepted(self):
+		"""After review the parked file becomes the next ancestor, whatever
+		the user chose to keep on disk. Getting this wrong makes the next
+		upgrade merge against a version two releases old."""
+		self.archiver_sees_the_scratch_tree()
+		self.dpkg_install(self.build("1.0", "setting = original\n"))
+		self.m.archive_settled(self.conf, ["emtest-cfg"])
+		self.write(self.target(), "setting = mine\n")
+		self.dpkg_install(self.build("2.0", "setting = v2\n"))
+
+		parked = self.target() + ".dpkg-dist"
+		self.m._retire(self.conf, self.target(), parked)
+		self.assertFalse(os.path.exists(parked), "the parked file must go")
+		self.assertEqual(
+		    self.read(self.m.archive_path(self.conf, self.target())),
+		    "setting = v2\n")
+
+
 def _gpg_works():
 	return bool(shutil.which("gpg") and shutil.which("gpgv")
 	            and shutil.which("dpkg"))
