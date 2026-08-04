@@ -12,6 +12,10 @@
 PACKAGE     = apt-emerge
 PYTHON     ?= python3
 
+# Where build products land. Settable so an isolated build can be kept from
+# clobbering a plain one; OBJDIR is the canonical name across these projects.
+OBJDIR     ?= dist
+
 prefix     ?= /usr
 bindir     ?= $(prefix)/bin
 datarootdir?= $(prefix)/share
@@ -96,7 +100,7 @@ uninstall:
 # outside the tree and not ours to litter. Collect them into dist/ instead.
 deb: version-check
 	dpkg-buildpackage --build=binary --no-sign
-	mkdir -p dist
+	mkdir -p $(OBJDIR)
 	set -e; ver=$$(dpkg-parsechangelog -SVersion); \
 	arch=$$(dpkg-architecture -qDEB_HOST_ARCH); \
 	moved=0; \
@@ -104,15 +108,42 @@ deb: version-check
 	         "../$(PACKAGE)_$${ver}_$${arch}.deb" \
 	         "../$(PACKAGE)_$${ver}_$${arch}.buildinfo" \
 	         "../$(PACKAGE)_$${ver}_$${arch}.changes"; do \
-		if [ -e "$$f" ]; then mv -f "$$f" dist/; moved=$$((moved + 1)); fi; \
+		if [ -e "$$f" ]; then \
+			mv -f "$$f" $(OBJDIR)/; moved=$$((moved + 1)); \
+		fi; \
 	done; \
 	if [ "$$moved" -eq 0 ]; then \
 		echo "deb: dpkg-buildpackage produced nothing to collect"; exit 1; \
 	fi
 	@echo
-	@ls -l dist/
+	@ls -l $(OBJDIR)/
+
+# Files clean removes, named individually rather than swept up by a wildcard.
+# `clean` is the one target everybody runs without reading it, so what it
+# deletes is a safety property: a glob that matches more than intended, or an
+# unset variable inside an rm, is how a clean target eats a source tree.
+CLEAN_FILES = debian/files \
+              debian/debhelper-build-stamp \
+              debian/$(PACKAGE).substvars \
+              debian/$(PACKAGE).debhelper.log
+
+# Directories the build itself creates as staging or output trees, and which
+# are therefore disposable whole. Each is still checked before removal: an
+# absolute path or a parent traversal aborts, because OBJDIR is settable and
+# `make clean OBJDIR=/` must not be a working command.
+#
+# The unset-variable case needs no check. These are iterated as shell words,
+# so an empty OBJDIR disappears in word splitting and removes nothing -- it
+# is `rm -rf $(VAR)` as a single command, where an empty VAR leaves a bare
+# `rm -rf`, that turns a typo into a disaster.
+CLEAN_DIRS = $(OBJDIR) debian/$(PACKAGE) debian/.debhelper __pycache__
 
 clean:
-	rm -rf dist debian/$(PACKAGE) debian/.debhelper debian/files \
-	       debian/debhelper-build-stamp debian/*.substvars debian/*.log
-	find . -name __pycache__ -type d -prune -exec rm -rf {} +
+	rm -f $(CLEAN_FILES)
+	@set -e; for d in $(CLEAN_DIRS); do \
+		case "$$d" in \
+		/* | *..*) \
+			echo "clean: refusing to remove '$$d'" >&2; exit 1 ;; \
+		esac; \
+		if [ -d "$$d" ]; then echo "rm -r $$d"; rm -r "$$d"; fi; \
+	done

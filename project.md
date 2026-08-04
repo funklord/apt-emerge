@@ -54,6 +54,12 @@ been run against a real Debian 13 (trixie) desktop with `trixie-updates` and
 - Runs on real Debian (not just Ubuntu). Debian-specific version quirks
   (binNMU `+bN`, stable-update `+debNuN` suffixes) matter — see version compare.
 
+**Code style lives in `code-style.md`**, not here: `snake_case`, tabs for
+indentation with spaces for alignment, lowercase filenames — and, importantly,
+**no autoformatter may be run on this tree**, because `black` and `ruff format`
+rewrite tabs to spaces unconditionally and would silently revert the
+conversion. Read that file before editing; do not work from memory of it.
+
 ## Hard design rules (don't regress these)
 
 1. **Single file, stdlib only.** The deploy story for apt-less boxes is one
@@ -524,10 +530,18 @@ Both skip themselves if the tool is missing, so the suite runs off a Debian box.
 
 ## Packaging
 
-`make deb` builds `dist/apt-emerge_<version>_all.deb`. Source format is
-**`3.0 (native)`**: this repo *is* upstream, there is no separate tarball, and
-a quilt package would mean inventing an upstream/packaging split that does not
-exist.
+`make deb` builds `$(OBJDIR)/apt-emerge_<version>_all.deb`, where `OBJDIR`
+defaults to `dist/` and is settable so an isolated build cannot clobber a
+plain one. Source format is **`3.0 (native)`**: this repo *is* upstream, there
+is no separate tarball, and a quilt package would mean inventing an
+upstream/packaging split that does not exist.
+
+`clean` removes the files it names and no others — no wildcard sweeps, no
+`rm -rf` of a bare variable. The directories it does remove whole are ones the
+build created (`$(OBJDIR)`, `debian/apt-emerge`, `debian/.debhelper`), and each
+is rejected if it is absolute or contains `..`, so `make clean OBJDIR=/` is not
+a working command. This is a safety property rather than a style choice:
+`clean` is the one target everybody runs without reading it.
 
 Layout decisions worth not re-litigating:
 
