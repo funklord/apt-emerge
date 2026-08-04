@@ -696,8 +696,23 @@ write surface ever needs testing.
 
    Neither has been observed to bite in practice.
 4. ~~GPG verification~~ — **done**, see the verification section.
-5. ~~`_SESSION_LEADER_COMMS` truncation audit~~ — done for KDE Plasma/sddm.
-   Still unverified on GNOME/gdm and the greeter entries.
+5. **`_SESSION_LEADER_COMMS` truncation audit** — done properly now, and it
+   found a live bug rather than confirming the list. `/proc/PID/comm` is
+   capped at 15 characters, and SDDM 0.21 renamed its greeter binary to
+   `sddm-greeter-qt6` — 16 — so on Debian trixie it reports
+   `sddm-greeter-qt` and the entry `sddm-greeter` matched nothing. Both
+   spellings are now listed, and `TestSessionLeaderComms` enforces the
+   invariant in both directions: no entry may exceed 15 characters (it could
+   never match), and the known long binaries must appear truncated. The
+   15-character limit is measured against the running kernel rather than
+   hardcoded from memory.
+
+   **Still unverified: GNOME/gdm.** Deliberately not guessed at — the whole
+   point of the audit is that a wrong entry fails silently, and adding
+   plausible names without a box to check them on is how the sddm entry got
+   there. `gnome-shell` and `gdm-session-wor` are the ones that matter and
+   both are present; what is unchecked is whether GNOME has other leaders
+   worth naming.
 6. ~~Session-critical noise~~ — **done**. A same-upstream bump is now reported
    as `(session rebuild)` with an einfo saying the session keeps running; only
    a real upstream change keeps `(session)` and the restart warning. The
@@ -806,6 +821,23 @@ apart and drift silently because nothing enforces the shared contract.
 - `is_protected` (Essential + `Priority: required`) does **not** cover
   `libc6` — Debian ships it `Priority: optional` now. What stops
   `emerge -C libc6` is apt refusing to break `dpkg`'s Pre-Depends, not us.
+- **`/proc/PID/comm` is capped at 15 characters** (`TASK_COMM_LEN - 1`), so a
+  session leader whose binary name is longer only ever appears truncated.
+  This fails silently in both directions — an entry written out in full never
+  matches, and an entry over 15 characters can never match anything — and the
+  symptom is not an error but a session that stops being detected, so
+  `emerge -u` quietly stops warning that an upgrade may restart the desktop.
+  It has already bitten once (`sddm-greeter-qt6`). Tests enforce it now; add
+  new entries in their truncated spelling.
+- **Tests that patch `os`, `shutil` or `subprocess` are patching the module
+  objects the script itself imports.** Without a cleanup that restores the
+  original — captured *before* the patch, or `addCleanup` restores the patch
+  over itself — the damage lands in whatever runs next and nowhere else.
+  `make check-unit` and `make check-integration` are separate processes and
+  structurally cannot see it: a `shutil.which` stub returning None leaked out
+  of the world-seeding tests and made the entire gpgv suite fail, while each
+  module passed alone. `make check-isolation` (and a CI step) runs both in
+  one interpreter for exactly this.
 - **`apt-get dist-upgrade` does take package arguments**, despite its synopsis
   in apt-get(8) showing them only for `install`. Verified:
   `apt-get -s dist-upgrade sl` emits `Inst sl`. This matters because the

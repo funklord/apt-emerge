@@ -1407,7 +1407,10 @@ class TestSeedWorldIsDeferred(unittest.TestCase):
 		self.assertEqual(self.seeded, [])
 
 	def test_version_does_not_seed_the_world_file(self):
-		self.mod.shutil.which = lambda p: None       # force the dpkg backend
+		# shutil is a shared module object: patched without a cleanup this
+		# leaks a which() that finds nothing into every later test, which is
+		# how the gpgv suite started failing only when run after this one.
+		self.patch(self.mod.shutil, "which", lambda p: None)  # force dpkg
 		with contextlib.redirect_stdout(io.StringIO()):
 			self.mod.main(["-V"])
 		self.assertEqual(self.made, [])
@@ -1415,7 +1418,7 @@ class TestSeedWorldIsDeferred(unittest.TestCase):
 		self.assertEqual(self.seeded, [])
 
 	def test_help_does_not_seed_it_either(self):
-		self.mod.shutil.which = lambda p: None
+		self.patch(self.mod.shutil, "which", lambda p: None)
 		with contextlib.redirect_stdout(io.StringIO()):
 			self.mod.main(["--help"])
 		self.assertEqual(self.made, [])
@@ -3646,6 +3649,109 @@ MAPS_FULL = """\
 MAPS_LIBS_ONLY = """\
 7f0000002000-7f0000003000 r-xp 00000000 08:01 133 /usr/lib/libfoo.so.1
 """
+
+
+class TestSessionLeaderComms(unittest.TestCase):
+	"""/proc/PID/comm is capped by the kernel at TASK_COMM_LEN-1 = 15
+	characters, so a leader whose binary name is longer only ever appears
+	truncated.
+
+	This is a silent failure in both directions: an entry written out in full
+	never matches the truncated comm, and an entry longer than 15 characters
+	can never match anything at all. Neither produces an error -- the session
+	simply goes undetected, and `emerge -u` stops warning that an upgrade is
+	about to restart the desktop.
+
+	It has already happened once. SDDM 0.21 renamed its greeter to
+	sddm-greeter-qt6, one character over the limit, so on Debian trixie the
+	entry "sddm-greeter" matched nothing."""
+
+	def setUp(self):
+		self.mod = load()
+
+	COMM_MAX = 15
+
+	def test_no_entry_is_too_long_to_ever_match(self):
+		too_long = sorted(c for c in self.mod._SESSION_LEADER_COMMS
+		                  if len(c) > self.COMM_MAX)
+		self.assertEqual(too_long, [],
+		                 f"these can never match a real comm; use the "
+		                 f"truncated spelling: {too_long}")
+
+	def test_the_kernel_really_does_truncate_where_we_think(self):
+		"""Measured rather than assumed -- the whole entry list is derived
+		from this limit, so it is worth pinning to the running kernel rather
+		than to a constant someone remembered."""
+		with tempfile.TemporaryDirectory() as d:
+			long_name = "abcdefghijklmnopqrstuvwxyz"[:20]
+			path = os.path.join(d, long_name)
+			shutil.copy("/bin/sleep", path)
+			proc = subprocess.Popen([path, "5"])
+			try:
+				comm = None
+				for _ in range(50):
+					try:
+						with open(f"/proc/{proc.pid}/comm") as f:
+							comm = f.read().strip()
+						break
+					except OSError:
+						pass
+				self.assertIsNotNone(comm, "could not read the child's comm")
+				self.assertEqual(len(comm), self.COMM_MAX)
+				self.assertEqual(comm, long_name[:self.COMM_MAX])
+			finally:
+				proc.kill()
+				proc.wait()
+
+	def test_the_known_long_binaries_are_listed_truncated(self):
+		"""Each of these is a real binary whose name exceeds the limit. The
+		expected value is the truncation, not the name."""
+		for binary in ("gdm-session-worker", "sddm-greeter-qt6",
+		               "lightdm-gtk-greeter"):
+			with self.subTest(binary=binary):
+				self.assertGreater(len(binary), self.COMM_MAX,
+				                   "this case is pointless if it fits")
+				self.assertIn(binary[:self.COMM_MAX],
+				              self.mod._SESSION_LEADER_COMMS)
+
+	def test_the_short_names_are_left_alone(self):
+		"""A name that fits must be listed in full, not trimmed."""
+		for binary in ("plasmashell", "kwin_wayland", "gnome-shell", "sddm"):
+			with self.subTest(binary=binary):
+				self.assertLessEqual(len(binary), self.COMM_MAX)
+				self.assertIn(binary, self.mod._SESSION_LEADER_COMMS)
+
+	def fake_proc(self, comms):
+		"""A /proc holding exactly these {pid: comm}."""
+		original_listdir = self.mod.os.listdir
+		self.addCleanup(setattr, self.mod.os, "listdir", original_listdir)
+		self.mod.os.listdir = lambda p: (list(comms) if p == "/proc"
+		                                 else original_listdir(p))
+
+		def fake_open(path, *a, **kw):
+			pid = str(path).split("/")[2]
+			return io.StringIO(comms[pid] + "\n")
+		self.mod.open = fake_open
+
+	def test_a_truncated_greeter_is_actually_found(self):
+		"""End of the chain. The entries above are only useful if the
+		truncated comm is what _find_session_leaders ends up matching, so
+		this drives the real lookup rather than re-checking the set."""
+		self.fake_proc({"41": "sddm-greeter-qt", "42": "bash"})
+		self.assertEqual(self.mod._find_session_leaders(),
+		                 [("41", "sddm-greeter-qt")])
+
+	def test_the_untruncated_name_is_what_would_have_missed(self):
+		"""Why the entry had to change: a session running SDDM 0.21 reports
+		the truncated comm, and nothing else does."""
+		self.fake_proc({"41": "sddm-greeter-qt6"})
+		self.assertEqual(self.mod._find_session_leaders(), [],
+		                 "an untruncated comm cannot occur; if this ever "
+		                 "matches, the kernel limit assumption is wrong")
+
+	def test_an_ordinary_process_is_not_a_leader(self):
+		self.fake_proc({"41": "bash", "42": "sshd"})
+		self.assertEqual(self.mod._find_session_leaders(), [])
 
 
 class TestSessionCritical(unittest.TestCase):

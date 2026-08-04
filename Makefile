@@ -31,8 +31,8 @@ INSTALL_DATA    = $(INSTALL) -m 644
 # symlink is the whole implementation (see the __main__ block in `emerge`).
 ALIASES = dispatch-conf etc-update
 
-.PHONY: all check check-unit check-integration install uninstall deb clean \
-        version-check help
+.PHONY: all check check-unit check-integration check-isolation install \
+        uninstall deb clean version-check help
 
 all:
 	@:
@@ -41,16 +41,30 @@ help:
 	@echo 'Targets:'
 	@echo '  check       run the whole test suite (unit + integration)'
 	@echo '  check-unit  unit tests only -- no dpkg, no apt, no filesystem'
+	@echo '  check-isolation'
+	@echo '              both modules in one interpreter, to catch a test'
+	@echo '              that patches a shared module and does not restore it'
 	@echo '  install     install into $$(DESTDIR)$$(prefix)'
 	@echo '  deb         build a binary package into dist/'
 	@echo '  clean       remove build products'
 
 # -- tests -------------------------------------------------------------------
 
-check: version-check check-unit check-integration
+check: version-check check-unit check-integration check-isolation
 
 check-unit:
 	$(PYTHON) -m unittest test_emerge
+
+# Both modules in one interpreter. Run as separate processes -- which is how
+# check-unit, check-integration and CI all run them, deliberately, so a
+# failure says which half broke -- they cannot catch a test that patches a
+# shared module object (os, shutil, subprocess are the same objects the
+# script imports) and fails to restore it. The damage lands in whatever runs
+# next, and only there: a which() stub that found nothing leaked out of the
+# world-seeding tests and made the whole gpgv suite fail, while both passed
+# on their own.
+check-isolation:
+	$(PYTHON) -m unittest test_emerge test_integration
 
 # Skips itself where rootless dpkg/apt is unavailable, so it is safe to run
 # anywhere -- including inside a package build.

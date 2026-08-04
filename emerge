@@ -765,7 +765,22 @@ _SESSION_CRITICAL_EXACT = {
 _SESSION_CRITICAL_PREFIX = ("libgl1-mesa", "libgl1-amber", "xserver-xorg-video-",
                             "libmutter-", "libgtk-", "libqt5gui", "libqt6gui")
 
-# process names (comm) that identify a graphical session leader
+# Process names (comm) that identify a graphical session leader.
+#
+# These are matched against /proc/PID/comm, which the kernel caps at
+# TASK_COMM_LEN-1 = **15 characters**. A binary with a longer name appears
+# truncated, so the truncated spelling is what has to be listed -- and an
+# entry longer than 15 characters can never match anything, silently. Both
+# rules are asserted by TestSessionLeaderComms; measured, not assumed:
+#
+#     gdm-session-worker  (18) -> "gdm-session-wor"
+#     sddm-greeter-qt6    (16) -> "sddm-greeter-qt"
+#
+# That second one was a live gap. SDDM 0.21 renamed its greeter binary to
+# sddm-greeter-qt6, which is one character over the limit, so on Debian
+# trixie the greeter went undetected -- the entry below said "sddm-greeter",
+# which was correct only for SDDM 0.20 and earlier. Both spellings are kept:
+# the old name is still what older stable releases run.
 _SESSION_LEADER_COMMS = {
 	# X server / Xwayland
     "Xorg", "X", "Xwayland",
@@ -773,11 +788,11 @@ _SESSION_LEADER_COMMS = {
     "gnome-shell", "kwin_wayland", "kwin_x11", "plasmashell", "sway",
     "weston", "mutter", "wayfire", "labwc", "hyprland", "river", "cosmic-comp",
     "cinnamon", "xfwm4", "marco", "muffin", "compiz", "openbox", "i3",
-	# display managers
-    "gdm", "gdm3", "gdm-session-wor", "sddm", "sddm-greeter",
+	# display managers and their greeters
+    "gdm", "gdm3", "gdm-session-wor", "sddm",
+    "sddm-greeter",                     # SDDM <= 0.20
+    "sddm-greeter-qt",                  # SDDM >= 0.21, truncated from -qt6
     "lightdm", "lightdm-gtk-gre", "slick-greeter", "ly", "greetd",
-	# session buses that, if restarted, tear the session down
-    "Xwayland",
 }
 
 def _proc_comm(pid):

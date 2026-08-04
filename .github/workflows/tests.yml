@@ -39,6 +39,15 @@ jobs:
       - name: Integration tests
         run: python3 -m unittest test_integration -v
 
+      # The two steps above are separate processes, deliberately, so a
+      # failure says which half broke. That also means neither can catch a
+      # test that patches a shared module object -- os, shutil, subprocess
+      # are the same objects the script imports -- and fails to restore it:
+      # the damage lands only in whatever runs next. One did, and both
+      # halves passed on their own while the pair failed.
+      - name: Tests must not leak state between modules
+        run: python3 -m unittest test_emerge test_integration
+
       # These pass locally by accident of CPython refcounting if a handle is
       # left open; make that a failure rather than a warning.
       - name: Tests must not leak file handles
@@ -69,6 +78,9 @@ jobs:
 
       - name: Integration tests
         run: python3 -m unittest test_integration -v
+
+      - name: Tests must not leak state between modules
+        run: python3 -m unittest test_emerge test_integration
 
   # The package has to build, install, and produce a working emerge. Building
   # it proves very little on its own -- a .deb full of the wrong paths builds

@@ -23,6 +23,7 @@ own. The whole file skips if that turns out not to work here.
 Run with:  python3 -m unittest test_integration
 """
 
+import hashlib
 import importlib.machinery
 import importlib.util
 import os
@@ -630,6 +631,280 @@ class AptBackendEndToEnd(unittest.TestCase):
 			self.assertIn("emtest-lib",
 			              [c[0] for c in
 			               self.m.AptBackend().depclean_candidates()])
+
+
+def _gpg_works():
+	return bool(shutil.which("gpg") and shutil.which("gpgv")
+	            and shutil.which("dpkg"))
+
+
+HAVE_GPG = _gpg_works()
+
+
+@unittest.skipUnless(HAVE_GPG, "gpg/gpgv unavailable")
+class SignatureVerificationEndToEnd(unittest.TestCase):
+	"""The dpkg backend's trust anchor, against real gpg and real gpgv.
+
+	Everything else on this backend is checked against a SHA256 taken from
+	the Packages index, so the whole chain is worth exactly as much as the
+	signature over that index. test_emerge.py stubs `_gpgv` and pre-seeds a
+	keyring, which covers the decisions made around the check but never the
+	check -- and the two links it cannot cover are the ones most likely to be
+	silently wrong:
+
+	  - `dearmor` exists because gpgv reads binary keyrings only and refuses
+	    an armoured .asc outright, which is how Debian ships its keys. If it
+	    emitted subtly wrong bytes nothing here would say so.
+	  - a keyring that comes out *empty* does not fail. It warns and returns
+	    None, and the sync then proceeds unverified. That is the dangerous
+	    direction, and it is invisible unless a test asserts the check
+	    actually ran rather than that the sync succeeded.
+
+	So these generate a real key, sign a real Release with it, and assert
+	both that a good one passes *and that it was checked*."""
+
+	def setUp(self):
+		self.dir = tempfile.mkdtemp(prefix="emerge-gpg-itest-")
+		self.addCleanup(shutil.rmtree, self.dir, True)
+		self.gnupg = os.path.join(self.dir, "gnupg")
+		os.makedirs(self.gnupg, mode=0o700)
+		self.repo = os.path.join(self.dir, "repo")
+		self.trusted = os.path.join(self.dir, "trusted.gpg.d")
+		os.makedirs(self.repo)
+		os.makedirs(self.trusted)
+		self.env = {**os.environ, "GNUPGHOME": self.gnupg,
+		            "PATH": SBIN_PATH}
+		self.m = self.load()
+
+	# -- fixture -----------------------------------------------------------
+
+	def gpg(self, *args, **kw):
+		r = subprocess.run(["gpg", "--batch", "--pinentry-mode", "loopback",
+		                    "--passphrase", ""] + list(args),
+		                   capture_output=True, text=True, env=self.env, **kw)
+		return r
+
+	def make_key(self, uid):
+		"""A real signing key. ed25519 so this costs well under a second."""
+		r = self.gpg("--quick-generate-key", uid, "ed25519", "sign", "0")
+		self.assertEqual(r.returncode, 0, r.stderr)
+
+	def export_armoured(self, uid, path):
+		"""Armoured .asc, which is how Debian actually ships archive keys and
+		the whole reason dearmor exists."""
+		r = self.gpg("--armor", "--export", uid)
+		self.assertEqual(r.returncode, 0, r.stderr)
+		self.assertIn("BEGIN PGP PUBLIC KEY BLOCK", r.stdout)
+		with open(path, "w") as f:
+			f.write(r.stdout)
+
+	def publish(self, packages=b"Package: emtest\nVersion: 1.0\n",
+	            sign_with=None, corrupt_release=False, corrupt_index=False,
+	            sign=True):
+		"""A flat file:// repository with a signed InRelease over Release."""
+		with open(os.path.join(self.repo, "Packages"), "wb") as f:
+			f.write(packages)
+		digest = hashlib.sha256(packages).hexdigest()
+		release = (f"Suite: trixie\nComponents: main\n"
+		           f"SHA256:\n {digest} {len(packages)} Packages\n")
+		if corrupt_index:
+			# the signature stays valid; the index no longer matches it
+			with open(os.path.join(self.repo, "Packages"), "wb") as f:
+				f.write(packages + b"Package: smuggled\nVersion: 9\n")
+		if not sign:
+			return
+		src = os.path.join(self.dir, "Release.in")
+		with open(src, "w") as f:
+			f.write(release)
+		out = os.path.join(self.repo, "InRelease")
+		args = ["--clearsign", "-o", out]
+		if sign_with:
+			args += ["--local-user", sign_with]
+		r = self.gpg(*args, src)
+		self.assertEqual(r.returncode, 0, r.stderr)
+		if corrupt_release:
+			# flip a byte inside the signed payload
+			with open(out) as f:
+				text = f.read()
+			with open(out, "w") as f:
+				f.write(text.replace("Suite: trixie", "Suite: bookwrm"))
+
+	def load(self):
+		loader = importlib.machinery.SourceFileLoader("emerge_gpg_itest",
+		                                              SCRIPT)
+		spec = importlib.util.spec_from_loader(loader.name, loader)
+		m = importlib.util.module_from_spec(spec)
+		loader.exec_module(m)
+		m.TREE_DIR = os.path.join(self.dir, "tree")
+		m.LIB_DIR = os.path.join(self.dir, "lib")
+		m.WORLD = os.path.join(self.dir, "lib", "world")
+		m.TRUSTED_DIR = self.trusted
+		m.TRUSTED_LEGACY = os.path.join(self.dir, "nonexistent.gpg")
+		m.need_root = lambda: None
+		m.print = lambda *a, **k: None
+		m.read_sources = lambda: [("file://" + self.repo, "./", ["main"],
+		                           self.signed_by)]
+		self.warnings = []
+		m.ewarn = self.warnings.append
+		m.einfo = lambda msg: None
+		return m
+
+	signed_by = None
+
+	def sync(self, verify=True):
+		self.m.DpkgBackend().sync(verify=verify)
+
+	# -- the good case, and proof that it was actually checked -------------
+
+	def test_a_real_signature_verifies_through_dearmor_and_gpgv(self):
+		"""The link the stubbed tests cannot reach: an armoured key, run
+		through dearmor, handed to real gpgv, over a real signature."""
+		self.make_key("Emerge Archive <a@t>")
+		self.export_armoured("Emerge Archive",
+		                     os.path.join(self.trusted, "archive.asc"))
+		self.publish()
+		v = self.m.Verifier(True)
+		self.addCleanup(v.close)
+		self.assertTrue(v.enabled, "gpgv should have been found")
+
+		text = v.release("file://" + self.repo, "./")
+		self.assertIsNotNone(text, f"Release did not verify; {self.warnings}")
+		self.assertIn("Suite: trixie", text)
+
+		raw = open(os.path.join(self.repo, "Packages"), "rb").read()
+		self.assertTrue(v.check_index("file://" + self.repo, "./", None,
+		                              "Packages", raw))
+		self.assertEqual(v.checked, 1,
+		                 "the hash check must have actually run")
+
+	def test_the_keyring_built_from_an_armoured_key_is_not_empty(self):
+		"""An empty keyring does not fail -- it warns and the sync proceeds
+		unverified. That silent path is the one worth pinning."""
+		self.make_key("Emerge Archive <a@t>")
+		self.export_armoured("Emerge Archive",
+		                     os.path.join(self.trusted, "archive.asc"))
+		v = self.m.Verifier(True)
+		self.addCleanup(v.close)
+		ring = v.keyring(None)
+		self.assertIsNotNone(ring, "no keyring was built from the trust dir")
+		self.assertGreater(os.path.getsize(ring), 0)
+
+	def test_a_full_sync_reports_the_index_as_verified(self):
+		self.make_key("Emerge Archive <a@t>")
+		self.export_armoured("Emerge Archive",
+		                     os.path.join(self.trusted, "archive.asc"))
+		self.publish()
+		self.sync()
+		self.assertEqual(
+		    [w for w in self.warnings if "NOT" in w or "could not" in w], [],
+		    f"sync warned about verification: {self.warnings}")
+		self.assertTrue(os.listdir(self.m.TREE_DIR))
+
+	# -- the failures, which must be fatal ---------------------------------
+
+	def test_a_tampered_release_aborts_the_sync(self):
+		self.make_key("Emerge Archive <a@t>")
+		self.export_armoured("Emerge Archive",
+		                     os.path.join(self.trusted, "archive.asc"))
+		self.publish(corrupt_release=True)
+		with self.assertRaises(SystemExit) as cm:
+			self.sync()
+		self.assertNotEqual(cm.exception.code, 0)
+
+	def test_an_index_that_does_not_match_the_signed_release_aborts(self):
+		"""The signature is valid and the Release is genuine; the index
+		behind it is not. This is the attack the hash chain exists for."""
+		self.make_key("Emerge Archive <a@t>")
+		self.export_armoured("Emerge Archive",
+		                     os.path.join(self.trusted, "archive.asc"))
+		self.publish(corrupt_index=True)
+		with self.assertRaises(SystemExit) as cm:
+			self.sync()
+		self.assertNotEqual(cm.exception.code, 0)
+
+	def test_a_signature_from_an_untrusted_key_aborts(self):
+		"""Signed correctly, by a key the trust store does not carry."""
+		self.make_key("Emerge Archive <a@t>")
+		self.make_key("Some Rando <r@t>")
+		self.export_armoured("Emerge Archive",
+		                     os.path.join(self.trusted, "archive.asc"))
+		self.publish(sign_with="Some Rando")
+		with self.assertRaises(SystemExit) as cm:
+			self.sync()
+		self.assertNotEqual(cm.exception.code, 0)
+
+	# -- the deliberate non-failures ---------------------------------------
+
+	def test_no_verify_skips_the_check_entirely(self):
+		self.make_key("Emerge Archive <a@t>")
+		self.export_armoured("Emerge Archive",
+		                     os.path.join(self.trusted, "archive.asc"))
+		self.publish(corrupt_release=True)
+		self.sync(verify=False)          # must not raise
+		self.assertTrue(os.listdir(self.m.TREE_DIR))
+
+	def test_an_unsigned_local_repository_still_works(self):
+		"""Being unable to check only warns. Turning verification on must not
+		break a USB-stick repo that never had a Release at all.
+
+		The key has to be present for this to test what it says: without one
+		the run stops at "no usable keys" and never reaches the missing
+		Release at all."""
+		self.make_key("Emerge Archive <a@t>")
+		self.export_armoured("Emerge Archive",
+		                     os.path.join(self.trusted, "archive.asc"))
+		self.publish(sign=False)
+		self.sync()
+		self.assertTrue(os.listdir(self.m.TREE_DIR))
+		self.assertTrue(any("no verifiable InRelease or Release" in w
+		                    for w in self.warnings),
+		                f"the unverified sync said nothing: {self.warnings}")
+
+	def test_an_empty_trust_store_warns_and_does_not_pretend(self):
+		"""The other half of "unable to check": a signed repository, and
+		nothing to check it against. It must proceed -- and say so, because
+		the alternative is a sync that looks verified and is not."""
+		self.make_key("Emerge Archive <a@t>")
+		self.publish()          # properly signed, but nothing trusts the key
+		self.sync()
+		self.assertTrue(os.listdir(self.m.TREE_DIR))
+		self.assertTrue(any("no usable keys" in w for w in self.warnings),
+		                f"missing keys went unmentioned: {self.warnings}")
+		self.assertTrue(any("0 of 1" in w for w in self.warnings),
+		                f"the tally did not admit nothing was checked: "
+		                f"{self.warnings}")
+
+	# -- signed-by, which is a different trust decision --------------------
+
+	def test_signed_by_accepts_the_key_it_names(self):
+		self.make_key("Emerge Archive <a@t>")
+		key = os.path.join(self.dir, "byname.asc")
+		self.export_armoured("Emerge Archive", key)
+		self.publish()
+		self.signed_by = key
+		self.addCleanup(setattr, type(self), "signed_by", None)
+		self.m = self.load()
+		self.sync()
+		self.assertEqual(
+		    [w for w in self.warnings if "NOT" in w], [],
+		    f"signed-by verification warned: {self.warnings}")
+
+	def test_signed_by_rejects_a_key_it_does_not_name(self):
+		"""signed-by is the whole difference between apt's trust model and
+		"anything in the keyring will do": the archive key sits in the trust
+		directory, but this entry names a different one."""
+		self.make_key("Emerge Archive <a@t>")
+		self.make_key("Other Key <o@t>")
+		self.export_armoured("Emerge Archive",
+		                     os.path.join(self.trusted, "archive.asc"))
+		other = os.path.join(self.dir, "other.asc")
+		self.export_armoured("Other Key", other)
+		self.publish(sign_with="Emerge Archive")
+		self.signed_by = other
+		self.addCleanup(setattr, type(self), "signed_by", None)
+		self.m = self.load()
+		with self.assertRaises(SystemExit):
+			self.sync()
 
 
 if __name__ == "__main__":
