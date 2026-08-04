@@ -468,11 +468,11 @@ Chat-side testing used synthetic `Packages` trees under `TREE_DIR` and mocked
   reproduces exactly, and doing so found three bugs (see that section).
 - ~~**A graphical session.**~~ Done on KDE Plasma Wayland + sddm; found and
   fixed the two permission traps in session detection. GNOME/gdm still unseen.
-- **apt-less embedded box** — still outstanding, and now the biggest untested
-  area. The dpkg backend's sync (including signature verification) was
-  exercised against real archives and a synthetic USB `file://` repo using a
-  throwaway `TREE_DIR`, but install / depclean world-closure have never run on
-  hardware without `apt-get`.
+- **apt-less embedded box** — mostly closed, and not by finding hardware. See
+  backlog item 7: `pick_backend` decides on `shutil.which("apt-get")`, so
+  hiding it is the whole of "apt-less" from the program's side, and a local
+  HTTP server covers sync over http. What is left is confidence rather than
+  coverage: nobody has run it on a machine that genuinely lacks apt.
 - ~~**Config merging** against real package upgrades that ship conffile
   changes.~~ Done — and it did not need a real box after all, which is worth
   remembering before deferring something else as hardware-only. Two `.debs`
@@ -501,8 +501,19 @@ Always `python3 -m py_compile emerge` after edits.
 
 ## The test suite
 
-`python3 -m unittest test_emerge test_integration` — 244 tests, stdlib only,
-~0.7s.
+`make check` runs everything: 388 unit tests and 33 end-to-end ones, stdlib
+only. The unit half is a few seconds. The integration half is dominated by one
+test that drives a real `apt-get`, and its wall time swings hard with system
+load — measured between 14s and 115s for the same suite on the same machine,
+so treat a slow run as load rather than a hang. `make check-unit` is the fast
+loop.
+
+**Every module carries a `tearDownModule` sentinel** that fails the run if it
+left `os`, `shutil` or `subprocess` patched. `load()` gives each test a fresh
+copy of the *script*, but those modules are the same objects the test process
+uses, so a missing cleanup corrupts whatever runs next — in another file,
+with no clue where it came from. Three such leaks have happened; the sentinel
+names the culprit in the run that caused it, and costs nothing.
 
 `test_integration.py` is the end-to-end half: real `.debs` built with
 `dpkg-deb`, a real `file://` repository, real installs, and the real resolver
@@ -524,7 +535,25 @@ work. Two things it gets right that are easy to get wrong when extending it:
 and inherits the ambient environment), and it covers the corrupted-`.deb`
 path, which is the entire trust chain on that backend.
 
-`python3 -m unittest test_emerge` — 214 unit tests, stdlib only, ~0.2s. Covers
+Beyond the two backends, `test_integration.py` also covers:
+
+- **Signature verification** against real `gpg` and real `gpgv` — a generated
+  key, a real signature over a real `Release`, and the assertion that a good
+  one *was checked* rather than merely that the sync succeeded. An empty
+  keyring does not fail; it warns and proceeds unverified, which is the
+  direction worth pinning.
+- **Config merging** against real dpkg, premise first: that
+  `--force-confold` parks an edited conffile as `.dpkg-dist` and silently
+  replaces an untouched one. If that were false the whole feature would be
+  dead code and every unit test would still pass.
+- **Apt-less operation over real HTTP** — a stdlib server on 127.0.0.1, a
+  compressed index (the `.gz`/`.xz` path no `file://` test ever ran), and
+  `shutil.which` hiding `apt-get` so `pick_backend` has to choose dpkg on its
+  own. This class drives `main()` rather than backend methods, so argument
+  parsing → backend selection → resolve → fetch → SHA256 → install → world
+  file finally runs as one path.
+
+`python3 -m unittest test_emerge` — the unit half, stdlib only. Covers
 `vercmp`, `meets`, `parse_depends`, `parse_stanzas`, `merge3`, `_significant`,
 `_dep_ok`, `ndu_solve`, `_wall_from_merges`, `_with_arg`, `_AptIndex.has`,
 `_policy_batch`, `stream_apt`, `run_mergetool`, `_write`, the apt backend's
@@ -731,12 +760,29 @@ write surface ever needs testing.
    derived set is still broad, but breadth now costs a mild note rather than a
    false alarm. See "Session-critical detection".
 7. **The dpkg backend on real apt-less hardware.** Deprioritised by the owner
-   — rare case, mostly works. It is now exercised end-to-end by
-   `test_integration.py` against a throwaway dpkg root (sync, resolve,
-   download+SHA256, merge, world file, `--no-dep-upgrade` pins and walls,
-   `--with`, unmerge, depclean), so what remains untested is only the
-   genuinely hardware-specific part: a box with no `apt-get` at all, and
-   sync over real http rather than `file://`.
+   — rare case, mostly works. Both things this entry called
+   hardware-specific have since been closed without any, which is the second
+   time that has happened (see config merging in the testing notes):
+
+   - *A box with no `apt-get`.* `pick_backend()` decides by asking
+     `shutil.which`, so hiding `apt-get` from it **is** apt-less as far as
+     the program is concerned. `AptlessHttpEndToEnd` does exactly that and
+     asserts the dpkg backend is chosen.
+   - *Sync over real http.* A stdlib `ThreadingHTTPServer` on 127.0.0.1 is
+     real HTTP without a network, and it caught a path nothing else ran:
+     every other test serves `file://`, so **the gzip/xz decompression in
+     `sync()` had never executed** even though it is what every real archive
+     serves.
+
+   That class also drives `main()` rather than the backend methods, so
+   argument parsing → backend selection → resolve → HTTP fetch → SHA256 →
+   install → world file finally runs as one path, including `-p`, `-1` and
+   `-C`.
+
+   What genuinely remains is only this: nobody has run it on a machine that
+   has no `apt-get` *installed*, where the difference is the box, not the
+   program. That is worth doing once for confidence and is not blocking
+   anything.
 8. ~~`-1`/`--oneshot` on the apt backend~~ — **done**. The owner relaxed hard
    rule 3 (see it: the version-pin ban is intact, only the blanket `apt-mark`
    ban was too broad). `--oneshot` now marks the newly-added atoms back to
@@ -842,7 +888,12 @@ apart and drift silently because nothing enforces the shared contract.
   It has already bitten once (`sddm-greeter-qt6`). Tests enforce it now; add
   new entries in their truncated spelling.
 - **Tests that patch `os`, `shutil` or `subprocess` are patching the module
-  objects the script itself imports.** Without a cleanup that restores the
+  objects the script itself imports.** Both test modules carry a
+  `tearDownModule` sentinel that fails the run if one of those is left
+  replaced, naming it — added after the second such leak, and it found a
+  third (`subprocess.call`, patched twice: once with no cleanup at all, once
+  with a cleanup that read the attribute back *after* patching and so
+  restored the patch over itself). Without a cleanup that restores the
   original — captured *before* the patch, or `addCleanup` restores the patch
   over itself — the damage lands in whatever runs next and nowhere else.
   `make check-unit` and `make check-integration` are separate processes and

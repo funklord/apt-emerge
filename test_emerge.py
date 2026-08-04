@@ -39,6 +39,49 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "emerge")
 
 
+# --- shared-module sentinel -------------------------------------------------
+#
+# `load()` gives each test a fresh copy of the script, but the modules that
+# copy imports -- os, shutil, subprocess -- are the *same objects* the test
+# process uses. A test that replaces an attribute on one of them and does not
+# restore it corrupts everything that runs afterwards, in another file, with
+# no hint of where it came from. It has happened: a shutil.which stub that
+# found nothing leaked out of the world-seeding tests and made the entire
+# gpgv suite fail, while each module passed on its own.
+#
+# Running both modules in one interpreter finds that, but costs a second full
+# pass over a suite that drives real apt and takes over a minute. This costs
+# nothing and says which module did it.
+_WATCHED = ("os.listdir", "os.geteuid", "os.makedirs", "os.path.exists",
+            "os.path.isfile", "os.path.isdir", "os.readlink", "os.stat",
+            "shutil.which", "shutil.copy2", "shutil.rmtree",
+            "subprocess.run", "subprocess.Popen", "subprocess.call")
+_SNAPSHOT = {}
+
+
+def _resolve(dotted):
+	obj = {"os": os, "shutil": shutil, "subprocess": subprocess}[
+	    dotted.split(".")[0]]
+	for part in dotted.split(".")[1:]:
+		obj = getattr(obj, part)
+	return obj
+
+
+def setUpModule():
+	for name in _WATCHED:
+		_SNAPSHOT[name] = _resolve(name)
+
+
+def tearDownModule():
+	changed = [name for name in _WATCHED if _resolve(name) is not _SNAPSHOT[name]]
+	if changed:
+		raise AssertionError(
+		    "this module left shared standard-library functions patched: "
+		    + ", ".join(changed)
+		    + ". Capture the original *before* replacing it and restore it "
+		      "with addCleanup, or the damage lands in whatever runs next.")
+
+
 def load():
 	loader = importlib.machinery.SourceFileLoader("emerge_under_test", SCRIPT)
 	spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -2925,9 +2968,17 @@ class TestRunMergetool(unittest.TestCase):
 	def setUp(self):
 		self.mod = load()
 		self.cmds = []
-		self.mod.subprocess.call = lambda cmd, shell=False: (
-		    self.cmds.append(cmd), 0)[1]
-		self.addCleanup(setattr, self.mod.subprocess, "call", subprocess.call)
+		# subprocess is the same module object the script imports, so the
+		# original has to be captured *before* the patch. Reading it back
+		# inside addCleanup restores the patch over itself and leaks it into
+		# every test that follows, in every file.
+		self.original_call = subprocess.call
+		self.addCleanup(setattr, self.mod.subprocess, "call",
+		                self.original_call)
+		self.patch_call(lambda cmd, shell=False: (self.cmds.append(cmd), 0)[1])
+
+	def patch_call(self, fn):
+		self.mod.subprocess.call = fn
 
 	def conf(self, **kw):
 		c = {"mergetool": "", "merge": ""}
@@ -2970,7 +3021,7 @@ class TestRunMergetool(unittest.TestCase):
 		self.assertTrue(self.cmds[0].startswith("A "))
 
 	def test_failure_is_reported(self):
-		self.mod.subprocess.call = lambda cmd, shell=False: 1
+		self.patch_call(lambda cmd, shell=False: 1)
 		self.assertFalse(self.mod.run_mergetool(
 		    self.conf(mergetool="x {mine}"), "/b", "/m", "/t", "/o"))
 
@@ -3649,6 +3700,38 @@ MAPS_FULL = """\
 MAPS_LIBS_ONLY = """\
 7f0000002000-7f0000003000 r-xp 00000000 08:01 133 /usr/lib/libfoo.so.1
 """
+
+
+class TestFetch(unittest.TestCase):
+	"""fetch() is the one place a source URL becomes a request. http(s) and
+	file:// are covered end to end by test_integration; this covers the third
+	form, which no integration test produces: a bare path.
+
+	`deb /media/usb ./` is a legal sources.list line, and read_sources hands
+	that through with no scheme at all. Without the conversion urllib raises
+	`unknown url type`, which reads as a broken repository rather than a
+	line the user is entitled to write."""
+
+	def setUp(self):
+		self.dir = tempfile.mkdtemp(prefix="emerge-fetch-")
+		self.addCleanup(shutil.rmtree, self.dir, True)
+		self.path = os.path.join(self.dir, "Packages")
+		with open(self.path, "wb") as f:
+			f.write(b"Package: emtest\nVersion: 1.0\n")
+
+	def test_a_bare_path_is_read_as_a_local_file(self):
+		self.assertEqual(em.fetch(self.path),
+		                 b"Package: emtest\nVersion: 1.0\n")
+
+	def test_an_explicit_file_url_still_works(self):
+		self.assertEqual(em.fetch("file://" + self.path),
+		                 b"Package: emtest\nVersion: 1.0\n")
+
+	def test_a_missing_bare_path_raises_rather_than_returning_empty(self):
+		"""sync() decides a repository is unusable by catching the error, so
+		a silent empty result would be written out as a valid empty index."""
+		with self.assertRaises(Exception):
+			em.fetch(os.path.join(self.dir, "no-such-file"))
 
 
 class TestSessionLeaderComms(unittest.TestCase):

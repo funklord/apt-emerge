@@ -38,6 +38,49 @@ SCRIPT = os.path.join(HERE, "emerge")
 SBIN_PATH = os.environ.get("PATH", "") + ":/usr/sbin:/sbin"
 
 
+# --- shared-module sentinel -------------------------------------------------
+#
+# `load()` gives each test a fresh copy of the script, but the modules that
+# copy imports -- os, shutil, subprocess -- are the *same objects* the test
+# process uses. A test that replaces an attribute on one of them and does not
+# restore it corrupts everything that runs afterwards, in another file, with
+# no hint of where it came from. It has happened: a shutil.which stub that
+# found nothing leaked out of the world-seeding tests and made the entire
+# gpgv suite fail, while each module passed on its own.
+#
+# Running both modules in one interpreter finds that, but costs a second full
+# pass over a suite that drives real apt and takes over a minute. This costs
+# nothing and says which module did it.
+_WATCHED = ("os.listdir", "os.geteuid", "os.makedirs", "os.path.exists",
+            "os.path.isfile", "os.path.isdir", "os.readlink", "os.stat",
+            "shutil.which", "shutil.copy2", "shutil.rmtree",
+            "subprocess.run", "subprocess.Popen", "subprocess.call")
+_SNAPSHOT = {}
+
+
+def _resolve(dotted):
+	obj = {"os": os, "shutil": shutil, "subprocess": subprocess}[
+	    dotted.split(".")[0]]
+	for part in dotted.split(".")[1:]:
+		obj = getattr(obj, part)
+	return obj
+
+
+def setUpModule():
+	for name in _WATCHED:
+		_SNAPSHOT[name] = _resolve(name)
+
+
+def tearDownModule():
+	changed = [name for name in _WATCHED if _resolve(name) is not _SNAPSHOT[name]]
+	if changed:
+		raise AssertionError(
+		    "this module left shared standard-library functions patched: "
+		    + ", ".join(changed)
+		    + ". Capture the original *before* replacing it and restore it "
+		      "with addCleanup, or the damage lands in whatever runs next.")
+
+
 def _rootless_dpkg_works():
 	"""Can we unpack into a directory we own, without being root?"""
 	if not (shutil.which("dpkg") and shutil.which("dpkg-deb")):
@@ -631,6 +674,274 @@ class AptBackendEndToEnd(unittest.TestCase):
 			self.assertIn("emtest-lib",
 			              [c[0] for c in
 			               self.m.AptBackend().depclean_candidates()])
+
+
+@unittest.skipUnless(HAVE_DPKG_ROOT, "rootless `dpkg --root` unavailable")
+class AptlessHttpEndToEnd(unittest.TestCase):
+	"""The dpkg backend as an apt-less box actually meets it.
+
+	Three things nothing else covers, and none of them needed hardware:
+
+	  - **No apt-get.** pick_backend() picks the dpkg backend by asking
+	    shutil.which, so removing apt-get from its view is the whole of
+	    "apt-less" as far as the program is concerned.
+	  - **Real HTTP.** Every other test serves file://, which never exercises
+	    urllib, the User-Agent, or a server that can 404. A local server on
+	    127.0.0.1 is real HTTP without a network.
+	  - **Compressed indexes.** sync() tries .xz, then .gz, then plain, and
+	    the generated USB index is always plain -- so the decompression path,
+	    which is what every real archive serves, had never run.
+
+	And it drives `main()` rather than the backend methods, so argument
+	parsing, backend selection, resolution, install and the world file run as
+	one path for the first time."""
+
+	def setUp(self):
+		self.dir = tempfile.mkdtemp(prefix="emerge-http-itest-")
+		self.addCleanup(shutil.rmtree, self.dir, True)
+		self.sysroot = os.path.join(self.dir, "sysroot")
+		self.repo = os.path.join(self.dir, "repo")
+		self.state = os.path.join(self.dir, "state")
+		for sub in ("info", "updates", "triggers"):
+			os.makedirs(os.path.join(self.sysroot, "var/lib/dpkg", sub))
+		for f in ("status", "available"):
+			open(os.path.join(self.sysroot, "var/lib/dpkg", f), "a").close()
+		os.makedirs(self.repo)
+		os.makedirs(self.state)
+		original_path = os.environ.get("PATH", "")
+		os.environ["PATH"] = SBIN_PATH
+		self.addCleanup(os.environ.__setitem__, "PATH", original_path)
+		self.env = {**os.environ, "PATH": SBIN_PATH}
+		self.base = self.serve(self.repo)
+		self.m = self.load()
+
+	# -- fixture -----------------------------------------------------------
+
+	def serve(self, directory):
+		"""A local HTTP server, so fetch() goes through urllib for real."""
+		import http.server
+		import threading
+
+		class Quiet(http.server.SimpleHTTPRequestHandler):
+			def log_message(self, *a):
+				pass
+
+		def handler(*args, **kw):
+			return Quiet(*args, directory=directory, **kw)
+
+		httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+		thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+		thread.start()
+		# Cleanups run last-registered-first, so this reads bottom-up:
+		# stop serving, wait for the thread, then close the listening socket.
+		# Without the close the suite leaks a socket per test, which the
+		# ResourceWarning CI step turns into a failure.
+		self.addCleanup(httpd.server_close)
+		self.addCleanup(thread.join, 5)
+		self.addCleanup(httpd.shutdown)
+		return f"http://127.0.0.1:{httpd.server_address[1]}"
+
+	def load(self):
+		loader = importlib.machinery.SourceFileLoader("emerge_http_itest",
+		                                              SCRIPT)
+		spec = importlib.util.spec_from_loader(loader.name, loader)
+		m = importlib.util.module_from_spec(spec)
+		loader.exec_module(m)
+		m.LIB_DIR = os.path.join(self.state, "lib")
+		m.TREE_DIR = os.path.join(self.state, "tree")
+		m.WORLD = os.path.join(self.state, "lib", "world")
+		m.DISTFILES = os.path.join(self.state, "distfiles")
+		m.STATUS = os.path.join(self.sysroot, "var/lib/dpkg/status")
+		m.need_root = lambda: None
+		m.print = lambda *a, **k: None
+		m.read_sources = lambda: [(self.base, "./", ["main"], None)]
+
+		# The point of the class: no apt-get anywhere, so pick_backend has to
+		# choose the dpkg backend on its own. shutil is a shared module
+		# object, hence the restore.
+		real_which = m.shutil.which
+		self.addCleanup(setattr, m.shutil, "which", real_which)
+		m.shutil.which = lambda n: None if n == "apt-get" else real_which(n)
+
+		log = os.path.join(self.state, "dpkg.log")
+		real_capture, real_run = m.capture, m.run
+
+		def inject(cmd):
+			if (cmd and cmd[0] == "dpkg"
+			        and cmd[1] != "--print-architecture"):
+				return [cmd[0], f"--root={self.sysroot}", "--force-not-root",
+				        f"--log={log}"] + list(cmd[1:])
+			return cmd
+		m.capture = lambda cmd: real_capture(inject(cmd))
+		m.run = lambda cmd, **kw: real_run(inject(cmd), **kw)
+		return m
+
+	def make_deb(self, name, version, depends=None):
+		d = os.path.join(self.dir, "build", f"{name}_{version}")
+		shutil.rmtree(d, ignore_errors=True)
+		os.makedirs(os.path.join(d, "DEBIAN"))
+		os.makedirs(os.path.join(d, "usr/share/emtest"))
+		ctl = [f"Package: {name}", f"Version: {version}",
+		       "Architecture: all", "Maintainer: t <t@t>"]
+		if depends:
+			ctl.append(f"Depends: {depends}")
+		ctl.append(f"Description: test package {name}")
+		with open(os.path.join(d, "DEBIAN", "control"), "w") as f:
+			f.write("\n".join(ctl) + "\n")
+		with open(os.path.join(d, f"usr/share/emtest/{name}.txt"), "w") as f:
+			f.write(f"{name} {version}\n")
+		fn = f"{name}_{version}_all.deb"
+		r = subprocess.run(["dpkg-deb", "--build", "-Znone", d,
+		                    os.path.join(self.repo, fn)],
+		                   capture_output=True, text=True, env=self.env)
+		self.assertEqual(r.returncode, 0, r.stderr)
+		return fn
+
+	def write_index(self, filenames, compression=None):
+		"""A Packages index for these .debs, optionally compressed.
+
+		Only one form is written, so a test that asks for .gz proves the
+		decompression ran rather than that a plain fallback was found."""
+		stanzas = []
+		for fn in filenames:
+			path = os.path.join(self.repo, fn)
+			r = subprocess.run(["dpkg-deb", "-f", path], capture_output=True,
+			                   text=True, env=self.env)
+			self.assertEqual(r.returncode, 0, r.stderr)
+			with open(path, "rb") as f:
+				blob = f.read()
+			stanzas.append(r.stdout.rstrip("\n")
+			               + f"\nFilename: {fn}"
+			               + f"\nSize: {len(blob)}"
+			               + f"\nSHA256: {hashlib.sha256(blob).hexdigest()}")
+		raw = ("\n\n".join(stanzas) + "\n").encode()
+		for stale in ("Packages", "Packages.gz", "Packages.xz"):
+			try:
+				os.unlink(os.path.join(self.repo, stale))
+			except OSError:
+				pass
+		if compression == "gz":
+			import gzip as _gz
+			name, payload = "Packages.gz", _gz.compress(raw)
+		elif compression == "xz":
+			import lzma as _xz
+			name, payload = "Packages.xz", _xz.compress(raw)
+		else:
+			name, payload = "Packages", raw
+		with open(os.path.join(self.repo, name), "wb") as f:
+			f.write(payload)
+		return raw
+
+	def installed(self):
+		return {n: st["Version"]
+		        for n, st in self.m.installed_state().items()}
+
+	def tree_text(self):
+		files = os.listdir(self.m.TREE_DIR)
+		self.assertTrue(files, "sync wrote no index")
+		with open(os.path.join(self.m.TREE_DIR, files[0])) as f:
+			return f.read()
+
+	def world(self):
+		try:
+			with open(self.m.WORLD) as f:
+				return f.read().split()
+		except OSError:
+			return []
+
+	# -- the sync half -----------------------------------------------------
+
+	def test_a_gzipped_index_is_fetched_over_http_and_decompressed(self):
+		self.make_deb("emtest-http", "1.0")
+		raw = self.write_index(["emtest-http_1.0_all.deb"], compression="gz")
+		self.m.main(["--sync"])
+		self.assertEqual(self.tree_text(), raw.decode(),
+		                 "the stored index is not the decompressed original")
+
+	def test_an_xz_index_is_preferred_when_present(self):
+		"""emerge guards its lzma import -- minimal Python builds ship
+		without it -- so skip where the module under test also would."""
+		if self.m.lzma is None:
+			self.skipTest("this Python has no lzma, as emerge allows for")
+		self.make_deb("emtest-http", "1.0")
+		raw = self.write_index(["emtest-http_1.0_all.deb"], compression="xz")
+		self.m.main(["--sync"])
+		self.assertEqual(self.tree_text(), raw.decode())
+
+	def test_a_plain_index_still_works_as_the_last_resort(self):
+		self.make_deb("emtest-http", "1.0")
+		raw = self.write_index(["emtest-http_1.0_all.deb"])
+		self.m.main(["--sync"])
+		self.assertEqual(self.tree_text(), raw.decode())
+
+	def test_a_repository_that_serves_nothing_is_reported(self):
+		"""404 on every candidate. The sync must say so rather than write an
+		empty index and let the resolver blame the user's atom."""
+		self.m.main(["--sync"])
+		self.assertFalse(os.listdir(self.m.TREE_DIR))
+
+	# -- the whole CLI path ------------------------------------------------
+
+	def test_without_apt_get_the_dpkg_backend_is_chosen(self):
+		self.assertEqual(self.m.pick_backend(None).name, "dpkg")
+
+	def test_install_through_main_over_http(self):
+		"""Argument parsing, backend selection, resolution, the HTTP fetch of
+		the .deb, its SHA256 check, the dpkg install and the world file --
+		one path, the way a user runs it."""
+		self.make_deb("emtest-lib", "1.0")
+		self.make_deb("emtest-http", "1.0", depends="emtest-lib")
+		self.write_index(["emtest-lib_1.0_all.deb",
+		                  "emtest-http_1.0_all.deb"], compression="gz")
+		self.m.main(["--sync"])
+		self.m.main(["emtest-http"])
+
+		installed = self.installed()
+		self.assertEqual(installed.get("emtest-http"), "1.0")
+		self.assertEqual(installed.get("emtest-lib"), "1.0",
+		                 "the dependency was not pulled in")
+		self.assertTrue(os.path.exists(os.path.join(
+		    self.sysroot, "usr/share/emtest/emtest-http.txt")))
+		self.assertIn("emtest-http", self.world())
+		self.assertNotIn("emtest-lib", self.world(),
+		                 "a dependency must not enter world")
+
+	def test_pretend_through_main_installs_nothing(self):
+		self.make_deb("emtest-http", "1.0")
+		self.write_index(["emtest-http_1.0_all.deb"], compression="gz")
+		self.m.main(["--sync"])
+		self.m.main(["-p", "emtest-http"])
+		self.assertNotIn("emtest-http", self.installed())
+
+	def test_oneshot_through_main_keeps_it_out_of_world(self):
+		self.make_deb("emtest-http", "1.0")
+		self.write_index(["emtest-http_1.0_all.deb"], compression="gz")
+		self.m.main(["--sync"])
+		self.m.main(["-1", "emtest-http"])
+		self.assertEqual(self.installed().get("emtest-http"), "1.0")
+		self.assertEqual(self.world(), [])
+
+	def test_unmerge_through_main(self):
+		self.make_deb("emtest-http", "1.0")
+		self.write_index(["emtest-http_1.0_all.deb"], compression="gz")
+		self.m.main(["--sync"])
+		self.m.main(["emtest-http"])
+		self.m.main(["-C", "emtest-http"])
+		self.assertNotIn("emtest-http", self.installed())
+		self.assertEqual(self.world(), [])
+
+	def test_a_corrupt_deb_served_over_http_is_refused(self):
+		"""The SHA256 in the index is the whole trust chain once the index
+		itself is trusted, and it has to hold over HTTP too."""
+		self.make_deb("emtest-http", "1.0")
+		self.write_index(["emtest-http_1.0_all.deb"], compression="gz")
+		self.m.main(["--sync"])
+		with open(os.path.join(self.repo, "emtest-http_1.0_all.deb"),
+		          "ab") as f:
+			f.write(b"tampered")
+		with self.assertRaises(SystemExit):
+			self.m.main(["emtest-http"])
+		self.assertNotIn("emtest-http", self.installed())
 
 
 @unittest.skipUnless(HAVE_DPKG_ROOT, "rootless `dpkg --root` unavailable")

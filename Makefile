@@ -39,11 +39,13 @@ all:
 
 help:
 	@echo 'Targets:'
-	@echo '  check       run the whole test suite (unit + integration)'
-	@echo '  check-unit  unit tests only -- no dpkg, no apt, no filesystem'
+	@echo '  check       everything; slowest, the apt tests drive real apt'
+	@echo '  check-unit  unit tests only, a few seconds -- the fast loop'
+	@echo '  check-integration'
+	@echo '              real dpkg, apt, gpgv and http against throwaway roots'
 	@echo '  check-isolation'
-	@echo '              both modules in one interpreter, to catch a test'
-	@echo '              that patches a shared module and does not restore it'
+	@echo '              both modules in one interpreter, for leaks the'
+	@echo '              per-module sentinel cannot see'
 	@echo '  install     install into $$(DESTDIR)$$(prefix)'
 	@echo '  deb         build a binary package into dist/'
 	@echo '  clean       remove build products'
@@ -55,14 +57,18 @@ check: version-check check-unit check-integration check-isolation
 check-unit:
 	$(PYTHON) -m unittest test_emerge
 
-# Both modules in one interpreter. Run as separate processes -- which is how
-# check-unit, check-integration and CI all run them, deliberately, so a
-# failure says which half broke -- they cannot catch a test that patches a
-# shared module object (os, shutil, subprocess are the same objects the
-# script imports) and fails to restore it. The damage lands in whatever runs
-# next, and only there: a which() stub that found nothing leaked out of the
-# world-seeding tests and made the whole gpgv suite fail, while both passed
-# on their own.
+# Both modules in one interpreter, which is the only way to see one module's
+# leftovers break another.
+#
+# The common case no longer needs it: each module now has a tearDownModule
+# sentinel that fails if it left os/shutil/subprocess patched, which is what
+# every leak so far has been, and which it reports by name in the run that
+# caused it. This stays for what the sentinel cannot see -- environment
+# variables, the working directory, state inside the loaded copies of the
+# script -- and for the genuine end-to-end reassurance.
+#
+# It is also the slow one: it re-runs everything, and the apt tests drive a
+# real apt-get. `make check-unit` is the fast loop at a few seconds.
 check-isolation:
 	$(PYTHON) -m unittest test_emerge test_integration
 
