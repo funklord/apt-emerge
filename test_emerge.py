@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tokenize
 import types
 import unittest
@@ -3771,17 +3772,26 @@ class TestSessionLeaderComms(unittest.TestCase):
 			shutil.copy("/bin/sleep", path)
 			proc = subprocess.Popen([path, "5"])
 			try:
+				# Poll until comm *changes to the child's own name*, not
+				# merely until it is readable. Popen forks and then execs,
+				# and in between the child still carries the parent's comm
+				# -- so reading once can return "python3" and fail this test
+				# at random, which is exactly what it must not do.
+				want = long_name[:self.COMM_MAX]
 				comm = None
-				for _ in range(50):
+				deadline = time.monotonic() + 5
+				while time.monotonic() < deadline:
 					try:
 						with open(f"/proc/{proc.pid}/comm") as f:
 							comm = f.read().strip()
-						break
 					except OSError:
-						pass
-				self.assertIsNotNone(comm, "could not read the child's comm")
+						comm = None
+					if comm == want:
+						break
+					time.sleep(0.01)
+				self.assertEqual(comm, want,
+				                 "the child never reported its own comm")
 				self.assertEqual(len(comm), self.COMM_MAX)
-				self.assertEqual(comm, long_name[:self.COMM_MAX])
 			finally:
 				proc.kill()
 				proc.wait()

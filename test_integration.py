@@ -1174,6 +1174,274 @@ class ConfigMergingEndToEnd(unittest.TestCase):
 		    "setting = v2\n")
 
 
+def _source_build_works():
+	return bool(HAVE_DPKG_ROOT and shutil.which("apt-get")
+	            and shutil.which("dpkg-source")
+	            and shutil.which("dpkg-scansources")
+	            and shutil.which("dpkg-buildpackage"))
+
+
+HAVE_SOURCE_BUILD = _source_build_works()
+
+
+@unittest.skipUnless(HAVE_SOURCE_BUILD, "source-build tooling unavailable")
+class SourceBuildEndToEnd(unittest.TestCase):
+	"""`emerge -b` / `-B`, which had never executed.
+
+	The README and the man page both advertise building from the Debian
+	source package, and `resolve_source`, `_src_version` and `_build_use` had
+	no test of any kind -- the same shape as dispatch-conf before its premise
+	was checked: a documented headline feature that could have been dead and
+	nothing would have said so.
+
+	It needs a real source package, so this makes one: a minimal native
+	package with a hand-written `debian/rules` that produces a .deb with
+	`dpkg-deb` directly. No debhelper, deliberately -- it keeps the build to
+	about a second and removes a dependency the tests would otherwise need.
+
+	`apt-get build-dep` runs for real. `Build-Depends: dpkg-dev` is satisfied
+	on any machine that can run these tests at all, so it resolves to no
+	action; apt is still pointed at the scratch tree in case that ever stops
+	being true."""
+
+	SRC = "emtest-src"
+
+	def setUp(self):
+		self.dir = tempfile.mkdtemp(prefix="emerge-src-itest-")
+		self.addCleanup(shutil.rmtree, self.dir, True)
+		os.chmod(self.dir, 0o755)
+		self.sysroot = os.path.join(self.dir, "sysroot")
+		self.repo = os.path.join(self.dir, "repo")
+		for sub in ("info", "updates", "triggers"):
+			os.makedirs(os.path.join(self.sysroot, "var/lib/dpkg", sub))
+		for f in ("status", "available"):
+			open(os.path.join(self.sysroot, "var/lib/dpkg", f), "a").close()
+		for d in ("repo", "lists/partial", "cache/archives/partial", "log",
+		          "etc"):
+			os.makedirs(os.path.join(self.dir, d), exist_ok=True)
+		original_path = os.environ.get("PATH", "")
+		os.environ["PATH"] = SBIN_PATH
+		self.addCleanup(os.environ.__setitem__, "PATH", original_path)
+		self.env = {**os.environ, "PATH": SBIN_PATH}
+
+		self.sources = os.path.join(self.dir, "etc", "sources.list")
+		with open(self.sources, "w") as f:
+			f.write(f"deb-src [trusted=yes] file://{self.repo} ./\n")
+		# The host's real dpkg status, read-only: build-dep has to see what is
+		# actually installed or it would try to install dpkg-dev's entire
+		# tree from a repository that has no binaries in it.
+		self.states = os.path.join(self.dir, "extended_states")
+		open(self.states, "a").close()
+		self.apt_opts = [
+		    "-o", f"Dir::State::lists={self.dir}/lists",
+		    # apt writes the auto/manual marks at the end of every install,
+		    # and fails the whole run if it cannot -- after the package is
+		    # already unpacked and configured, which reads as a build failure
+		    "-o", f"Dir::State::extended_states={self.states}",
+		    "-o", f"Dir::Cache={self.dir}/cache",
+		    "-o", f"Dir::Log={self.dir}/log",
+		    "-o", f"Dir::Etc::sourcelist={self.sources}",
+		    "-o", "Dir::Etc::sourceparts=/dev/null",
+		    "-o", "Dir::Etc::preferences=/dev/null",
+		    "-o", "Dir::Etc::preferencesparts=/dev/null",
+		    "-o", "Debug::NoLocking=1",
+		    "-o", "APT::Sandbox::User=root",
+		    "-o", f"DPkg::Options::=--root={self.sysroot}",
+		    "-o", "DPkg::Options::=--force-not-root",
+		    "-o", f"DPkg::Options::=--log={self.dir}/dpkg.log",
+		]
+		self.m = self.load()
+
+	# -- fixture -----------------------------------------------------------
+
+	def sh(self, *cmd, **kw):
+		return subprocess.run(cmd, capture_output=True, text=True,
+		                      env=self.env, **kw)
+
+	RULES = """#!/usr/bin/make -f
+D = debian/emtest-src
+clean:
+\trm -rf $(D) debian/files debian/*.substvars
+build build-arch build-indep:
+binary-indep:
+\tmkdir -p $(D)/DEBIAN $(D)/usr/share/emtest-src
+\techo built-from-source > $(D)/usr/share/emtest-src/marker
+\tdpkg-gencontrol -pemtest-src -P$(D)
+\tdpkg-deb --build -Znone $(D) ..
+binary: binary-indep
+.PHONY: clean build build-arch build-indep binary binary-indep
+"""
+
+	def publish_source(self, version="1.0"):
+		src = os.path.join(self.dir, "src", f"{self.SRC}-{version}")
+		shutil.rmtree(os.path.join(self.dir, "src"), ignore_errors=True)
+		os.makedirs(os.path.join(src, "debian", "source"))
+		with open(os.path.join(src, "debian", "control"), "w") as f:
+			f.write(f"Source: {self.SRC}\nSection: misc\nPriority: optional\n"
+			        f"Maintainer: t <t@t>\nBuild-Depends: dpkg-dev\n"
+			        f"Standards-Version: 4.7.0\n\n"
+			        f"Package: {self.SRC}\nArchitecture: all\n"
+			        f"Description: minimal source-built test package\n"
+			        f" One line.\n")
+		with open(os.path.join(src, "debian", "changelog"), "w") as f:
+			f.write(f"{self.SRC} ({version}) unstable; urgency=medium\n\n"
+			        f"  * Initial.\n\n"
+			        f" -- t <t@t>  Tue, 04 Aug 2026 12:00:00 +0200\n")
+		with open(os.path.join(src, "debian", "source", "format"), "w") as f:
+			f.write("3.0 (native)\n")
+		rules = os.path.join(src, "debian", "rules")
+		with open(rules, "w") as f:
+			f.write(self.RULES)
+		os.chmod(rules, 0o755)
+
+		r = self.sh("dpkg-source", "-b", f"{self.SRC}-{version}",
+		            cwd=os.path.join(self.dir, "src"))
+		self.assertEqual(r.returncode, 0, r.stderr)
+		for fn in os.listdir(os.path.join(self.dir, "src")):
+			if fn.endswith((".dsc", ".tar.xz", ".tar.gz")):
+				shutil.copy2(os.path.join(self.dir, "src", fn), self.repo)
+		r = self.sh("dpkg-scansources", ".", cwd=self.repo)
+		self.assertEqual(r.returncode, 0, r.stderr)
+		with open(os.path.join(self.repo, "Sources"), "w") as f:
+			f.write(r.stdout)
+		self.assertEqual(
+		    self.sh("apt-get", *self.apt_opts, "update").returncode, 0)
+
+	def load(self):
+		loader = importlib.machinery.SourceFileLoader("emerge_src_itest",
+		                                              SCRIPT)
+		spec = importlib.util.spec_from_loader(loader.name, loader)
+		m = importlib.util.module_from_spec(spec)
+		loader.exec_module(m)
+		m.STATUS = os.path.join(self.sysroot, "var/lib/dpkg/status")
+		m.BINPKGS = os.path.join(self.dir, "binpkgs")
+		m.PORTAGE_TMPDIR = os.path.join(self.dir, "portage")
+		m.need_root = lambda: None
+		m.print = lambda *a, **k: None
+		m._session_critical_cache = set()
+		m._session_blind = False
+
+		opts, sysroot = self.apt_opts, self.sysroot
+		admin = os.path.join(sysroot, "var/lib/dpkg")
+		real_capture, real_run, real_popen = (m.capture, m.run,
+		                                      m.subprocess.Popen)
+
+		def inject(cmd):
+			cmd = list(cmd)
+			if not cmd:
+				return cmd
+			if cmd[0] in ("apt-get", "apt-cache", "apt-mark"):
+				return [cmd[0]] + opts + cmd[1:]
+			if cmd[0] == "dpkg-query":
+				return [cmd[0], f"--admindir={admin}"] + cmd[1:]
+			if cmd[0] == "dpkg" and cmd[1] != "--print-architecture":
+				return [cmd[0], f"--root={sysroot}",
+				        "--force-not-root"] + cmd[1:]
+			return cmd
+
+		m.capture = lambda cmd: real_capture(inject(cmd))
+		m.run = lambda cmd, **kw: real_run(inject(cmd), **kw)
+		m.subprocess.Popen = lambda cmd, **kw: real_popen(inject(cmd), **kw)
+		self.addCleanup(setattr, m.subprocess, "Popen", real_popen)
+		return m
+
+	def installed(self):
+		return {n: st["Version"]
+		        for n, st in self.m.installed_state().items()}
+
+	def opts(self, **kw):
+		o = {"buildpkgonly": False, "oneshot": False, "fetchonly": False}
+		o.update(kw)
+		return o
+
+	# -- planning ----------------------------------------------------------
+
+	def test_the_source_version_is_found(self):
+		self.publish_source("1.0")
+		self.assertEqual(self.m.AptBackend()._src_version(self.SRC), "1.0")
+
+	def test_a_missing_source_package_is_reported_not_guessed(self):
+		self.publish_source("1.0")
+		be = self.m.AptBackend()
+		with self.assertRaises(RuntimeError) as cm:
+			be.resolve_source(["no-such-source"], self.opts())
+		self.assertIn("no source package found", str(cm.exception))
+
+	def test_resolve_source_plans_a_local_version(self):
+		"""The built version is suffixed +local1 so a later @world upgrade
+		will not silently clobber it -- vercmp puts it above the archive's
+		1.0, which is the whole point."""
+		self.publish_source("1.0")
+		merges = self.m.AptBackend().resolve_source([self.SRC], self.opts())
+		names = {m[0]: m for m in merges}
+		self.assertIn(self.SRC, names)
+		self.assertEqual(names[self.SRC][1], "1.0+local1")
+		self.assertGreater(self.m.vercmp("1.0+local1", "1.0"), 0)
+
+	def test_the_plan_carries_deb_build_options_as_use_flags(self):
+		self.publish_source("1.0")
+		merges = self.m.AptBackend().resolve_source([self.SRC], self.opts())
+		use = [m[5] for m in merges if m[0] == self.SRC][0]
+		self.assertIn("nocheck", use)
+
+	# -- building ----------------------------------------------------------
+
+	def test_buildpkgonly_produces_a_deb_and_installs_nothing(self):
+		self.publish_source("1.0")
+		be = self.m.AptBackend()
+		be.resolve_source([self.SRC], self.opts(buildpkgonly=True))
+		be.build(self.opts(buildpkgonly=True))
+
+		products = os.listdir(self.m.BINPKGS)
+		self.assertTrue(any(p.startswith(f"{self.SRC}_1.0+local1_")
+		                    and p.endswith(".deb") for p in products),
+		                f"no +local1 .deb in PKGDIR: {products}")
+		self.assertNotIn(self.SRC, self.installed(),
+		                 "-B must not install what it builds")
+
+	def test_buildpkg_installs_what_it_built(self):
+		self.publish_source("1.0")
+		be = self.m.AptBackend()
+		be.resolve_source([self.SRC], self.opts())
+		be.build(self.opts())
+
+		self.assertEqual(self.installed().get(self.SRC), "1.0+local1",
+		                 "the installed version must be the local build")
+		marker = os.path.join(self.sysroot,
+		                      "usr/share/emtest-src/marker")
+		self.assertTrue(os.path.exists(marker),
+		                "the built payload never reached the filesystem")
+		with open(marker) as f:
+			self.assertEqual(f.read().strip(), "built-from-source")
+
+	def test_the_build_happens_under_portage_tmpdir(self):
+		"""It used to be written inline as /var/tmp/portage, which is the one
+		path the source builder writes to and the only one that could not be
+		repointed."""
+		self.publish_source("1.0")
+		be = self.m.AptBackend()
+		be.resolve_source([self.SRC], self.opts(buildpkgonly=True))
+		be.build(self.opts(buildpkgonly=True))
+		self.assertTrue(os.path.isdir(self.m.PORTAGE_TMPDIR))
+		self.assertIn(f"{self.SRC}-1.0", os.listdir(self.m.PORTAGE_TMPDIR))
+
+	def test_a_rebuild_replaces_the_previous_work_tree(self):
+		"""build() rmtree's the work directory first, so a second run cannot
+		pick up a stale source tree."""
+		self.publish_source("1.0")
+		be = self.m.AptBackend()
+		be.resolve_source([self.SRC], self.opts(buildpkgonly=True))
+		be.build(self.opts(buildpkgonly=True))
+		stale = os.path.join(self.m.PORTAGE_TMPDIR, f"{self.SRC}-1.0",
+		                     "work", "STALE")
+		with open(stale, "w") as f:
+			f.write("x")
+		be = self.m.AptBackend()
+		be.resolve_source([self.SRC], self.opts(buildpkgonly=True))
+		be.build(self.opts(buildpkgonly=True))
+		self.assertFalse(os.path.exists(stale))
+
+
 def _gpg_works():
 	return bool(shutil.which("gpg") and shutil.which("gpgv")
 	            and shutil.which("dpkg"))

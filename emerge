@@ -95,6 +95,11 @@ WORLD     = os.path.join(LIB_DIR, "world")
 DISTFILES = "/var/cache/emerge-dpkg/distfiles"
 BINPKGS   = "/var/cache/emerge-dpkg/binpkgs"      # PKGDIR for -b/-B products
 STATUS    = "/var/lib/dpkg/status"
+# Where -b/-B unpack and build. Portage's own name for it, and a constant for
+# the same reason as the others: it was written inline inside build(), which
+# made the only path the source builder writes to the only one that could not
+# be repointed.
+PORTAGE_TMPDIR = "/var/tmp/portage"
 
 # Single source of truth for what -V prints; the notice at the top of this
 # file is a comment and cannot be shared with it, so keep the two in step.
@@ -2501,7 +2506,7 @@ class AptBackend:
 				print(r.stderr, file=sys.stderr)
 				print(f"{RED('!!!')} build-dep failed for {atom}")
 				sys.exit(1)
-			portage_dir = f"/var/tmp/portage/{atom}-{srcver}"
+			portage_dir = os.path.join(PORTAGE_TMPDIR, f"{atom}-{srcver}")
 			workdir = os.path.join(portage_dir, "work")
 			shutil.rmtree(portage_dir, ignore_errors=True)
 			os.makedirs(workdir)

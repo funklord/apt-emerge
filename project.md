@@ -100,7 +100,8 @@ for anything specific — the sequence has not changed, only the offsets.
   - `LIB_DIR=/var/lib/emerge-dpkg`, `TREE_DIR=$LIB_DIR/tree`,
     `WORLD=$LIB_DIR/world`
   - `DISTFILES=/var/cache/emerge-dpkg/distfiles`,
-    `BINPKGS=/var/cache/emerge-dpkg/binpkgs` (PKGDIR for `-b/-B`)
+    `BINPKGS=/var/cache/emerge-dpkg/binpkgs` (PKGDIR for `-b/-B`),
+    `PORTAGE_TMPDIR=/var/tmp/portage` (where `-b/-B` unpack and build)
   - `STATUS=/var/lib/dpkg/status`
   - config-merge paths defined later: `CONF_FILE=/etc/emerge/dispatch-conf.conf`
     (alt `/etc/dispatch-conf.conf`), `ARCHIVE_DIR=/var/lib/emerge/config-archive`,
@@ -546,6 +547,14 @@ Beyond the two backends, `test_integration.py` also covers:
   `--force-confold` parks an edited conffile as `.dpkg-dist` and silently
   replaces an untouched one. If that were false the whole feature would be
   dead code and every unit test would still pass.
+- **Source builds (`-b` / `-B`)** against a real source package. `build()`
+  had never executed and `resolve_source`/`_src_version`/`_build_use` had no
+  test at all — the same shape as dispatch-conf before its premise was
+  checked. The fixture makes a minimal *native* source package with a
+  hand-written `debian/rules` that produces its `.deb` with `dpkg-deb`
+  directly: no debhelper, which keeps the build near a second and removes a
+  dependency the suite would otherwise need. `apt-get build-dep` runs for
+  real, satisfied by `Build-Depends: dpkg-dev`.
 - **Apt-less operation over real HTTP** — a stdlib server on 127.0.0.1, a
   compressed index (the `.gz`/`.xz` path no `file://` test ever ran), and
   `shutil.which` hiding `apt-get` so `pick_backend` has to choose dpkg on its
@@ -887,6 +896,12 @@ apart and drift silently because nothing enforces the shared contract.
   `emerge -u` quietly stops warning that an upgrade may restart the desktop.
   It has already bitten once (`sddm-greeter-qt6`). Tests enforce it now; add
   new entries in their truncated spelling.
+- **`/proc/PID/comm` is the *parent's* name between fork and exec.**
+  `subprocess.Popen` returns as soon as the fork happens, so a test that
+  reads the child's comm immediately can get `python3` instead of the
+  binary's name. Measured at 3 in 200 — rare enough to look like an
+  unrelated flake and never reproduce on demand. Poll until the value is
+  what you expect, not until it is readable.
 - **Tests that patch `os`, `shutil` or `subprocess` are patching the module
   objects the script itself imports.** Both test modules carry a
   `tearDownModule` sentinel that fails the run if one of those is left
