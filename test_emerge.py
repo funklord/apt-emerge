@@ -591,6 +591,29 @@ class TestMerge3(unittest.TestCase):
 		self.assertIn("a\n", text)
 		self.assertIn("t\n", text)
 
+	def test_an_identical_rewrite_is_taken_once_not_conflicted(self):
+		"""base=[a, c] rewritten to [Y] by both sides. The answer is Y.
+
+		`diff3 -m` reports a conflict here -- with no ancestor section at
+		all -- which is why byte-equality with diff3 is not the contract and
+		is not worth chasing. Three quarters of the measured divergence is
+		this shape."""
+		out, n = em.merge3(L("a", "c"), L("Y"), L("Y"))
+		self.assertEqual((out, n), (L("Y"), 0))
+
+	def test_an_identical_insertion_by_both_sides_appears_once(self):
+		"""The commonest divergent shape on config-like input: both sides
+		add the same line, one side also changes something else."""
+		out, n = em.merge3(L("a", "b", "c"),
+		                   L("new", "a", "b", "c"),
+		                   L("new", "a", "X", "c"))
+		self.assertEqual(n, 0)
+		self.assertEqual(out, L("new", "a", "X", "c"))
+
+	def test_a_deletion_both_sides_made_is_not_a_conflict(self):
+		out, n = em.merge3(L("a", "b", "c"), L("a", "b"), L("b"))
+		self.assertEqual((out, n), (L("b"), 0))
+
 	@unittest.skipUnless(HAVE_DIFF3, "diff3 not available")
 	def test_clean_merges_match_diff3(self):
 		"""merge3 claims diff3 -m equivalence; hold it to that on the cases

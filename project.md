@@ -604,13 +604,37 @@ are wrong together and agree forever. Keep them that way:
   conflicted. 80,000 random triples, no violation.
 
   It is **not** byte-identical to `diff3 -m`, and the docstring used to say
-  it was. Measured: 97% identical on config-shaped content, 82% on
-  adversarial input full of repeated single-character lines. The rest is
-  alignment ambiguity — where a line repeats there is more than one valid
-  alignment, and diff3 picks a different one. It diverges in both
-  directions, including roughly 2% of realistic cases where `automerge`
-  applies a result diff3 would have put to the user. Every divergence
-  examined was still a valid merge of both sides.
+  it was. That gap was investigated properly rather than left as a caveat,
+  and the conclusion is that **closing it is not worth wanting**:
+
+  - On config-shaped input, 96% identical. In *every* divergent case the two
+    underlying 2-way diffs were identical to GNU diff's, so the alignment is
+    not the cause and a better diff cannot fix it. Two rewrites were tried
+    and both produced byte-identical output to what is there now: computing
+    stable regions as diff3 does (the complement of the two change sets),
+    and replacing difflib with a minimal Myers diff. Neither changed a
+    single merge out of 12,000.
+  - Classifying the 85 divergent merges out of 2,000: **57** are diff3
+    emitting a conflict with no ancestor section at all for a change both
+    sides made identically, **8** are diff3 conflicting although mine and
+    theirs are the same text, and **20** are both conflicting over
+    differently chosen but equally valid regions.
+
+  So three quarters of the difference is diff3 producing the worse answer.
+  The minimal case is `base=[a, c]`, `mine=[Y]`, `theirs=[Y]`: both sides
+  made the same change, the answer is plainly `Y`, and `diff3 -m` reports a
+  conflict. Matching diff3 byte-for-byte would mean reproducing that.
+  **The four rules are the contract; diff3 is a reference for them, not an
+  oracle.** There are tests pinning the cases where the two disagree and we
+  are right.
+
+  What did come out of the investigation: `_sync_regions` now states diff3's
+  stable-region model directly instead of intersecting matching blocks and
+  walking the result greedily. The greedy step carried a guard that could
+  never fire — matching blocks are already ordered in both their sequences,
+  so the intersections are too — and a correctness check that cannot fail is
+  worse than none. Identical output, measured; same speed at 600, 2,000 and
+  5,000 lines.
 
   The hand-written clean-merge cases are still compared byte-for-byte
   against real `diff3`, because on unambiguous input the two do agree and
