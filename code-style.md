@@ -142,6 +142,19 @@ Lowercase for everything this project names itself. The program is
 The exception is a name a tool will not accept lowercased: `Makefile`,
 `README.md`, `LICENSE`, and the `debian/` files native packaging dictates.
 
+## ASCII in source
+
+Source and comments are ASCII. Write `--` where prose would use an em dash,
+and "section" for a section sign.
+
+This governs the text the repository writes about itself, not the data the
+software handles. Documentation may use typographic punctuation; so may
+user-facing text in UI software, and anything that genuinely requires
+Unicode.
+
+**This project is excepted** and does not enable the check: it prints status
+ticks, and that output lives in the source as string literals.
+
 ## See also
 
 - **`~/.claude/guidelines/code-style.md`** -- the source this file copies.
