@@ -14,10 +14,12 @@ installed.
 | `emerge.1` | man page, hand-written, cross-checked against `--help` |
 | `test_emerge.py` | unit tests |
 | `test_integration.py` | end-to-end against throwaway roots, real tools |
-| `Makefile` | `check`, `install`, `deb`, `clean`; owns the install list |
+| `Makefile` | `check`, `style`, `install`, `deb`, `clean`; owns the install list |
 | `debian/` | native package; `debian/rules` defers to the Makefile |
 | `README.md` | user-facing front page |
 | `code-style.md` | copy of the global style source, plus this project's own |
+| `tools/style_gate.py` | the shared indentation gate, copied verbatim |
+| `.style-gate.toml` | its scope here; load-bearing, see `code-style.md` |
 | `LICENSE` | GPL-2, verbatim from `/usr/share/common-licenses/GPL-2` |
 | `.github/workflows/tests.yml` | CI: interpreters, Debian, package, stdlib-only |
 | `project.md` | this file |
@@ -659,6 +661,45 @@ are wrong together and agree forever. Keep them that way:
 
 Both skip themselves if the tool is missing, so the suite runs off a Debian box.
 
+## The style gate
+
+`make style` runs `tools/style_gate.py`, the indentation and whitespace
+checker shared verbatim across the private projects (source:
+`~/.claude/tools/style_gate.py` — fix drift, do not edit the copy). It was
+adopted here after the tab conversion, which until then had nothing
+mechanical holding it: `code-style.md` said indentation was a review item.
+The tree passed on the first run, so nothing needed fixing — what needed
+doing was making the check exist and cover the right files.
+
+**The scope is the part that goes wrong, and it did.** The gate selects
+files by suffix or by exact name, and `emerge` has no suffix — it is a
+command, not a module. Out of the box it therefore checked six files and
+reported them clean while never opening the program. `.style-gate.toml`
+names it (and `debian/rules`, which is Makefile syntax under a name dpkg
+chose), taking the list to ten.
+
+Two things about that config are worth knowing before trusting the gate:
+
+- **The tool's collapse floor cannot protect it.** Dropping `emerge` from
+  `indent_names` takes the list from 10 to 9, which is not a collapse — and
+  the floor is configured in the file that stopped being read anyway. So the
+  scope is pinned by `TestStyleGate` instead, which asserts that `emerge`,
+  `Makefile`, `debian/rules` and both test modules are in the gate's list.
+- **`tomllib` is 3.11+, and an older interpreter does not fail.** It prints
+  one line to stderr and then checks a *smaller* set of files successfully:
+  measured at `8 files conform`, exit 0, with `emerge` and `debian/rules`
+  silently outside it. `make style` refuses to run on such an interpreter,
+  and the CI job pins 3.13 rather than trusting the runner's default.
+
+Mutation-tested rather than assumed, all five confirmed by running them: a
+4-space-indented function appended to `emerge` is caught at the line
+(`indented 0 tab(s), structure says 1`), so is one in `test_emerge.py`, so
+is a space-indented line inside an existing block (as a `TabError`), so is
+trailing whitespace in `project.md` — and dropping `emerge` from the config
+is **not**, which is why the test above exists. Note also that
+`make style PYTHON=/bin/false` fails whether or not the guard is there, so
+the test asserting the guard checks the *message*, not the exit status.
+
 ## Packaging
 
 `make deb` builds `$(OBJDIR)/apt-emerge_<version>_all.deb`, where `OBJDIR`
@@ -742,7 +783,7 @@ every local run had reported green:
 
 `.github/workflows/tests.yml`, on every push and pull request (the remote
 carried both `main` and `master` at one point, so it is not branch-pinned).
-Free on GitHub for a suite this size. Four jobs:
+Free on GitHub for a suite this size. Five jobs:
 
 - **`unit`** — both suites on Python 3.9, 3.11 and 3.13, plus a run under
   `-W error::ResourceWarning`, because a leaked file handle otherwise passes
@@ -754,9 +795,13 @@ Free on GitHub for a suite this size. Four jobs:
   caught. Its unit and integration steps are deliberately separate so a
   failure says which half broke without needing the logs — job logs need repo
   admin rights, which a helper may not have.
+- **`style`** — `make style`, on a pinned 3.13. See "The style gate" below
+  for why the interpreter is pinned rather than left to the runner.
 - **`stdlib-only`** — walks the AST for imports outside
   `sys.stdlib_module_names` and fails if a non-test `.py` appears beside
-  `emerge`. This guards hard rule 1.
+  `emerge`. This guards hard rule 1. `tools/` is a subdirectory and so does
+  not trip it, correctly: the gate is development scaffolding and is not
+  installed.
 
 **The first CI run failed three times, and all three were test defects, not
 product bugs** — every one invisible on the development machine. See the

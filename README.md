@@ -41,7 +41,8 @@ The single-file constraint exists so an embedded box can be fixed with one
 a requirement.
 
 Other targets: `make check` runs everything, `make check-unit` runs the fast
-half, `make install` takes the usual `DESTDIR` and `prefix`.
+half, `make style` is the indentation gate, and `make install` takes the
+usual `DESTDIR` and `prefix`.
 
 ## What it does
 

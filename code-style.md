@@ -98,10 +98,41 @@ above on the next save. `pycodestyle` would need W191 disabled.
 
 **Do not run any of them, not even ad hoc on a single file.**
 
-There is no mechanical indent gate in this repository, so indentation is a
-review item here. The sibling project `situ` has `tools/lint_conventions.py`
-for exactly this; adopting it would be a harmonizing change, worth raising
-rather than doing in passing.
+## The gate
+
+What is mechanised instead is a checker: `tools/style_gate.py`, run by `make
+style` and by a CI job of the same name. It is shared verbatim with the
+sibling projects -- fix drift, do not edit the copy -- and it checks
+indentation, trailing whitespace, carriage returns and the final newline.
+Naming and filenames stay review items, as the source says they are.
+
+For Python it asks the stronger of the two available questions. A line rule
+can only ask whether tabs precede spaces; the gate instead converts the file
+with a `tokenize`-driven fixer and compares *tab counts* per line, so a line
+indented to the wrong depth is caught as well. That comparison never
+mentions a tab width -- the conversion above is what a width was needed for,
+and it is over. `tools/style_gate.py fix` writes the conversion, and refuses
+to write one that would change the file's AST.
+
+### `.style-gate.toml`, and why it is load-bearing
+
+The gate decides what to look at by suffix or exact name, and **`emerge` has
+no suffix**. Without the `indent_names` line naming it, the gate walks past
+the entire program and reports the remaining files as a clean tree. That is
+not a hypothetical: dropping the name leaves it printing `9 files conform`,
+exit 0.
+
+The tool's own collapse floor does not catch this, for two reasons worth
+knowing before trusting it: nine files is not a collapse, and the floor is
+configured in the very file that stopped being read. So the invariant is
+pinned by a test instead -- `TestStyleGate` asserts that `emerge`,
+`Makefile`, `debian/rules` and both test modules are in the gate's list.
+
+The config is TOML, read with `tomllib`, which is Python 3.11+. An older
+interpreter does not fail: it prints one line to stderr and then checks a
+smaller set of files *successfully*. `make style` therefore refuses to run
+on one at all, because a green result that quietly meant less is the failure
+this project keeps finding by other names.
 
 ## 3. Filenames
 
@@ -116,5 +147,7 @@ The exception is a name a tool will not accept lowercased: `Makefile`,
 - **`~/.claude/guidelines/code-style.md`** -- the source this file copies.
 - **`project.md`** -- the design and the reasoning. It wins over this file
   where the two disagree.
-- **`../situ/code-style.md`** -- the sibling Python project, which carries
-  the same rules plus the linter this one lacks.
+- **`~/.claude/tools/style_gate.py`** -- the source of `tools/style_gate.py`.
+- **`../situ/code-style.md`** -- the sibling Python project, carrying the
+  same rules. Its `tools/lint_conventions.py` is one of the three checkers
+  the shared gate was merged from.

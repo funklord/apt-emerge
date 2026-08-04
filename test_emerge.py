@@ -2201,6 +2201,69 @@ class TestPackaging(unittest.TestCase):
 				self.assertIn(em.AUTHOR, self.read(name))
 
 
+class TestStyleGate(unittest.TestCase):
+	"""The gate reports what it checked, and it is the file list that goes
+    wrong -- not the rules.
+
+    `tools/style_gate.py` decides scope by suffix or by exact name, and the
+    one file that ships has neither: `emerge` is extensionless because it is
+    a command. `.style-gate.toml` names it, and without that line the gate
+    walks past the whole program and calls the remaining eight files clean.
+    Measured, not feared: dropping `emerge` from `indent_names` leaves the
+    gate reporting `9 files conform`, exit 0, and the tool's own collapse
+    floor cannot see it because 9 is not a collapse -- and because the floor
+    lives in the same file that stopped being read."""
+
+	GATE = os.path.join(HERE, "tools", "style_gate.py")
+
+	# Everything this project writes itself in a language whose indentation
+	# is ours to govern. A file may leave this list when it leaves the tree,
+	# not because the gate stopped noticing it.
+	GOVERNED = ("emerge", "Makefile", "debian/rules",
+	            "test_emerge.py", "test_integration.py")
+
+	def setUp(self):
+		if not os.path.exists(self.GATE):
+			self.skipTest("tools/style_gate.py is not present in this tree")
+
+	@unittest.skipUnless(sys.version_info >= (3, 11),
+	                     "tomllib is 3.11+; the gate cannot read its config "
+	                     "here, which is why `make style` refuses to run on "
+	                     "such an interpreter -- see the test below")
+	def test_the_gate_looks_at_the_file_that_ships(self):
+		proc = subprocess.run(
+		    [sys.executable, self.GATE, "list", "--root", HERE],
+		    capture_output=True, text=True, timeout=120)
+		self.assertEqual(proc.returncode, 0, proc.stderr)
+		listed = {line.split("\t")[0] for line in proc.stdout.splitlines()
+		          if "\t" in line}
+		missing = sorted(set(self.GOVERNED) - listed)
+		self.assertEqual(missing, [],
+		                 f"the style gate does not look at {missing}; check "
+		                 f"indent_names in .style-gate.toml")
+
+	def test_make_style_refuses_an_interpreter_that_cannot_read_the_config(self):
+		"""The guard that makes the skip above harmless.
+
+        An interpreter without tomllib does not fail the gate -- it prints
+        one line to stderr and checks a smaller set of files successfully,
+        which is the failure mode this whole class exists for. `make style`
+        therefore declines to run at all rather than produce a green result
+        that means less than it appears to. /bin/false stands in for such an
+        interpreter: it fails the `import tomllib` probe the same way."""
+		if not shutil.which("make"):
+			self.skipTest("make is not installed")
+		proc = subprocess.run(["make", "style", "PYTHON=/bin/false"],
+		                      cwd=HERE, capture_output=True, text=True,
+		                      timeout=120)
+		self.assertNotEqual(proc.returncode, 0,
+		                    "make style ran the gate on an interpreter that "
+		                    "would have ignored .style-gate.toml")
+		self.assertIn("tomllib", proc.stdout + proc.stderr,
+		              "make style failed, but not with the explanation that "
+		              "says why a green run would have been misleading")
+
+
 class TestPortability(unittest.TestCase):
 	"""emerge is stdlib-only so it can be scp'd onto whatever a target box
     runs, which is not necessarily a current Python. Syntax that only a new

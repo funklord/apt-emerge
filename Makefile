@@ -31,7 +31,7 @@ INSTALL_DATA    = $(INSTALL) -m 644
 # symlink is the whole implementation (see the __main__ block in `emerge`).
 ALIASES = dispatch-conf etc-update
 
-.PHONY: all check check-unit check-integration check-isolation install \
+.PHONY: all check check-unit check-integration check-isolation style install \
         uninstall deb clean version-check help
 
 all:
@@ -46,13 +46,14 @@ help:
 	@echo '  check-isolation'
 	@echo '              both modules in one interpreter, for leaks the'
 	@echo '              per-module sentinel cannot see'
+	@echo '  style       the indentation and whitespace gate'
 	@echo '  install     install into $$(DESTDIR)$$(prefix)'
 	@echo '  deb         build a binary package into dist/'
 	@echo '  clean       remove build products'
 
 # -- tests -------------------------------------------------------------------
 
-check: version-check check-unit check-integration check-isolation
+check: style version-check check-unit check-integration check-isolation
 
 check-unit:
 	$(PYTHON) -m unittest test_emerge
@@ -76,6 +77,26 @@ check-isolation:
 # anywhere -- including inside a package build.
 check-integration:
 	$(PYTHON) -m unittest test_integration
+
+# The indentation and whitespace gate, shared verbatim with the sibling
+# projects. Its scope here comes from .style-gate.toml, because `emerge` has
+# no suffix and the gate would otherwise not look at the one file that ships.
+#
+# Hence the interpreter guard. The config is TOML, the tool reads it with
+# tomllib, and on Python 3.10 or older it prints one line to stderr and
+# carries on with its defaults -- which drops `emerge` and `debian/rules`
+# from the file list and then reports the remaining eight as conforming,
+# exit 0. That is a check that has quietly stopped checking, and the floor
+# cannot catch it because the floor is in the file that was ignored. Refuse
+# to run instead.
+style:
+	@$(PYTHON) -c 'import tomllib' 2>/dev/null || { \
+		echo "style: $(PYTHON) predates tomllib (3.11), so .style-gate.toml"; \
+		echo "       would be ignored and the gate would silently stop"; \
+		echo "       checking emerge itself. Try: make style PYTHON=python3.13"; \
+		exit 1; \
+	}
+	$(PYTHON) tools/style_gate.py check
 
 # The Portage-dialect version the program reports and the Debian package
 # version are two different things, and both are hand-written. This stops

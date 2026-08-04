@@ -1,0 +1,781 @@
+#!/usr/bin/env python3
+"""The indentation and whitespace gate for private projects.
+
+One tool, merged from three that had grown apart:
+
+  fuzzypickles/tools/tabify.py    the C/C++ fixer (brace-nesting lexer)
+  beerssh/tools/tabify.py         a copy of it, drifted in the docstring only
+  */tools/check-indent.sh         file enumeration plus the collapse floor
+  situ/tools/lint_conventions.py  the checker: ASCII, tabs, trailing space,
+                                  final newline, with a tokenize-based
+                                  exemption for Python string literals
+
+The two tabify.py copies were byte-identical in code and differed only in
+their docstrings, which is the cheap kind of drift. The two check-indent.sh
+copies had genuinely diverged -- different discovery, different scope,
+different floor -- and both were right for their own tree, which is why
+those differences are configuration here rather than a winner.
+
+A fourth capability existed in none of them: fixing Python. tabify.py's
+lexer counts braces and cannot see a Python block, so apt-emerge's
+conversion was done by a throwaway script. That approach is folded in.
+
+Every fixer carries a proof rather than a promise:
+
+  C/C++   expanding leading tabs back to `indent_width` columns must give
+          the original file. Only leading whitespace is ever rewritten.
+  Python  the AST must be identical before and after. ast.dump() without
+          attributes is position-free but carries every string constant,
+          so an identical dump means no block and no literal moved.
+
+A fixer that cannot prove its own edit refuses to write it.
+
+Usage:
+    style_gate.py check [--root DIR] [PATH...]
+    style_gate.py fix   [--root DIR] PATH...
+    style_gate.py list  [--root DIR]      # what would be checked, and why
+
+Configuration is `.style-gate.toml` at the project root; every key is
+optional. See DEFAULTS below for the meaning and the shipped values.
+"""
+from __future__ import annotations
+
+import ast
+import io
+import re
+import subprocess
+import sys
+import tokenize
+from pathlib import Path
+
+try:
+	import tomllib
+except ModuleNotFoundError:		# pragma: no cover - 3.10 and older
+	tomllib = None
+
+DEFAULTS = {
+	# A MIGRATION parameter, not a style setting. It is how many columns a
+	# level occupied in a space-indented file that is being converted, and it
+	# is read only while converting one. Once a file is tab-indented no width
+	# applies to it ever again: the tab carries the level, spaces carry
+	# alignment measured from the content, and the viewer decides how wide a
+	# tab looks. Checking never uses this value.
+	"indent_width": 4,
+
+	# Minimum plausible file count. Below it the gate fails loudly instead
+	# of passing. A gate that has quietly stopped matching anything reads
+	# exactly like a clean tree -- see the note on collapse() below.
+	"floor": 1,
+
+	# ASCII-only content. Off by default: two projects require it, one
+	# explicitly exempts Markdown, and it is not yet a global rule.
+	"ascii_only": False,
+	"ascii_exclude_markdown": True,
+
+
+	# Scope. Empty include means the whole repository.
+	"include": [],
+	"exclude": ["attic", "third_party", "vendor", "build", "target"],
+
+	# Files whose indentation is ours to govern.
+	"indent_suffixes": [".c", ".h", ".cpp", ".hpp", ".cc", ".hh", ".py",
+	                    ".rs", ".situ", ".ebnf", ".lua"],
+	"indent_names": ["Makefile"],
+
+	# Files that get the text checks (trailing space, final newline, and
+	# ASCII when enabled) but not necessarily the tab rule.
+	"text_suffixes": [".md", ".json", ".toml", ".cfg", ".map"],
+}
+
+SKIP_DIR_NAMES = frozenset({"__pycache__", ".git"})
+
+
+# ---------------------------------------------------------------- config
+
+def load_config(root: Path) -> dict:
+	cfg = dict(DEFAULTS)
+	path = root / ".style-gate.toml"
+	if not path.is_file():
+		return cfg
+	if tomllib is None:
+		print(f"style-gate: {path} ignored (needs Python 3.11+)", file=sys.stderr)
+		return cfg
+	with path.open("rb") as handle:
+		loaded = tomllib.load(handle)
+	unknown = set(loaded) - set(DEFAULTS)
+	if unknown:
+		# A misspelt key that is silently ignored is a gate that quietly
+		# stops enforcing whatever the key was meant to turn on.
+		print(f"style-gate: {path}: unknown key(s): {', '.join(sorted(unknown))}",
+		      file=sys.stderr)
+		raise SystemExit(2)
+	cfg.update(loaded)
+	return cfg
+
+
+# ------------------------------------------------------------ discovery
+
+def in_git_repo(root: Path) -> bool:
+	try:
+		out = subprocess.run(["git", "-C", str(root), "rev-parse",
+		                      "--is-inside-work-tree"],
+		                     capture_output=True, text=True, check=False)
+		return out.returncode == 0 and out.stdout.strip() == "true"
+	except OSError:
+		return False
+
+
+def discover(root: Path, cfg: dict) -> list[Path]:
+	"""Every file this project owns, git-preferred with a plain-walk fallback.
+
+	git is preferred because `--cached --others --exclude-standard` gets two
+	things right that a walk cannot: ignored build output and vendored
+	submodule content drop out on their own, and a NEW file is listed before
+	it has been committed. Scoping a pre-commit gate to tracked files only is
+	backwards, and did once let a non-conformant new file through.
+
+	The fallback exists so the tool works in a tree that is not a repo yet.
+	"""
+	if in_git_repo(root):
+		out = subprocess.run(
+			["git", "-C", str(root), "ls-files", "--cached", "--others",
+			 "--exclude-standard"],
+			capture_output=True, text=True, check=False)
+		names = [line for line in out.stdout.splitlines() if line]
+		paths = [root / n for n in names]
+	else:
+		paths = [p for p in root.rglob("*") if p.is_file()]
+
+	include = [str(i).strip("/") for i in cfg["include"]]
+	exclude = {str(e).strip("/") for e in cfg["exclude"]}
+	kept = []
+	for path in paths:
+		if not path.is_file():
+			continue
+		try:
+			rel = path.relative_to(root)
+		except ValueError:
+			continue
+		parts = rel.parts
+		if any(p in SKIP_DIR_NAMES or p in exclude for p in parts):
+			continue
+		if include and not any(rel.as_posix() == i or rel.as_posix().startswith(i + "/")
+		                       for i in include):
+			continue
+		if wants_text(path, cfg) or wants_indent(path, cfg):
+			kept.append(path)
+	return sorted(set(kept))
+
+
+def wants_indent(path: Path, cfg: dict) -> bool:
+	return path.suffix in set(cfg["indent_suffixes"]) or path.name in set(cfg["indent_names"])
+
+
+def wants_text(path: Path, cfg: dict) -> bool:
+	return wants_indent(path, cfg) or path.suffix in set(cfg["text_suffixes"])
+
+
+def collapse(count: int, cfg: dict) -> bool:
+	"""True if the file list has plausibly collapsed rather than come back clean.
+
+	"Found nothing" cannot mean "there is nothing to check" in a tree with
+	sources -- it can only mean the pathspec, the glob or the git call stopped
+	matching. Reported as success that is the worst outcome available: a gate
+	that has stopped looking is indistinguishable from a clean tree and stays
+	that way until somebody thinks to doubt it.
+
+	The floor is deliberately below the real count. It catches a list that has
+	collapsed; it is not there to police a number, so it does not need raising
+	every time a file is added.
+	"""
+	return count < int(cfg["floor"])
+
+
+# -------------------------------------------------------------- lexing
+
+_CASE_LABEL = re.compile(r"(?:case\b|default\s*:)")
+
+# Identifier runs that turn a following `"` into a C++ raw string literal.
+RAW_PREFIXES = frozenset({"R", "LR", "uR", "UR", "u8R"})
+
+# Control keywords whose parenthesised head may be followed by a single
+# statement instead of a block. Their bodies are a real indent level that no
+# brace records, so a brace-counting lexer places them one level too shallow
+# and then reports correct code as wrong. Braceless bodies are permitted and
+# sometimes preferable, so the lexer models them rather than the style being
+# bent to suit the lexer.
+CTRL_HEADS = frozenset({"if", "for", "while"})
+
+
+def split_leading_ws(line: str, width: int) -> tuple[int, str]:
+	"""(visual column of first non-ws char, remainder). Tabs expand at width."""
+	col = 0
+	i = 0
+	for ch in line:
+		if ch == " ":
+			col += 1
+		elif ch == "\t":
+			col += width - (col % width)
+		else:
+			break
+		i += 1
+	return col, line[i:]
+
+
+def leading_whitespace(line: str) -> str:
+	return line[: len(line) - len(line.lstrip(" \t"))]
+
+
+def is_comment_continuation(line: str) -> bool:
+	"""A C block-comment body line, whose leading space aligns the asterisk."""
+	return line.lstrip().startswith("*")
+
+
+C_SUFFIXES = frozenset({".c", ".h", ".cpp", ".hpp", ".cc", ".hh"})
+
+
+def has_fixer(path: Path) -> bool:
+	"""True where a depth-aware converter exists, making the line rule redundant."""
+	return is_python(path) or path.suffix in C_SUFFIXES
+
+
+def is_python(path: Path) -> bool:
+	"""Python by suffix, or by shebang for a command that has no suffix."""
+	if path.suffix == ".py":
+		return True
+	try:
+		with path.open("rb") as handle:
+			first = handle.readline(64)
+	except OSError:
+		return False
+	return first.startswith(b"#!") and b"python" in first
+
+
+def python_literal_lines(text: str) -> frozenset[int]:
+	"""Rows inside multi-line Python string literals.
+
+	Their leading whitespace is content, not indentation: a golden diagnostic
+	text with a space gutter must survive the tab rule untouched.
+	"""
+	covered: set[int] = set()
+	try:
+		for token in tokenize.generate_tokens(io.StringIO(text).readline):
+			if token.type == tokenize.STRING and token.end[0] > token.start[0]:
+				covered.update(range(token.start[0] + 1, token.end[0] + 1))
+	except (tokenize.TokenError, SyntaxError, IndentationError):
+		# A file that does not tokenise has a real error somebody else will
+		# report. Do not also fail it on indentation.
+		return frozenset()
+	return frozenset(covered)
+
+
+# --------------------------------------------------------------- checks
+
+class Problem:
+	def __init__(self, path, line: int, col: int, message: str) -> None:
+		self.path    = path
+		self.line    = line
+		self.col     = col
+		self.message = message
+
+	def __str__(self) -> str:
+		return f"{self.path}:{self.line}:{self.col}: {self.message}"
+
+
+def check_text(text: str, where, indent: bool = True,
+               skip: frozenset[int] = frozenset()) -> list[Problem]:
+	"""The line rules, against text that need not be a file on disk.
+
+	Split out because code a compiler *emits* is governed by nobody: it lands
+	in a build directory the gate skips, and before that it lives inside the
+	emitter's own string literals, which the literal exemption deliberately
+	excludes. One rule, two callers -- the file checker, and a test that runs
+	it over generated output.
+	"""
+	problems: list[Problem] = []
+	previous = ""
+	for number, line in enumerate(text.splitlines(), start=1):
+		# A backslash-continued line's leading whitespace is alignment under
+		# whatever it continues, not indentation -- a Makefile variable list
+		# aligned under its first entry sits at depth 0 and correctly carries
+		# no tab. Without a parser the column-only rule cannot tell the two
+		# apart, and this is the case that actually occurs.
+		continuation = previous.rstrip().endswith("\\")
+		previous = line
+
+		if line != line.rstrip():
+			problems.append(Problem(where, number, len(line.rstrip()) + 1,
+			                        "trailing whitespace"))
+		if "\r" in line:
+			problems.append(Problem(where, number, line.index("\r") + 1,
+			                        "carriage return"))
+
+		if not indent or number in skip or continuation or is_comment_continuation(line):
+			continue
+
+		lead = leading_whitespace(line)
+		# Tabs carry the indent level and spaces carry alignment within it,
+		# so a space may follow a tab but never precede one.
+		if " " in lead and "\t" in lead[lead.index(" "):]:
+			problems.append(Problem(where, number, lead.index(" ") + 1,
+			                        "space before tab in indent"))
+		elif lead.startswith(" ") and line.strip():
+			problems.append(Problem(where, number, 1,
+			                        "space-indented line; use tabs"))
+	return problems
+
+
+def check_file(path: Path, root: Path, cfg: dict) -> list[Problem]:
+	rel      = path.relative_to(root)
+	problems = []
+	raw      = path.read_bytes()
+
+	if cfg["ascii_only"] and not (cfg["ascii_exclude_markdown"] and path.suffix == ".md"):
+		try:
+			raw.decode("ascii")
+		except UnicodeDecodeError as exc:
+			offset  = exc.start
+			line_no = raw.count(b"\n", 0, offset) + 1
+			col_no  = offset - (raw.rfind(b"\n", 0, offset) + 1) + 1
+			problems.append(Problem(rel, line_no, col_no,
+			                        f"non-ASCII byte 0x{raw[offset]:02x}"))
+			return problems
+
+	text = raw.decode("utf-8", errors="replace")
+	if raw and not raw.endswith(b"\n"):
+		problems.append(Problem(rel, raw.count(b"\n") + 1, 1,
+		                        "no newline at end of file"))
+
+	# The line rule cannot see structural depth, and a continuation line at
+	# depth 0 -- a signature wrapped under its own open paren at module level
+	# -- correctly carries NO tab, only alignment spaces. Flagging those is
+	# wrong, and inherited from the checker this tool merges: apt-emerge alone
+	# has 219 such lines. Where a fixer exists it knows the real depth, so the
+	# fixpoint check below is both authoritative and depth-aware, and the
+	# heuristic is redundant. Keep the heuristic only for the languages that
+	# have no fixer, where something is better than nothing.
+	skip = python_literal_lines(text) if is_python(path) else frozenset()
+	tab_rules = wants_indent(path, cfg) and not has_fixer(path)
+	problems.extend(check_text(text, rel, tab_rules, skip))
+
+	# Where a fixer exists, "tabs-then-spaces" is the weaker of two possible
+	# questions. The C fixer also knows what LEVEL each line belongs at, so a
+	# file can satisfy the line rule and still be indented to the wrong depth
+	# -- which the old tabify.py --check caught and a pure line check does
+	# not. Migrating to this tool without asking the stronger question would
+	# have quietly weakened two projects' gates, which is the exact failure
+	# the floor above exists to prevent, arriving by a different door.
+	if wants_indent(path, cfg) and has_fixer(path):
+		fixed, error = fixed_text(path, text, cfg)
+		if error:
+			problems.append(Problem(rel, 1, 1, error))
+		else:
+			# The rule, stated without reference to any tab width: the number
+			# of leading TABS must equal the structural depth. How many
+			# spaces follow is alignment and is nobody's business -- it is
+			# measured from where the content starts, so it holds at every
+			# width. That is the whole point of tabs-for-structure, and it is
+			# why this check compares tab counts rather than whole lines:
+			# comparing lines asks "is this what the converter would emit",
+			# which needs a width to answer and so contradicts the rule it is
+			# trying to enforce.
+			for n, (was, now) in enumerate(zip(text.splitlines(),
+			                                   fixed.splitlines()), start=1):
+				if n in skip or is_comment_continuation(was):
+					continue
+				want = len(now) - len(now.lstrip("\t"))
+				have = len(was) - len(was.lstrip("\t"))
+				if have != want:
+					problems.append(Problem(rel, n, 1,
+						f"indented {have} tab(s), structure says {want}"))
+	return problems
+
+
+# --------------------------------------------------------------- fixers
+
+def convert_c(text: str, width: int) -> str:
+	"""Rewrite leading whitespace in C/C++ so indent is tabs, alignment spaces.
+
+	Structural indent = level * width columns -> level tabs; columns beyond
+	that are alignment -> spaces. `level` is brace-nesting depth plus one for
+	a switch's case/default body, since C labels open no brace but their
+	bodies sit a level deeper. Braces inside strings, char literals, comments
+	and preprocessor lines are not counted.
+	"""
+	lines = text.split("\n")
+	out = []
+	stack = []			# one [is_switch, in_case] per open brace
+	state = "normal"		# normal | block_comment | string | char | raw
+	pp_cont = False			# inside a backslash-continued directive
+	pending_switch = False		# saw `switch`, awaiting its `{`
+	ident = ""
+	raw_end = ""			# the `)delim"` that closes an open raw string
+	paren = 0			# ( ) depth, to find where a control head ends
+	head_paren = None		# paren depth a control head is unwinding to
+	virtual = 0			# open braceless bodies: real levels, no braces
+	await_body = False		# an `else`/`do` whose body shape is not yet known
+	stmt_level = 0			# level of the line the current statement began on
+
+	def case_extra(frames):
+		return sum(1 for f in frames if f[0] and f[1])
+
+	for line in lines:
+		state_at_start = state
+		lead_cols, rest = split_leading_ws(line, width)
+
+		# An `else` or `do` at the end of the previous line leaves the shape
+		# of its body unknown until this line starts. Resolve it here, before
+		# the level is computed: a `{` means the brace owns the level, and
+		# anything else means this line is the body and takes it.
+		if state_at_start == "normal" and await_body and rest[:1] not in ("{", ""):
+			virtual += 1
+			await_body = False
+
+		if rest == "":
+			new = line			# blank: no churn
+		elif state_at_start in ("string", "raw"):
+			new = line			# inside a literal: content
+		elif state_at_start == "normal" and not pp_cont and rest[0] == "#":
+			new = line			# preprocessor directive
+		else:
+			top_is_switch = bool(stack) and stack[-1][0]
+			is_close = state_at_start == "normal" and rest[0] == "}"
+			is_open = state_at_start == "normal" and rest[0] == "{"
+			is_label = (state_at_start == "normal" and top_is_switch
+			            and _CASE_LABEL.match(rest) is not None)
+			if is_close:
+				frames = stack[:-1]
+				level = len(stack) - 1 + case_extra(frames)
+			elif is_label:
+				frames = stack[:-1]
+				level = len(stack) + case_extra(frames)
+			else:
+				frames = stack
+				level = len(stack) + case_extra(frames)
+			# A braceless body is one real level per open construct. A brace
+			# on its own line belongs to the construct that opened it, not to
+			# the body it is about to start, so it does not take that level.
+			level += virtual - (1 if is_open and virtual else 0)
+			level = max(level, 0)
+
+			# A line that opens inside unclosed parens continues a statement
+			# begun earlier, and its alignment is measured from where THAT
+			# line's content starts -- so it takes that line's tab count, not
+			# its own abstract depth. The two differ for a braceless body
+			# written on the same line as its head: `if (x) f(a,` puts the
+			# statement at the head's indentation while its depth is one
+			# deeper, and using the depth would break the alignment at every
+			# tab width except the one it was computed for.
+			base_paren = stack[-1][2] if stack else 0
+			if paren > base_paren:
+				level = stmt_level
+			else:
+				stmt_level = level
+			if lead_cols >= width * level:
+				new = "\t" * level + " " * (lead_cols - width * level) + rest
+			else:
+				new = "\t" * (lead_cols // width) + " " * (lead_cols % width) + rest
+			if is_label:
+				stack[-1][1] = True
+
+		out.append(new)
+
+		counting = not (pp_cont or (state_at_start == "normal" and rest[:1] == "#"))
+		i, n = 0, len(line)
+		while i < n:
+			c = line[i]
+			if state == "raw":
+				# A raw string ends only at `)delim"`. Nothing inside it is
+				# code: hydra embeds whole JavaScript programs this way, and
+				# a lexer that walks in reads their braces as C++ nesting and
+				# their indentation as ours. That produced 775 findings in
+				# four files, none of them real.
+				at = line.find(raw_end, i)
+				if at < 0:
+					break			# rest of the line is raw content
+				i = at + len(raw_end)
+				state = "normal"
+				raw_end = ""
+				continue
+			if state == "normal":
+				if c.isalnum() or c == "_":
+					ident += c
+					i += 1
+					continue
+				if counting and ident == "switch":
+					pending_switch = True
+				was_ident = ident
+				ident = ""
+				if counting and was_ident:
+					if await_body:
+						# `else if` -- the `if` owns the body, and must clear
+						# the pending state or the next identifier inside its
+						# own condition is mistaken for a braceless body.
+						await_body = False
+						if was_ident != "if":
+							# `else`/`do` followed by a statement rather than
+							# a block: that statement is the body.
+							virtual += 1
+					if was_ident in CTRL_HEADS:
+						head_paren = paren	# body begins when this unwinds
+					elif was_ident in ("else", "do"):
+						await_body = True
+				if c == "/" and i + 1 < n and line[i + 1] == "/":
+					break
+				if c == "/" and i + 1 < n and line[i + 1] == "*":
+					state = "block_comment"
+					i += 2
+					continue
+				if c == '"' and was_ident in RAW_PREFIXES:
+					# R"delim( ... )delim" -- delim is up to 16 chars and may
+					# not contain a paren, backslash or space.
+					open_paren = line.find("(", i + 1)
+					if open_paren >= 0:
+						delim = line[i + 1:open_paren]
+						if len(delim) <= 16 and not any(
+								ch in delim for ch in "()\\ \t"):
+							raw_end = ")" + delim + '"'
+							state = "raw"
+							i = open_paren + 1
+							continue
+					state = "string"	# not actually a raw string
+				elif c == '"':
+					state = "string"
+				elif c == "'":
+					state = "char"
+				elif counting and c == "(":
+					paren += 1
+				elif counting and c == ")":
+					paren -= 1
+					if head_paren is not None and paren <= head_paren:
+						# the head is complete; whatever follows is its body
+						virtual += 1
+						head_paren = None
+				elif counting and c == "{":
+					# The brace takes the level the braceless body would have
+					# had, rather than adding a second one on top of it.
+					if virtual:
+						virtual -= 1
+					await_body = False
+					# Remember the paren depth this block opened at. A C++
+					# lambda passed as an argument -- `connect(x, [this] {`
+					# -- runs its whole body at paren depth 1, so a statement
+					# inside it ends at a `;` seen at THAT depth, not at zero.
+					# Testing against zero leaves every braceless body opened
+					# inside a lambda unclosed for the rest of the file.
+					stack.append([pending_switch, False, paren])
+					pending_switch = False
+				elif counting and c == "}":
+					if stack:
+						stack.pop()
+					virtual = 0
+					await_body = False
+				elif counting and c == ";" and paren == (stack[-1][2] if stack else 0):
+					# End of a statement closes every braceless body that was
+					# waiting on it -- `if (a) if (b) x;` opened two.
+					pending_switch = False
+					virtual = 0
+					await_body = False
+				i += 1
+			elif state == "block_comment":
+				if c == "*" and i + 1 < n and line[i + 1] == "/":
+					state = "normal"
+					i += 2
+					continue
+				i += 1
+			else:
+				if c == "\\":
+					i += 2
+					continue
+				if (state == "string" and c == '"') or (state == "char" and c == "'"):
+					state = "normal"
+				i += 1
+
+		# An identifier ending the line is never resolved by the scanner
+		# above, which only closes one when it meets a non-identifier
+		# character. `else` and `do` on a line of their own are exactly that
+		# shape, and so is a `switch` whose `(` is on the next line.
+		if state == "normal" and counting:
+			if ident == "switch":
+				pending_switch = True
+			elif ident in CTRL_HEADS:
+				head_paren = paren
+			elif ident in ("else", "do"):
+				await_body = True
+		ident = ""
+		if state in ("string", "char") and not line.endswith("\\"):
+			state = "normal"
+		if pp_cont or (state_at_start == "normal" and rest[:1] == "#"):
+			pp_cont = line.endswith("\\")
+		else:
+			pp_cont = False
+
+	return "\n".join(out)
+
+
+def convert_python(text: str, width: int) -> str:
+	"""Rewrite leading whitespace in Python, structurally rather than by division.
+
+	A line's depth comes from tokenize's INDENT/DEDENT stack, not from its
+	column. That distinction is the whole job: a continuation line aligned
+	under an open paren sits at a column that is not a multiple of `width`,
+	and dividing its leading whitespace would turn alignment into indentation
+	and destroy it. Rows inside multi-line strings are content and are never
+	touched; a comment-only line has no structural meaning, so its own column
+	decides.
+	"""
+	row_depth: dict[int, int] = {}
+	protected: set[int] = set()
+	depth = 0
+	for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+		if tok.type == tokenize.INDENT:
+			depth += 1
+		elif tok.type == tokenize.DEDENT:
+			depth -= 1
+		elif tok.type in (tokenize.NL, tokenize.NEWLINE,
+		                  tokenize.COMMENT, tokenize.ENDMARKER):
+			continue
+		elif tok.type == tokenize.STRING and tok.end[0] > tok.start[0]:
+			protected.update(range(tok.start[0] + 1, tok.end[0] + 1))
+			row_depth.setdefault(tok.start[0], depth)
+		else:
+			for r in range(tok.start[0], tok.end[0] + 1):
+				row_depth.setdefault(r, depth)
+
+	out = []
+	for row, line in enumerate(text.splitlines(keepends=True), 1):
+		body = line.lstrip(" ")
+		col = len(line) - len(body)
+		if row in protected or not body.strip() or col == 0:
+			out.append(line)
+			continue
+		if row in row_depth:
+			d = row_depth[row]
+			pad = " " * max(0, col - width * d)
+		else:
+			d, pad = col // width, " " * (col % width)
+		out.append("\t" * d + pad + body)
+	return "".join(out)
+
+
+def expand(text: str, width: int) -> str:
+	"""Leading tabs back to spaces, for content comparison."""
+	out = []
+	for line in text.split("\n"):
+		cols, rest = split_leading_ws(line, width)
+		out.append(" " * cols + rest if rest != "" else line)
+	return "\n".join(out)
+
+
+def fixed_text(path: Path, src: str, cfg: dict) -> tuple[str, str | None]:
+	"""What the fixer would produce, with its proof checked. -> (text, error)."""
+	width = int(cfg["indent_width"])
+	if is_python(path):
+		try:
+			dst = convert_python(src, width)
+		except (tokenize.TokenError, SyntaxError, IndentationError) as exc:
+			return src, f"does not tokenise ({exc.__class__.__name__})"
+		try:
+			if ast.dump(ast.parse(src)) != ast.dump(ast.parse(dst)):
+				return src, "AST would change (tool bug)"
+		except SyntaxError as exc:
+			return src, f"does not parse ({exc})"
+		return dst, None
+	if path.suffix in C_SUFFIXES:
+		dst = convert_c(src, width)
+		if expand(dst, width) != expand(src, width):
+			return src, "conversion would change content (tool bug)"
+		return dst, None
+	return src, None
+
+
+def fix_file(path: Path, cfg: dict, write: bool) -> tuple[bool, str | None]:
+	"""-> (changed, error). Refuses to write an edit it cannot prove."""
+	src = path.read_text(encoding="utf-8", errors="surrogateescape")
+	if not has_fixer(path):
+		return False, "no fixer for this file type; check only"
+
+	dst, error = fixed_text(path, src, cfg)
+	if error:
+		return False, f"{error} -- not written"
+
+	if dst == src:
+		return False, None
+	if write:
+		path.write_text(dst, encoding="utf-8", errors="surrogateescape")
+	return True, None
+
+
+# ----------------------------------------------------------------- main
+
+def resolve(argv: list[str]) -> tuple[str, Path, list[Path]]:
+	mode = argv[0] if argv else "check"
+	if mode not in ("check", "fix", "list"):
+		print(__doc__, file=sys.stderr)
+		raise SystemExit(2)
+	rest = argv[1:]
+	root = Path.cwd()
+	paths = []
+	i = 0
+	while i < len(rest):
+		if rest[i] == "--root":
+			root = Path(rest[i + 1]).resolve()
+			i += 2
+			continue
+		if rest[i] in ("-h", "--help"):
+			print(__doc__)
+			raise SystemExit(0)
+		paths.append(Path(rest[i]).resolve())
+		i += 1
+	return mode, root, paths
+
+
+def main(argv: list[str]) -> int:
+	mode, root, explicit = resolve(argv)
+	cfg = load_config(root)
+	files = explicit or discover(root, cfg)
+
+	if mode == "list":
+		for f in files:
+			kind = "indent+text" if wants_indent(f, cfg) else "text"
+			print(f"{f.relative_to(root)}\t{kind}")
+		print(f"\n{len(files)} file(s); floor is {cfg['floor']}", file=sys.stderr)
+		return 0
+
+	if not explicit and collapse(len(files), cfg):
+		print(f"style-gate: found {len(files)} files, expected at least "
+		      f"{cfg['floor']} --", file=sys.stderr)
+		print("style-gate:   this reads as a clean tree but is a collapsed "
+		      "file list.", file=sys.stderr)
+		print("style-gate:   check include/exclude in .style-gate.toml, or "
+		      "run `list`.", file=sys.stderr)
+		return 2
+
+	if mode == "fix":
+		rc = 0
+		for path in files:
+			if not wants_indent(path, cfg):
+				continue
+			changed, error = fix_file(path, cfg, write=True)
+			if error and "no fixer" not in error:
+				print(f"style-gate: {path}: {error}", file=sys.stderr)
+				rc = 2
+			elif changed:
+				print(f"fixed {path.relative_to(root)}")
+		return rc
+
+	problems = []
+	for path in files:
+		problems.extend(check_file(path, root, cfg))
+	for problem in problems:
+		print(problem, file=sys.stderr)
+	if problems:
+		print(f"\n{len(problems)} convention violation(s) in {len(files)} file(s)",
+		      file=sys.stderr)
+		return 1
+	print(f"style-gate: {len(files)} files conform")
+	return 0
+
+
+if __name__ == "__main__":
+	raise SystemExit(main(sys.argv[1:]))

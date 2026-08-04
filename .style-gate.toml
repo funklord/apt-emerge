@@ -1,0 +1,26 @@
+# Configuration for tools/style_gate.py -- see code-style.md.
+#
+# Nothing here changes the rules. It says which files in *this* tree the
+# rules apply to, and the answer is unusual enough to need saying: the only
+# file that ships has no suffix.
+
+# The gate decides scope by suffix or by exact name, and `emerge` is
+# extensionless by design -- it is a command, not a module (hard rule 1: one
+# file you can scp and open in vi). Without this line the shipped program is
+# the one file the gate does not look at, and it reports the other six as a
+# clean tree. `debian/rules` is Makefile syntax under a name of dpkg's
+# choosing, so it needs naming for the same reason.
+indent_names = ["Makefile", "emerge", "rules"]
+
+# Below this the gate fails instead of passing, because "found nothing" in a
+# tree with sources means the file list collapsed, not that the tree is
+# clean. Ten files match today; eight is under the real count deliberately,
+# so adding a document does not require touching this, while losing `emerge`
+# or either test module does.
+floor = 8
+
+# The defaults, restated because a table replaces rather than extends them.
+# `dist` is ours: git discovery already drops it as ignored, but the gate
+# falls back to a plain walk in a tree with no .git -- which is exactly how
+# the container CI recipe runs.
+exclude = ["attic", "third_party", "vendor", "build", "target", "dist"]
