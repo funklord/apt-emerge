@@ -4,18 +4,26 @@ A Gentoo Portage–flavoured package manager for Debian/Ubuntu, implemented as a
 single stdlib-only Python 3 script. It speaks emerge's CLI dialect and paints
 Portage-style output, but drives real Debian tooling underneath.
 
-The shipped artifact is still one file, `emerge` (~3600 lines). Everything
-else in the repository is development scaffolding and is not installed:
+The shipped artifact is one file, `emerge`. Everything else is development
+scaffolding or packaging; only `emerge`, its man page and the docs are
+installed.
 
 | file | |
 |---|---|
-| `emerge` | the whole program; the only thing that ships |
-| `test_emerge.py` | unit tests (~3200 lines) |
-| `test_integration.py` | end-to-end tests against throwaway roots |
+| `emerge` | the whole program; the only code that ships |
+| `emerge.1` | man page, hand-written, cross-checked against `--help` |
+| `test_emerge.py` | unit tests |
+| `test_integration.py` | end-to-end against throwaway roots, real tools |
+| `Makefile` | `check`, `install`, `deb`, `clean`; owns the install list |
+| `debian/` | native package; `debian/rules` defers to the Makefile |
 | `README.md` | user-facing front page |
+| `code-style.md` | copy of the global style source, plus this project's own |
 | `LICENSE` | GPL-2, verbatim from `/usr/share/common-licenses/GPL-2` |
-| `.github/workflows/tests.yml` | CI |
+| `.github/workflows/tests.yml` | CI: interpreters, Debian, package, stdlib-only |
 | `project.md` | this file |
+
+No line counts here on purpose — every one written down has gone stale,
+twice within a single session. `wc -l` is right there.
 
 Both test files load `emerge` **by path** rather than importing it, so the
 single-file rule survives having tests at all.
@@ -459,10 +467,18 @@ are all refused.
 
 ---
 
-## Testing notes / what needs a real box
+## What needed a real box, and what only looked like it did
 
-Chat-side testing used synthetic `Packages` trees under `TREE_DIR` and mocked
-`apt-cache` output. What genuinely needs Claude Code + a real system:
+This began as a list of things deferred until hardware was available. Most
+of them turned out not to need any, which is the lesson worth keeping:
+**before deferring something as hardware-only, work out what the program
+actually distinguishes.** "apt-less" is `shutil.which("apt-get")` returning
+None. A conffile upgrade is two `.debs` and a throwaway root. Running as
+root is a container. Three items came off this list that way, and one of
+those found four live defects on the day it was tried.
+
+What is left genuinely is the hardware: a box that really has no apt, and a
+GNOME session. The record:
 
 - ~~**Real multi-version repos.**~~ Done: validated against a live trixie
   mirror with `-updates`/`-security` pockets. The `libsdl3-dev` deb13u1 wall
@@ -502,8 +518,9 @@ Always `python3 -m py_compile emerge` after edits.
 
 ## The test suite
 
-`make check` runs everything: 388 unit tests and 33 end-to-end ones, stdlib
-only. The unit half is a few seconds. The integration half is dominated by one
+`make check` runs everything, stdlib only — a few hundred unit tests and a
+few dozen end-to-end ones. (No count here: the last one written down went
+stale inside a single session.) The unit half is a few seconds. The integration half is dominated by one
 test that drives a real `apt-get`, and its wall time swings hard with system
 load — measured between 14s and 115s for the same suite on the same machine,
 so treat a slow run as load rather than a hang. `make check-unit` is the fast
@@ -953,6 +970,42 @@ carrying the bug.**)
 **When touching one backend, check the other.** They were written months
 apart and drift silently because nothing enforces the shared contract.
 
+## A green check is not evidence until you know what it checked
+
+The parity lesson above came from diffing two implementations. This one came
+from auditing the *checks*, and it caught more. Every item below reported
+success while testing nothing, and none of them looked wrong:
+
+- **A skipped test is as green as a passing one.** CI installed `gpgv` but
+  not `gpg`, so the eleven tests covering the dpkg backend's whole trust
+  anchor never ran there — written, passing locally, silently absent where
+  it mattered. `EMERGE_TESTS_REQUIRE_ALL=1` now turns a missing capability
+  into a failure naming it.
+- **A test can assert nothing and look fine.** One exercised a function that
+  returns early unless run as root. One restored a monkeypatch over itself
+  in cleanup, so it verified the patch. Neither was caught by reading them;
+  both were caught by breaking the code and noticing the test stayed green.
+  **Mutation-test every new test**, and when a mutation survives, work out
+  whether it is a gap or an equivalent mutant — several here were genuinely
+  equivalent, and saying so is part of the job.
+- **A measurement can be of the wrong thing.** Timings of "5.7s" for a suite
+  that takes a minute were of runs that had been *killed* — a `pkill -f
+  gpg-agent` matched its own command line. Two claims were published from
+  that before it was noticed.
+- **Documentation verified once decays.** The README's console blocks were
+  real captures, checked by hand, and three prose claims around them went
+  stale within the session. They are re-rendered and compared by a test now.
+- **A check that cannot fail is worse than none**, because the next reader
+  trusts it: an unreachable `""` branch in `clean`, and a monotonicity guard
+  in `_sync_regions` that could never reject. Both removed.
+- **The environment is part of the check.** Running CI in a `debian:trixie`
+  container — as *root*, which a workstation is not — found four defects
+  that every local run called green, one of them a regression introduced
+  earlier the same day. See "Running CI locally"; it is worth the trouble.
+
+The habit that generalises: after something passes, ask what would have had
+to be true for it to fail, and go and make that true.
+
 ## Gotchas that bit us before (don't repeat)
 
 - dpkg pty progress → garbled output. Always `-o Dpkg::Use-Pty=0` + `stream_lines`.
@@ -1154,3 +1207,38 @@ two share:
   dispatch-conf interactive loop, and the archiving half of config merging.
 - **Repository**: README, GPL-2.0-or-later, `-V`, and CI — whose first run
   failed three times, all of them test defects invisible on the dev machine.
+
+Then a review pass and everything it pulled behind it. The recurring theme
+this time was different, and it is the one worth carrying forward: **a green
+check is not evidence until you know what it checked.**
+
+- **Thirteen defects from reading the whole script**, the worst three
+  reproduced against real dpkg and real apt rather than argued about: dpkg
+  refuses to unpack a package whose `Pre-Depends` is only unpacked; `dpkg -r`
+  one at a time dies on a dependency; and `--no-dep-upgrade` named the whole
+  closure to apt, which marks every one of them manual, so 32 dependencies
+  entered `@world` for good.
+- **Packaging**: `make deb`, `debian/`, `emerge.1`, and a CI job that
+  installs the package and runs it — because a `.deb` full of wrong paths
+  builds perfectly.
+- **The premises under the features nobody had tested.** dispatch-conf rests
+  on dpkg parking an edited conffile as `.dpkg-dist`; that is now proven
+  before the round trip is. `-b`/`-B` had never executed once. Signature
+  verification had only ever run with `gpgv` stubbed.
+- **Differential and property testing** where a reimplementation exists:
+  `vercmp` fuzzed against dpkg, `merge3` against its four rules, the solver
+  against brute force on graphs small enough to enumerate. The last of these
+  matters because a false wall is a bug this project has already shipped.
+- **Checks that were not checking.** The gpg suite skipped in CI for want of
+  `gpg` while reporting OK; `make check-unit` and `check-integration` are
+  separate processes and structurally cannot see a leak between modules; a
+  test failed once in twenty runs because `Popen` returns before `exec` and
+  `/proc/PID/comm` still held the parent's name.
+- **CI run for real in a container**, which runs as root as the workstation
+  does not. It found four things every local run called green — including a
+  regression introduced earlier in the same session.
+- **Two investigations that ended in "no change".** `merge3` is not
+  `diff3 -m` equivalent and should not try to be: three quarters of the
+  difference is diff3 producing the worse answer. Replacing difflib with a
+  minimal Myers diff changed nothing in 12,000 merges. Both are written down
+  so nobody spends the day again.
