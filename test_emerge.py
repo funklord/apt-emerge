@@ -1936,6 +1936,70 @@ class TestPrompts(unittest.TestCase):
 				self.assertFalse(self.ask_yesno())
 
 
+class TestBackendSelection(unittest.TestCase):
+	"""Which backend gets picked, and what `-V` says when it cannot be used.
+
+	`-V` used to construct a backend just to read its name, which on the dpkg
+	side seeds the world file -- so a version query created state. It asks
+	backend_name() now, and that changed one edge: `--backend=apt` on a box
+	with no apt-get used to make `-V` exit 1, and now reports "apt backend".
+
+	That is deliberate. `-V` is informational and reports the backend that is
+	configured; it does not try to use one. Anything that actually needs the
+	backend still refuses, clearly, which is the message worth having."""
+
+	def setUp(self):
+		self.mod = load()
+		self.errors = []
+		self.mod.eerror = self.errors.append
+		# constructing the dpkg backend seeds the world file and announces
+		# it, which as root put the notice in the middle of the test output
+		self.mod.einfo = lambda m: None
+
+	def without_apt(self):
+		original = self.mod.shutil.which
+		self.addCleanup(setattr, self.mod.shutil, "which", original)
+		self.mod.shutil.which = lambda n: (None if n == "apt-get"
+		                                   else original(n))
+
+	def test_apt_is_chosen_when_apt_get_is_present(self):
+		self.assertEqual(self.mod.backend_name(None), "apt")
+
+	def test_dpkg_is_chosen_when_apt_get_is_absent(self):
+		self.without_apt()
+		self.assertEqual(self.mod.backend_name(None), "dpkg")
+		self.assertEqual(self.mod.pick_backend(None).name, "dpkg")
+
+	def test_an_explicit_choice_wins_over_detection(self):
+		self.assertEqual(self.mod.backend_name("dpkg"), "dpkg")
+		self.without_apt()
+		self.assertEqual(self.mod.backend_name("apt"), "apt")
+
+	def test_the_environment_variable_is_honoured(self):
+		self.addCleanup(os.environ.pop, "EMERGE_BACKEND", None)
+		os.environ["EMERGE_BACKEND"] = "dpkg"
+		self.assertEqual(self.mod.backend_name(None), "dpkg")
+
+	def test_an_unknown_backend_is_rejected(self):
+		with self.assertRaises(SystemExit):
+			self.mod.backend_name("nonsense")
+		self.assertTrue(any("unknown backend" in e for e in self.errors))
+
+	def test_version_reports_the_requested_backend_even_if_unusable(self):
+		self.without_apt()
+		out = io.StringIO()
+		with contextlib.redirect_stdout(out):
+			self.mod.main(["--backend=apt", "-V"])
+		self.assertIn("apt backend", out.getvalue())
+
+	def test_but_using_it_refuses_clearly(self):
+		self.without_apt()
+		with self.assertRaises(SystemExit):
+			self.mod.pick_backend("apt")
+		self.assertTrue(any("apt-get not found" in e for e in self.errors),
+		                self.errors)
+
+
 class TestPipeBehaviour(unittest.TestCase):
 	"""`emerge -pv @world | head` is how people read a long package list.
 
