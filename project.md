@@ -702,16 +702,20 @@ the test asserting the guard checks the *message*, not the exit status.
 
 ## Packaging
 
-`make deb` builds `$(OBJDIR)/apt-emerge_<version>_all.deb`, where `OBJDIR`
-defaults to `dist/` and is settable so an isolated build cannot clobber a
-plain one. Source format is **`3.0 (native)`**: this repo *is* upstream, there
+`make deb` builds `$(BUILD_DIR)/apt-emerge_<version>_all.deb`, where
+`BUILD_DIR` defaults to `dist/` and is settable so an isolated build cannot
+clobber a plain one. The variable was `OBJDIR` until 2026-08-05; `BUILD_DIR`
+is the canonical spelling across these projects, and the two are not
+synonyms in any case — this holds a build tree of `.deb`, `.changes` and
+`.buildinfo`, and nothing here compiles to an object file at all. Source format is **`3.0 (native)`**: this repo *is* upstream, there
 is no separate tarball, and a quilt package would mean inventing an
 upstream/packaging split that does not exist.
 
 `clean` removes the files it names and no others — no wildcard sweeps, no
 `rm -rf` of a bare variable. The directories it does remove whole are ones the
-build created (`$(OBJDIR)`, `debian/apt-emerge`, `debian/.debhelper`), and each
-is rejected if it is absolute or contains `..`, so `make clean OBJDIR=/` is not
+build created (`$(BUILD_DIR)`, `debian/apt-emerge`, `debian/.debhelper`), and
+each is rejected if it is absolute or contains `..`, so `make clean BUILD_DIR=/`
+is not
 a working command. This is a safety property rather than a style choice:
 `clean` is the one target everybody runs without reading it.
 

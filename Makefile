@@ -13,8 +13,12 @@ PACKAGE     = apt-emerge
 PYTHON     ?= python3
 
 # Where build products land. Settable so an isolated build can be kept from
-# clobbering a plain one; OBJDIR is the canonical name across these projects.
-OBJDIR     ?= dist
+# clobbering a plain one. BUILD_DIR is the canonical name across these
+# projects -- it was OBJDIR here, which is a BSD-make convention that only
+# one sibling uses, and the two are not quite synonyms anyway: this holds a
+# whole build tree of .deb, .changes and .buildinfo, not object files. There
+# is nothing here that compiles to an object file at all.
+BUILD_DIR  ?= dist
 
 prefix     ?= /usr
 bindir     ?= $(prefix)/bin
@@ -141,7 +145,7 @@ uninstall:
 # outside the tree and not ours to litter. Collect them into dist/ instead.
 deb: version-check
 	dpkg-buildpackage --build=binary --no-sign
-	mkdir -p $(OBJDIR)
+	mkdir -p $(BUILD_DIR)
 	set -e; ver=$$(dpkg-parsechangelog -SVersion); \
 	arch=$$(dpkg-architecture -qDEB_HOST_ARCH); \
 	moved=0; \
@@ -150,14 +154,14 @@ deb: version-check
 	         "../$(PACKAGE)_$${ver}_$${arch}.buildinfo" \
 	         "../$(PACKAGE)_$${ver}_$${arch}.changes"; do \
 		if [ -e "$$f" ]; then \
-			mv -f "$$f" $(OBJDIR)/; moved=$$((moved + 1)); \
+			mv -f "$$f" $(BUILD_DIR)/; moved=$$((moved + 1)); \
 		fi; \
 	done; \
 	if [ "$$moved" -eq 0 ]; then \
 		echo "deb: dpkg-buildpackage produced nothing to collect"; exit 1; \
 	fi
 	@echo
-	@ls -l $(OBJDIR)/
+	@ls -l $(BUILD_DIR)/
 
 # Files clean removes, named individually rather than swept up by a wildcard.
 # `clean` is the one target everybody runs without reading it, so what it
@@ -170,14 +174,14 @@ CLEAN_FILES = debian/files \
 
 # Directories the build itself creates as staging or output trees, and which
 # are therefore disposable whole. Each is still checked before removal: an
-# absolute path or a parent traversal aborts, because OBJDIR is settable and
-# `make clean OBJDIR=/` must not be a working command.
+# absolute path or a parent traversal aborts, because BUILD_DIR is settable and
+# `make clean BUILD_DIR=/` must not be a working command.
 #
 # The unset-variable case needs no check. These are iterated as shell words,
-# so an empty OBJDIR disappears in word splitting and removes nothing -- it
+# so an empty BUILD_DIR disappears in word splitting and removes nothing -- it
 # is `rm -rf $(VAR)` as a single command, where an empty VAR leaves a bare
 # `rm -rf`, that turns a typo into a disaster.
-CLEAN_DIRS = $(OBJDIR) debian/$(PACKAGE) debian/.debhelper __pycache__
+CLEAN_DIRS = $(BUILD_DIR) debian/$(PACKAGE) debian/.debhelper __pycache__
 
 clean:
 	rm -f $(CLEAN_FILES)
