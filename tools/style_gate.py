@@ -1,3 +1,5 @@
+# Copied from ~/.claude/tools/style_gate.py -- the source. Keep in sync;
+# fix drift the moment you notice it.
 #!/usr/bin/env python3
 """The indentation and whitespace gate for private projects.
 
@@ -75,12 +77,31 @@ DEFAULTS = {
 
 	# Scope. Empty include means the whole repository.
 	"include": [],
-	"exclude": ["attic", "third_party", "vendor", "build", "target"],
+	# The two discovery paths must agree. git's --exclude-standard drops
+	# tool state on its own; the plain walk used when there is no repo -- as
+	# in a container CI that copies the source in without .git -- does not,
+	# and would check a pytest cache README and the local editor settings.
+	# They happen to conform, so the gate would pass on luck.
+	"exclude": ["attic", "third_party", "vendor", "build", "target",
+	            "dist", ".pytest_cache", ".claude"],
 
+	# `Makefile` is deliberately absent from indent_names. A recipe line must
+	# begin with a literal tab, so it is compliant by construction; and the
+	# body of an `ifeq`/`ifdef` is indented with SPACES precisely because a
+	# leading tab there would be read as a recipe. Both spellings are correct
+	# and required in the same file, so the tab rule has nothing to say about
+	# Makefiles. They still get the text checks.
+	#
 	# Files whose indentation is ours to govern.
+	# `.rs` is deliberately absent. This tool has no Rust parser, so the line
+	# rule cannot tell a string literal from code and reports the usage text
+	# inside one as space-indented -- 97 such findings in netcfgd, none real.
+	# Rust is not unchecked: `rustfmt` with `hard_tabs = true` enforces the
+	# same rule and does have a parser. Check what you can read; defer the
+	# rest to something that can, rather than guessing loudly.
 	"indent_suffixes": [".c", ".h", ".cpp", ".hpp", ".cc", ".hh", ".py",
-	                    ".rs", ".situ", ".ebnf", ".lua"],
-	"indent_names": ["Makefile"],
+	                    ".situ", ".ebnf", ".lua"],
+	"indent_names": [],
 
 	# Files that get the text checks (trailing space, final newline, and
 	# ASCII when enabled) but not necessarily the tab rule.
@@ -98,8 +119,14 @@ def load_config(root: Path) -> dict:
 	if not path.is_file():
 		return cfg
 	if tomllib is None:
-		print(f"style-gate: {path} ignored (needs Python 3.11+)", file=sys.stderr)
-		return cfg
+		# Refuse rather than degrade. Ignoring the config means ignoring the
+		# scope it widens and the floor it raises, so the gate would run with
+		# defaults, check the wrong file set, and report a clean tree.
+		print(f"style-gate: {path} exists but this Python has no tomllib "
+		      f"(needs 3.11+).", file=sys.stderr)
+		print("style-gate:   running with defaults would check the wrong "
+		      "files and pass.", file=sys.stderr)
+		raise SystemExit(2)
 	with path.open("rb") as handle:
 		loaded = tomllib.load(handle)
 	unknown = set(loaded) - set(DEFAULTS)
@@ -168,7 +195,23 @@ def discover(root: Path, cfg: dict) -> list[Path]:
 
 
 def wants_indent(path: Path, cfg: dict) -> bool:
-	return path.suffix in set(cfg["indent_suffixes"]) or path.name in set(cfg["indent_names"])
+	if path.suffix in set(cfg["indent_suffixes"]) or path.name in set(cfg["indent_names"]):
+		return True
+	# A program with no suffix is still ours. Deciding scope on suffix alone
+	# excluded exactly the files that matter most: `fmake` IS fmake, `emerge`
+	# IS apt-emerge, and `situc` is situ's compiler entry point. The gate
+	# checked their documentation, found it clean, and said so -- the precise
+	# shape of vacuous pass this tool exists to refuse. A shebang is the
+	# file saying it is a program; that is enough.
+	return not path.suffix and has_shebang(path)
+
+
+def has_shebang(path: Path) -> bool:
+	try:
+		with path.open("rb") as handle:
+			return handle.readline(2) == b"#!"
+	except OSError:
+		return False
 
 
 def wants_text(path: Path, cfg: dict) -> bool:
@@ -257,9 +300,27 @@ def python_literal_lines(text: str) -> frozenset[int]:
 	Their leading whitespace is content, not indentation: a golden diagnostic
 	text with a space gutter must survive the tab rule untouched.
 	"""
+	# Python 3.12 stopped emitting a multi-line f-string as one STRING token
+	# and began splitting it into FSTRING_START / MIDDLE / END around its
+	# expressions. Matching only STRING therefore left every multi-line
+	# f-string unprotected, and the converter reindented the text inside it
+	# -- in fmake's `selftest` that text is C++ source the case then
+	# compiles. The AST proof refused the write; this is why it stopped
+	# being needed for that file.
+	FSTART = getattr(tokenize, "FSTRING_START", None)
+	FEND = getattr(tokenize, "FSTRING_END", None)
 	covered: set[int] = set()
+	opened: list[int] = []
 	try:
 		for token in tokenize.generate_tokens(io.StringIO(text).readline):
+			if FSTART is not None and token.type == FSTART:
+				opened.append(token.start[0])
+				continue
+			if FEND is not None and token.type == FEND and opened:
+				start = opened.pop()
+				if token.end[0] > start:
+					covered.update(range(start + 1, token.end[0] + 1))
+				continue
 			if token.type == tokenize.STRING and token.end[0] > token.start[0]:
 				covered.update(range(token.start[0] + 1, token.end[0] + 1))
 	except (tokenize.TokenError, SyntaxError, IndentationError):
@@ -283,7 +344,8 @@ class Problem:
 
 
 def check_text(text: str, where, indent: bool = True,
-               skip: frozenset[int] = frozenset()) -> list[Problem]:
+               skip: frozenset[int] = frozenset(),
+               heuristic: bool = True) -> list[Problem]:
 	"""The line rules, against text that need not be a file on disk.
 
 	Split out because code a compiler *emits* is governed by nobody: it lands
@@ -316,10 +378,14 @@ def check_text(text: str, where, indent: bool = True,
 		lead = leading_whitespace(line)
 		# Tabs carry the indent level and spaces carry alignment within it,
 		# so a space may follow a tab but never precede one.
+		# A space before a tab is wrong at every width and needs no parser, so
+		# it is checked even where a fixer exists. Only the column heuristic
+		# below needs standing down for those, the fixer knowing the real
+		# depth and a depth-0 continuation legitimately starting with spaces.
 		if " " in lead and "\t" in lead[lead.index(" "):]:
 			problems.append(Problem(where, number, lead.index(" ") + 1,
 			                        "space before tab in indent"))
-		elif lead.startswith(" ") and line.strip():
+		elif heuristic and lead.startswith(" ") and line.strip():
 			problems.append(Problem(where, number, 1,
 			                        "space-indented line; use tabs"))
 	return problems
@@ -355,8 +421,8 @@ def check_file(path: Path, root: Path, cfg: dict) -> list[Problem]:
 	# heuristic is redundant. Keep the heuristic only for the languages that
 	# have no fixer, where something is better than nothing.
 	skip = python_literal_lines(text) if is_python(path) else frozenset()
-	tab_rules = wants_indent(path, cfg) and not has_fixer(path)
-	problems.extend(check_text(text, rel, tab_rules, skip))
+	problems.extend(check_text(text, rel, wants_indent(path, cfg), skip,
+	                           heuristic=not has_fixer(path)))
 
 	# Where a fixer exists, "tabs-then-spaces" is the weaker of two possible
 	# questions. The C fixer also knows what LEVEL each line belongs at, so a
@@ -624,8 +690,13 @@ def convert_python(text: str, width: int) -> str:
 	touched; a comment-only line has no structural meaning, so its own column
 	decides.
 	"""
+	# One definition of "this row is literal content", shared with the
+	# checker. It used to be computed twice, and when f-strings stopped
+	# being a single token only one copy learned -- so the checker knew a row
+	# was untouchable while the converter rewrote it.
+	protected = python_literal_lines(text)
+
 	row_depth: dict[int, int] = {}
-	protected: set[int] = set()
 	depth = 0
 	for tok in tokenize.generate_tokens(io.StringIO(text).readline):
 		if tok.type == tokenize.INDENT:
@@ -635,12 +706,11 @@ def convert_python(text: str, width: int) -> str:
 		elif tok.type in (tokenize.NL, tokenize.NEWLINE,
 		                  tokenize.COMMENT, tokenize.ENDMARKER):
 			continue
-		elif tok.type == tokenize.STRING and tok.end[0] > tok.start[0]:
-			protected.update(range(tok.start[0] + 1, tok.end[0] + 1))
-			row_depth.setdefault(tok.start[0], depth)
 		else:
-			for r in range(tok.start[0], tok.end[0] + 1):
-				row_depth.setdefault(r, depth)
+			row_depth.setdefault(tok.start[0], depth)
+			if tok.start[0] not in protected:
+				for r in range(tok.start[0], tok.end[0] + 1):
+					row_depth.setdefault(r, depth)
 
 	out = []
 	for row, line in enumerate(text.splitlines(keepends=True), 1):

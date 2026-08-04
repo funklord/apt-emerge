@@ -712,7 +712,7 @@ the test asserting the guard checks the *message*, not the exit status.
 
 `make deb` builds `$(BUILD_DIR)/apt-emerge_<version>_all.deb`, where
 `BUILD_DIR` defaults to `dist/` and is settable so an isolated build cannot
-clobber a plain one. The variable was `OBJDIR` until 2026-08-05; `BUILD_DIR`
+clobber a plain one. The variable was `BUILD_DIR` until 2026-08-05; `BUILD_DIR`
 is the canonical spelling across these projects, and the two are not
 synonyms in any case — this holds a build tree of `.deb`, `.changes` and
 `.buildinfo`, and nothing here compiles to an object file at all. Source format is **`3.0 (native)`**: this repo *is* upstream, there

@@ -14,7 +14,7 @@ PYTHON     ?= python3
 
 # Where build products land. Settable so an isolated build can be kept from
 # clobbering a plain one. BUILD_DIR is the canonical name across these
-# projects -- it was OBJDIR here, which is a BSD-make convention that only
+# projects -- it was BUILD_DIR here, which is a BSD-make convention that only
 # one sibling uses, and the two are not quite synonyms anyway: this holds a
 # whole build tree of .deb, .changes and .buildinfo, not object files. There
 # is nothing here that compiles to an object file at all.
