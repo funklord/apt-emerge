@@ -24,6 +24,7 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import io
+import itertools
 import os
 import random
 import re
@@ -1016,6 +1017,133 @@ class TestNduSolve(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # The --no-dep-upgrade guarantee, independent of any solver
 # ---------------------------------------------------------------------------
+
+class TestNduSolveAgainstBruteForce(unittest.TestCase):
+	"""The solver against an exhaustive oracle, on random package graphs.
+
+	ndu_solve is the most intricate code here and the costliest place for a
+	silent wrong answer: it decides what actually gets installed. Its promise
+	is checkable, and on graphs small enough to enumerate, so is its *whole*
+	answer -- brute force every combination and see whether a no-upgrade
+	solution existed at all.
+
+	That matters because a false wall is a bug this project has already
+	shipped once: the old greedy solver reported walls that did not exist,
+	and no example-based test noticed. An oracle notices.
+
+	Three invariants, all absolute:
+	  1. a returned plan never moves an installed package outside `allow`;
+	  2. a returned plan actually satisfies every dependency it pulls in;
+	  3. a wall is only raised when brute force agrees there is no solution.
+
+	Seeded, so a failure is reproducible."""
+
+	class Index:
+		def __init__(self, universe):
+			self.universe = universe
+
+		def all_versions(self, name):
+			return list(self.universe.get(name, []))
+
+		def has(self, name):
+			return name in self.universe
+
+		def provides_of(self, name):
+			return []
+
+	def generate(self, rnd):
+		"""A small universe: a few packages, a few versions, random
+		dependencies with version constraints, and a random installed set."""
+		names = [f"p{i}" for i in range(rnd.randint(2, 4))]
+		universe = {}
+		for n in names:
+			versions = sorted({rnd.randint(1, 3)
+			                   for _ in range(rnd.randint(1, 3))},
+			                  reverse=True)
+			universe[n] = [{"Package": n, "Version": f"{v}.0"}
+			               for v in versions]
+		for n in names:
+			for st in universe[n]:
+				deps = []
+				for other in names:
+					if other == n or rnd.random() > 0.45:
+						continue
+					deps.append(f"{other} (>= {rnd.randint(1, 3)}.0)"
+					            if rnd.random() < 0.5 else other)
+				if deps:
+					st["Depends"] = ", ".join(deps)
+		installed = {}
+		for n in names:
+			if rnd.random() < 0.5:
+				installed[n] = {"Package": n,
+				                "Version": rnd.choice(universe[n])["Version"]}
+		return names, universe, installed
+
+	@staticmethod
+	def satisfied(assignment, installed):
+		have = {n: st["Version"] for n, st in assignment.items()}
+		for n, st in installed.items():
+			have.setdefault(n, st["Version"])
+		for st in assignment.values():
+			for alts in em.parse_depends(st.get("Depends", "")):
+				if not any(dn in have
+				           and (op is None or em.meets(have[dn], op, dv))
+				           for dn, op, dv in alts):
+					return False
+		return True
+
+	def solution_exists(self, target, universe, installed):
+		"""Brute force: is there *any* choice of not-installed packages that
+		installs the target with every installed package left where it is?"""
+		free = [n for n in universe if n not in installed]
+		for size in range(len(free) + 1):
+			for subset in itertools.combinations(free, size):
+				if target not in subset and target not in installed:
+					continue
+				pools = [universe[n] for n in subset]
+				for combo in (itertools.product(*pools) if pools else [()]):
+					assignment = dict(zip(subset, combo))
+					for n, st in installed.items():
+						assignment.setdefault(n, st)
+					if self.satisfied(assignment, installed):
+						return True
+		return False
+
+	def test_the_solver_agrees_with_exhaustive_search(self):
+		rnd = random.Random(31337)
+		solved = walls = 0
+		for i in range(250):
+			names, universe, installed = self.generate(rnd)
+			target = rnd.choice(names)
+			with self.subTest(i=i, target=target, universe=universe,
+			                  installed=installed):
+				try:
+					plan, merges = em.ndu_search(
+					    self.Index(universe), installed, {}, [target],
+					    [target], False, set(), backtrack=3)
+				except em.NduWall:
+					walls += 1
+					self.assertFalse(
+					    self.solution_exists(target, universe, installed),
+					    "walled on a graph that brute force can solve")
+					continue
+				except (RuntimeError, em.NduIncomplete):
+					continue
+				solved += 1
+				for name, newver, old, *_ in merges:
+					self.assertFalse(
+					    old is not None and em.vercmp(newver, old) > 0,
+					    f"{name} was upgraded from {old} to {newver}")
+				assignment = {st["Package"]: st for st in plan}
+				for n, st in installed.items():
+					assignment.setdefault(n, st)
+				self.assertTrue(self.satisfied(assignment, installed),
+				                "the plan does not satisfy its own "
+				                "dependencies")
+		# a run that solved everything trivially would prove little
+		self.assertGreater(walls, 5, "the wall path was barely exercised")
+		self.assertGreater(solved, 50, "the solve path was barely exercised")
+
 
 class TestNduSearch(unittest.TestCase):
 	"""The escalating wrapper. The cheap pass takes the first alternative of

@@ -569,8 +569,18 @@ Beyond the two backends, `test_integration.py` also covers:
 `unmerge_candidates` and `merge` aftermath, `print_unmerge_list`, the
 signature-verification code, and session detection.
 
-Two suites are **differential** rather than hand-written expectations, because
-both reimplement something with an existing reference — keep them that way:
+Three suites are **differential or property-based** rather than hand-written
+expectations, because a hand-authored case encodes what its author believed
+the reference does — so when the author misreads it, the code and the test
+are wrong together and agree forever. Keep them that way:
+
+- `ndu_solve` is checked against **brute force** on random package graphs
+  small enough to enumerate. Three invariants: a returned plan never moves an
+  installed package, it satisfies every dependency it pulls in, and a wall is
+  raised only where exhaustive search agrees there is none. The false wall is
+  a bug this project has already shipped once — the old greedy solver
+  reported walls that did not exist and no example-based test noticed.
+
 - `vercmp` is Debian policy 5.6.12 in Python, so every pair in the table is
   also run through `dpkg --compare-versions` and must agree — plus a seeded
   fuzz over generated versions, because the table encodes what its author
