@@ -692,6 +692,12 @@ shared surface (`resolve`, `merge`, `unmerge`, `depclean`, `sync`, `search`).
 thing and the apt backend did not** — and apt is what runs on every normal
 Debian box, so the broken one is the one everybody uses.
 
+(The later review below found the reverse direction too: the apt backend
+delegates ordering to apt, so the dpkg backend is the one that has to get
+`Pre-Depends` and removal order right by hand — and did not. The rule is
+symmetric: **whichever backend implements something itself is the one
+carrying the bug.**)
+
 - `unmerge` listed only the names you typed while `apt-get remove` cascaded.
   `emerge -C libjpeg62-turbo` showed 1 package and would have removed 868.
 - No `is_protected` check at all on apt, though `--help` promises one.
@@ -758,6 +764,69 @@ apart and drift silently because nothing enforces the shared contract.
   which answers a question nobody asked.
 - Never fork per search result. `emerge -s '^lib'` matches 29,185 packages;
   one `apt-cache policy` per hit meant the search never finished. Batch it.
+  The same mistake reappeared in `archive_settled`, which forked
+  `dpkg-query` once per package: **163× slower** than one batched call
+  (9.98s vs 0.061s for 200 packages), so a 1,500-package dist-upgrade spent
+  over a minute doing nothing else — on the failure path too. On Debian the
+  package count is always the scale that matters.
+- **apt marks everything named on its command line as manually installed**
+  (apt-mark(8): "the package you installed explicitly is marked as manually
+  installed"). Since `@selected` *is* `apt-mark showmanual` on this backend,
+  every name we pass is a world entry. `--no-dep-upgrade` resolves the whole
+  closure itself and passes each package as an explicit `pkg=version` pin, so
+  one `emerge --no-dep-upgrade libsdl3-dev` put **32 dependencies** into
+  `@world` permanently, where `--depclean` could never reclaim them.
+  `AptBackend._apply_marks` now snapshots the manual set before the install
+  and puts everything back to auto except the atoms the user typed. Anything
+  new that adds names to `self._action` must keep that true.
+- **dpkg is not a solver.** It does exactly what it is told, in the order it
+  is told, and both sequences the dpkg backend issued were wrong in ways only
+  real dpkg reveals — the resolver, the simulation and the merge list were all
+  perfectly happy:
+  - `--unpack` everything then `--configure -a` once fails on `Pre-Depends`:
+    dpkg requires a pre-dependency to be *configured*, not merely unpacked
+    ("libb is unpacked, but has never been configured"). `merge()` now
+    configures what is staged before unpacking anything with a `Pre-Depends`
+    field. One `dpkg -i` with the whole plan does **not** fix this — dpkg
+    does not reorder either.
+  - `dpkg -r` per package in the order the user typed fails as soon as an
+    earlier victim is depended on by a later one. One call naming all of them
+    works, because dpkg *does* order removals itself.
+- `sources.list(5)` disables a deb822 stanza with `Enabled: no`, and calls it
+  the easier alternative to commenting every line out. Ignoring the field
+  meant `--sync` fetching from repositories the admin had switched off.
+- A mergetool template is user-written configuration, so it can be wrong.
+  `mergetool=meld` — no placeholders — made `"meld" % (a, b, c)` a `TypeError`
+  that crashed dispatch-conf mid-review, with earlier files already retired
+  and no summary of what had been decided. Both substitution styles are now
+  guarded.
+- The `out` file handed to a mergetool is **seeded with your current version**
+  so the tool has something to edit. A tool that exits 0 without writing would
+  otherwise have that seed accepted back as a merge result — silently
+  "merging" to exactly what you already had and retiring the update.
+- Constructing a backend must not do work. `pick_backend()` runs for
+  `emerge -V` too, and `DpkgBackend.__init__` seeded the world file — so a
+  version query, as root, created `/var/lib/emerge-dpkg` and announced it.
+  Seeding is deferred to the first `_read_world()`.
+- `int(epoch)` in `vercmp` raised `ValueError` on a malformed version, and
+  `vercmp` sits on every code path there is: one odd string in an index took
+  down an operation that had nothing to do with it. A non-numeric epoch now
+  falls back to treating the whole string as the version.
+- `parse_depends` silently dropped a clause whose alternatives it could not
+  parse, which makes an unparseable dependency look **satisfied** — the one
+  direction a resolver must never fail in. It cannot be fatal (one odd field
+  would break every operation), so it warns once per distinct clause.
+- `/proc/PID/maps` puts the pathname last precisely because it may contain
+  spaces. `line.split()[5]` truncated such a mapping to its first word, so the
+  library went unrecognised and its package was never flagged as
+  session-critical. Use `split(None, 5)`.
+- `os.replace` swaps in a different inode, so a file written fresh keeps
+  nothing the original carried outside the stat struct — SELinux labels, ACLs,
+  file capabilities. `_write` copies xattrs across; an `/etc` file that comes
+  back unlabelled can stop being readable by the one daemon that needs it.
+- `emerge -uD @world foo` dropped `foo`: the `dist-upgrade` branch took the
+  set and threw the atoms away. `apt-get dist-upgrade` does take package
+  arguments.
 
 ---
 

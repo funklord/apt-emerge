@@ -99,13 +99,15 @@ class DpkgBackendEndToEnd(unittest.TestCase):
         return subprocess.run(cmd, capture_output=True, text=True,
                               env=self.env)
 
-    def make_deb(self, name, version, depends=None):
+    def make_deb(self, name, version, depends=None, pre_depends=None):
         d = os.path.join(self.dir, "build", f"{name}_{version}")
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(os.path.join(d, "DEBIAN"))
         os.makedirs(os.path.join(d, "usr/share/emtest"))
         ctl = [f"Package: {name}", f"Version: {version}",
                "Architecture: all", "Maintainer: t <t@t>"]
+        if pre_depends:
+            ctl.append(f"Pre-Depends: {pre_depends}")
         if depends:
             ctl.append(f"Depends: {depends}")
         ctl.append(f"Description: test package {name}")
@@ -297,6 +299,69 @@ class DpkgBackendEndToEnd(unittest.TestCase):
             self.assertIn("emtest-lib",
                           [c[0] for c in
                            m.DpkgBackend().depclean_candidates()])
+
+    def test_a_new_pre_dependency_is_configured_before_its_dependent(self):
+        """dpkg refuses to *unpack* a package whose Pre-Depends is merely
+        unpacked -- it must already be configured:
+
+            emtest-front pre-depends on emtest-core
+             emtest-core is unpacked, but has never been configured.
+
+        Unpacking the whole plan and configuring once at the end therefore
+        failed outright on any plan containing a new package that pre-depends
+        on another new one. Nothing short of real dpkg shows this: the
+        simulation, the resolver and the merge list are all perfectly happy.
+        """
+        self.make_deb("emtest-core", "1.0")
+        self.make_deb("emtest-front", "1.0", pre_depends="emtest-core")
+        self.m.DpkgBackend().sync(verify=False)
+
+        self.merge(["emtest-front"])
+
+        installed = self.installed()
+        self.assertEqual(installed.get("emtest-core"), "1.0")
+        self.assertEqual(installed.get("emtest-front"), "1.0",
+                         "the pre-dependent must actually be installed")
+        self.assertTrue(os.path.exists(os.path.join(
+            self.sysroot, "usr/share/emtest/emtest-front.txt")))
+
+    def test_a_pre_dependency_is_fully_configured_not_merely_unpacked(self):
+        """The half that makes the merge real rather than half-done: both
+        packages must end up in state `installed`, not `unpacked`."""
+        self.make_deb("emtest-core", "1.0")
+        self.make_deb("emtest-front", "1.0", pre_depends="emtest-core")
+        self.m.DpkgBackend().sync(verify=False)
+        self.merge(["emtest-front"])
+
+        with open(self.m.STATUS) as f:
+            states = {st["Package"]: st.get("Status", "")
+                      for st in self.m.parse_stanzas(f.read())}
+        for pkg in ("emtest-core", "emtest-front"):
+            with self.subTest(pkg=pkg):
+                self.assertIn("install ok installed", states.get(pkg, ""))
+
+    def test_unmerging_a_package_and_its_dependency_together_succeeds(self):
+        """dpkg orders removals itself when given the whole list, but refuses
+        one at a time in the order the user typed:
+
+            dpkg: dependency problems prevent removal of emtest-lib:
+             emtest-app depends on emtest-lib.
+
+        `emerge -C emtest-lib emtest-app` named the dependency first and died
+        on the very first package."""
+        self.make_deb("emtest-lib", "1.0")
+        self.make_deb("emtest-app", "1.0", depends="emtest-lib")
+        self.m.DpkgBackend().sync(verify=False)
+        self.merge(["emtest-app"])
+        self.assertIn("emtest-lib", self.installed())
+
+        # deliberately the order that fails: dependency before dependent
+        self.m.DpkgBackend().unmerge([("emtest-lib", "1.0"),
+                                      ("emtest-app", "1.0")])
+
+        left = self.installed()
+        self.assertNotIn("emtest-lib", left)
+        self.assertNotIn("emtest-app", left)
 
 
 def _rootless_apt_works():

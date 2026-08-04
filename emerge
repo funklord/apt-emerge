@@ -241,7 +241,10 @@ def _verrevcmp(a, b):
 def vercmp(v1, v2):
     def split(v):
         epoch, _, rest = v.partition(":")
-        if not rest:
+        # A colon that is not an epoch separator (a malformed version, or a
+        # stray ":arch" that escaped a parser) must not crash the comparison:
+        # int() on it would raise, and vercmp is reached from every code path.
+        if not rest or not epoch.isdigit():
             epoch, rest = "0", v
         upstream, _, revision = rest.rpartition("-")
         if not upstream:
@@ -813,9 +816,15 @@ def _proc_mapped_code(pid, comm=None):
     try:
         with open(f"/proc/{pid}/maps") as f:
             for line in f:
-                parts = line.split()
-                if len(parts) >= 6:
-                    perms, path = parts[1], parts[5]
+                # split off exactly the five leading fields: the pathname is
+                # the rest of the line and may itself contain spaces, so
+                # splitting on every space truncates such a mapping to its
+                # first word and loses the library entirely
+                parts = line.split(None, 5)
+                if len(parts) == 6:
+                    perms, path = parts[1], parts[5].rstrip("\n")
+                    if path.endswith(" (deleted)"):
+                        path = path[:-len(" (deleted)")]
                     if path.startswith("/") and ("x" in perms or ".so" in path):
                         files.add(path)
     except OSError:
@@ -931,19 +940,6 @@ class NduWall(Exception):
         self.movers = movers
 
 
-def _ndu_blocker(name, iv, why, cons):
-    consread = ", ".join(f"{op} {v}" for op, v in cons if op) or "any"
-    tail = f" (pulled in by {why})" if why else ""
-    if iv and iv != "?":
-        return (f"--no-dep-upgrade: {BOLD(name)} is installed at {iv} but "
-                f"a dependency needs {consread}{tail}.\n"
-                f"    keeping it would break the dependency; upgrading it is "
-                f"what --no-dep-upgrade is avoiding.")
-    return (f"--no-dep-upgrade: no version of {BOLD(name)}{tail} avoids "
-            f"upgrading an already-installed package.\n"
-            f"    every version new enough to satisfy {consread} pulls an "
-            f"installed dependency up.")
-
 def _format_movers(movers):
     """Human-readable, per-package block for a wall, with same-upstream and
     session-critical annotations."""
@@ -993,6 +989,8 @@ DEP_RE = re.compile(r"^\s*([a-z0-9][a-z0-9+.-]*)\s*(?::\s*\S+)?"
                     r"(?:\s*\(\s*(<<|<=|=|>=|>>|<|>)\s*([^)]+?)\s*\))?"
                     r"(?:\s*\[[^\]]*\])?\s*$")
 
+_DEP_WARNED = set()
+
 def parse_depends(field):
     clauses = []
     for clause in field.split(","):
@@ -1003,6 +1001,16 @@ def parse_depends(field):
                 alts.append((m.group(1), m.group(2), m.group(3)))
         if alts:
             clauses.append(alts)
+        elif clause.strip():
+            # Dropping the clause makes an unparseable dependency look
+            # *satisfied*, which is the one direction a resolver must never
+            # fail in. Refusing to run is worse -- one odd field would break
+            # every operation -- but it cannot pass unremarked either.
+            key = clause.strip()
+            if key not in _DEP_WARNED:
+                _DEP_WARNED.add(key)
+                eerror(f'cannot parse dependency "{key}" -- ignoring it; '
+                       f"the resolution that follows may be wrong.")
     return clauses
 
 # ---------------------------------------------------------------------------
@@ -1184,6 +1192,13 @@ def read_sources():
             text = f.read()
         if path.endswith(".sources"):
             for st in parse_stanzas(text):
+                # sources.list(5): "it is usually easier to add the field
+                # Enabled: no to the stanza to disable the entry". Syncing
+                # from a repository the admin switched off is not a small
+                # oversight -- it is the one they explicitly asked us not
+                # to touch.
+                if st.get("Enabled", "yes").strip().lower() in ("no", "false"):
+                    continue
                 if "deb" not in st.get("Types", ""):
                     continue
                 signed_by = st.get("Signed-By", "").strip() or None
@@ -1462,11 +1477,20 @@ class DpkgBackend:
         self.provides = {}    # virtual -> [(provider, version|None)]
         self.versions = None  # name -> [stanza,...] (built lazily on demand)
         self._plan = []       # resolver output stanzas, kept for merge()
-        self._seed_world()
+        self._seeded = False
 
     # -- world file ---------------------------------------------------------
 
     def _seed_world(self):
+        """Populate the world file on first use.
+
+        Deferred rather than done in __init__: constructing a backend is not
+        an operation, and pick_backend() runs for `emerge -V` too -- which
+        has no business creating /var/lib/emerge-dpkg, let alone announcing
+        that it seeded it."""
+        if self._seeded:
+            return
+        self._seeded = True
         if os.path.exists(WORLD) or os.geteuid() != 0:
             return
         os.makedirs(LIB_DIR, exist_ok=True)
@@ -1476,6 +1500,7 @@ class DpkgBackend:
         einfo(f"Seeded world file with {len(inst)} currently installed packages.")
 
     def _read_world(self):
+        self._seed_world()
         if not os.path.exists(WORLD):
             return set()
         with open(WORLD) as f:
@@ -1838,12 +1863,6 @@ class DpkgBackend:
         self._plan = plan
         return merges
 
-    def _upgrades_in(self, merges, inst):
-        """Names in a merge plan that would upgrade an already-installed
-        package (the reboot-causing set we want to avoid)."""
-        return [n for n, newv, old, *_ in merges
-                if old is not None and vercmp(newv, old) > 0]
-
     def _resolve_no_upgrade(self, worklist, atoms, inst, iprov, update,
                             allow=None):
         """Whole-closure downgrade search via the shared solver."""
@@ -1925,22 +1944,38 @@ class DpkgBackend:
             pending_notice(conf)
             sys.exit(1)
 
-        # deps were appended after their dependents: unpack in reverse
-        for i, (st, deb) in enumerate(
-                reversed(list(zip(self._plan, debs))), 1):
+        # deps were appended after their dependents, so reversing the plan
+        # gives install order: dependencies first, targets last
+        seq = list(reversed(list(zip(self._plan, debs))))
+        staged = False
+
+        def configure_all(what):
+            r = capture(["dpkg", "--force-confold", "--force-confdef",
+                         "--configure", "-a"])
+            if r.returncode != 0:
+                print(r.stderr, file=sys.stderr)
+                abort(what)
+
+        for i, (st, deb) in enumerate(seq, 1):
             pv = f"{st['Package']}-{st['Version']}"
-            print(f"{ARROW} Emerging ({total - i + 1} of {total}) {BGREEN(pv)}")
+            print(f"{ARROW} Emerging ({i} of {total}) {BGREEN(pv)}")
+            # dpkg refuses to unpack a package whose Pre-Depends is merely
+            # unpacked -- it must be *configured* first -- so deferring every
+            # configure to the end fails outright the moment a plan contains
+            # a new package that pre-depends on another new one. Configuring
+            # what is already staged first is apt's "immediate configuration"
+            # pass under a different name, and Pre-Depends is rare enough
+            # that this costs nothing on an ordinary merge.
+            if staged and st.get("Pre-Depends"):
+                configure_all(f"configure phase failed before {pv}")
             r = capture(["dpkg", "--force-confold", "--force-confdef",
                          "--unpack", "--auto-deconfigure", deb])
             if r.returncode != 0:
                 print(r.stderr, file=sys.stderr)
                 abort(f"unpack failed for {pv}")
-        r = capture(["dpkg", "--force-confold", "--force-confdef",
-                     "--configure", "-a"])
-        if r.returncode != 0:
-            print(r.stderr, file=sys.stderr)
-            abort("configure phase failed")
-        for i, st in enumerate(self._plan, 1):
+            staged = True
+        configure_all("configure phase failed")
+        for i, (st, _deb) in enumerate(seq, 1):
             pv = f"{st['Package']}-{st['Version']}"
             print(f"{ARROW} Installing ({i} of {total}) {BGREEN(pv)}")
             print(f"{ARROW} Completed ({i} of {total}) {BGREEN(pv)}")
@@ -2000,14 +2035,20 @@ class DpkgBackend:
 
     def unmerge(self, removals):
         need_root()
+        if not removals:
+            return
         total = len(removals)
         for i, (pkg, ver) in enumerate(removals, 1):
             print(f"{ARROW} Unmerging ({i} of {total}) "
                   f"{RED(pkg + '-' + ver)}...")
-            r = capture(["dpkg", "-r", pkg])
-            if r.returncode != 0:
-                print(r.stderr, file=sys.stderr)
-                print(f"{RED('!!!')} unmerge failed for {pkg}"); sys.exit(1)
+        # One call for the whole list, not one per package. dpkg works out
+        # the removal order itself; going one at a time in the order the user
+        # typed dies as soon as an earlier victim is depended on by a later
+        # one -- `emerge -C libfoo foo` failed on the first package.
+        r = capture(["dpkg", "-r"] + [p for p, _ in removals])
+        if r.returncode != 0:
+            print(r.stderr, file=sys.stderr)
+            print(f"{RED('!!!')} unmerge failed."); sys.exit(1)
         self._write_world(self._read_world() - {p for p, _ in removals})
         print(f"\n{ARROW} {BGREEN('Auto-cleaning packages...')}")
         einfo("GNU info directory index is up-to-date.")
@@ -2151,33 +2192,6 @@ class AptBackend:
                 atoms.append(t)
         return atoms, sorted(members), had_world
 
-    def _madison_versions(self, pkg):
-        """All available versions of pkg, newest-first."""
-        r = capture(["apt-cache", "madison", pkg])
-        vers = []
-        for line in r.stdout.splitlines():
-            parts = [p.strip() for p in line.split("|")]
-            if len(parts) >= 2 and parts[0] == pkg:
-                vers.append(parts[1])
-        # de-dup preserving apt's order, then sort strictly newest-first
-        seen = [v for i, v in enumerate(vers) if v not in vers[:i]]
-        return sorted(seen, key=functools.cmp_to_key(vercmp), reverse=True)
-
-    def _simulate(self, specs):
-        """Return (upgrades, error). upgrades = installed pkgs this action
-        would move to a newer version."""
-        r = capture(["apt-get", "-s", "-qq",
-                     "-o", "APT::Get::Show-User-Simulation-Note=0",
-                     "install"] + specs)
-        if r.returncode != 0:
-            return None, (r.stderr or r.stdout).strip().replace("E: ", "")
-        ups = []
-        for line in r.stdout.splitlines():
-            m = re.match(r"^Inst ([^\s:]+)(?::\S+)? \[([^\]]+)\] \((\S+) ", line)
-            if m and vercmp(m.group(3), m.group(2)) > 0:
-                ups.append(m.group(1))
-        return ups, None
-
     def _resolve_no_upgrade(self, atoms, members, update, allow=None):
         """Full-closure downgrade search using the shared solver, fed by an
         apt-cache-backed index. Resolves exact version pins that avoid
@@ -2210,8 +2224,10 @@ class AptBackend:
         if no_dep_upgrade:
             self._resolve_no_upgrade(atoms, members, update, allow)
         elif had_world and update and deep:
-            # emerge -uD @world: the full-tree upgrade apt's solver owns
-            self._action = ["dist-upgrade"]
+            # emerge -uD @world: the full-tree upgrade apt's solver owns.
+            # Atoms still have to be carried: `emerge -uD @world foo` asks
+            # for foo as well, and dist-upgrade takes package arguments.
+            self._action = ["dist-upgrade"] + atoms
         elif update:
             # -u: upgrade if outdated, install if missing, never reinstall
             # current versions -- exactly apt-get install's semantics
@@ -2260,7 +2276,7 @@ class AptBackend:
         # snapshot before the install: apt marks everything it is told to
         # install as manual, so afterwards there is no way to tell which of
         # them were already in @world beforehand
-        was_manual = self._manual_set() if opts["oneshot"] else set()
+        was_manual = self._manual_set()
         proc = subprocess.Popen(
             ["apt-get", "-y", "-q", "-o", "Dpkg::Use-Pty=0",
              "-o", "Dpkg::Options::=--force-confold",
@@ -2289,11 +2305,7 @@ class AptBackend:
         rc = stream_apt(proc, translate)
         print()
         if rc == 0:
-            if opts["oneshot"]:
-                self._apply_oneshot(was_manual)
-            else:
-                print(f"{ARROW} Recording targets in \"world\" favorites file "
-                      f"(apt manual-install marks)")
+            self._apply_marks(was_manual, opts["oneshot"])
             print(f"{ARROW} {BGREEN('Auto-cleaning packages...')}\n")
             einfo("GNU info directory index is up-to-date.")
         # Regardless of the outcome: whatever did get installed has settled
@@ -2459,8 +2471,8 @@ class AptBackend:
         os.makedirs(BINPKGS, exist_ok=True)
         use = self._build_use()
         installed = []
-        # snapshot before anything is installed, for --oneshot below
-        was_manual = self._manual_set() if opts["oneshot"] else set()
+        # snapshot before anything is installed, for the mark fix-up below
+        was_manual = self._manual_set()
         env = {**os.environ, "DEB_BUILD_OPTIONS": use,
                "DEBIAN_FRONTEND": "noninteractive"}
         total = len(self._src_plan)
@@ -2544,8 +2556,8 @@ class AptBackend:
             print(f"{ARROW} Installing ({i} of {total}) {BGREEN(pv)}")
             print(f"{ARROW} Completed ({i} of {total}) {BGREEN(pv)}")
         print()
-        if installed and opts["oneshot"]:
-            self._apply_oneshot(was_manual)
+        if installed:
+            self._apply_marks(was_manual, opts["oneshot"], named=installed)
         einfo("GNU info directory index is up-to-date.")
         # same as merge(): what we just installed has settled conffiles that
         # become the next ancestor, and parked ones have to be announced
@@ -2560,27 +2572,51 @@ class AptBackend:
         r = capture(["apt-mark", "showmanual"])
         return {l.strip() for l in r.stdout.splitlines() if l.strip()}
 
-    def _apply_oneshot(self, before):
-        """Undo the world-file entry `apt-get install` just made.
+    def _named_packages(self):
+        """Package names this run puts on apt's own command line.
 
-        On this backend @selected *is* `apt-mark showmanual`, and apt writes a
-        manual mark for everything named on its command line, so honouring
-        --oneshot means marking those back to auto. Only packages that were
-        not already manual are touched: --oneshot means "do not add this to
-        world", never "remove what was already there"."""
-        added = [a for a in getattr(self, "_atoms", []) if a not in before]
-        if not added:
+        apt marks every one of them manually installed, which is precisely
+        what @selected is on this backend, so these are the names whose marks
+        may need correcting afterwards."""
+        return [a.split("=")[0] for a in (self._action or [])[1:]
+                if not a.startswith("-")]
+
+    def _apply_marks(self, before, oneshot, named=None):
+        """Correct apt's manual-install marks after a merge.
+
+        apt marks everything named on its command line as manually installed,
+        and we name a great deal more than the user asked for: set members,
+        and under --no-dep-upgrade the entire resolved closure as explicit
+        version pins. Left alone, one `emerge --no-dep-upgrade libsdl3-dev`
+        moved 32 dependencies into @world, where --depclean could never
+        reclaim them again -- a leak with no way back short of apt-mark by
+        hand.
+
+        So everything we named that was not already manual goes back to auto,
+        except the atoms the user actually typed. Under --oneshot those go
+        back too, which is exactly what --oneshot means here. Packages that
+        were already manual are never touched: neither flag has any business
+        removing an entry that was in world before we started."""
+        atoms = [a for a in getattr(self, "_atoms", []) if a not in before]
+        keep = set() if oneshot else set(getattr(self, "_atoms", []))
+        names = self._named_packages() if named is None else list(named)
+        extra = sorted({p for p in names if p not in before and p not in keep})
+        if extra:
+            r = capture(["apt-mark", "auto"] + extra)
+            if r.returncode != 0:
+                ewarn("could not reset the manual-install mark: "
+                      + (r.stderr or r.stdout).strip())
+                ewarn(f"These stayed in @world: {', '.join(extra)}")
+                return
+        if not oneshot:
+            print(f"{ARROW} Recording targets in \"world\" favorites file "
+                  f"(apt manual-install marks)")
+        elif atoms:
+            print(f"{ARROW} Not recording targets in \"world\" favorites file "
+                  f"(--oneshot): {', '.join(sorted(atoms))}")
+        else:
             print(f"{ARROW} Not recording targets in \"world\" "
                   f"favorites file (--oneshot)")
-            return
-        r = capture(["apt-mark", "auto"] + added)
-        if r.returncode != 0:
-            ewarn("could not reset the manual-install mark: "
-                  + (r.stderr or r.stdout).strip())
-            ewarn(f"These stayed in @world: {', '.join(added)}")
-            return
-        print(f"{ARROW} Not recording targets in \"world\" favorites file "
-              f"(--oneshot): {', '.join(added)}")
 
     @staticmethod
     def _policy_batch(names, chunk=500):
@@ -2784,15 +2820,48 @@ def color_diff(a, b, fromfile, tofile):
 def archive_path(conf, path):
     return os.path.join(conf["archive-dir"], path.lstrip("/"))
 
-def pkg_conffiles(pkg):
-    """Config files dpkg tracks for an installed package."""
-    r = capture(["dpkg-query", "-W", "-f=${Conffiles}\n", pkg])
-    out = []
-    for line in r.stdout.splitlines():
-        parts = line.split()
-        if parts and parts[0].startswith("/") and "obsolete" not in parts[-1:]:
-            out.append(parts[0])
+def conffiles_of(packages, chunk=500):
+    """{package: [config file, ...]} for many packages in one dpkg-query.
+
+    Batched rather than one call per package. A fork each costs ~50ms, so a
+    1500-package dist-upgrade spent well over a minute doing nothing but
+    starting processes -- on the failure path as well as the success one.
+    Same lesson as _policy_batch: on Debian the package count is the scale
+    that matters, and per-package forks do not survive it.
+
+    dpkg-query renders ${Conffiles} with its first entry on the package's own
+    line and the rest indented beneath, so the split has to follow that."""
+    out = {}
+    names = list(packages)
+    for i in range(0, len(names), chunk):
+        r = capture(["dpkg-query", "-W", "-f=${Package}:${Conffiles}\n"]
+                    + names[i:i + chunk])
+        cur = None
+        for line in r.stdout.splitlines():
+            if line[:1].isspace():
+                rest = line
+            elif ":" in line:
+                cur, _, rest = line.partition(":")
+                out.setdefault(cur, [])
+            else:
+                # Neither a "<package>:" header nor an indented conffile.
+                # Skipping rather than treating it as a header matters: a
+                # stray line would otherwise become the current package and
+                # every conffile after it would be filed under the wrong one
+                # -- or, for a blank line, under "".
+                continue
+            if cur is None:
+                continue
+            parts = rest.split()
+            # dpkg marks a dropped conffile with a trailing "obsolete"
+            if parts and parts[0].startswith("/") \
+               and "obsolete" not in parts[-1:] and parts[0] not in out[cur]:
+                out[cur].append(parts[0])
     return out
+
+def pkg_conffiles(pkg):
+    """Config files dpkg tracks for one installed package."""
+    return conffiles_of([pkg]).get(pkg, [])
 
 def _store_ancestor(conf, target, source):
     dest = archive_path(conf, target)
@@ -2808,8 +2877,8 @@ def archive_settled(conf, packages):
     precisely the ancestor dispatch-conf needs -- and are re-archived from
     the parked copy once resolved."""
     n = 0
-    for pkg in packages:
-        for path in pkg_conffiles(pkg):
+    for paths in conffiles_of(packages).values():
+        for path in paths:
             if any(os.path.exists(path + s) for s in PENDING_SUFFIXES):
                 continue
             if os.path.isfile(path):
@@ -2876,17 +2945,30 @@ def run_mergetool(conf, base, mine, theirs, output):
     tmpl = conf["mergetool"] or conf["merge"]
     if not tmpl:
         return False
-    if "{" in tmpl:
-        cmd = tmpl.format(base=shlex.quote(base or "/dev/null"),
-                          mine=shlex.quote(mine),
-                          theirs=shlex.quote(theirs),
-                          output=shlex.quote(output))
-    else:
-        # No quoting here on purpose: this is dispatch-conf's positional form
-        # and its templates quote the placeholders themselves ("... '%s'"),
-        # so quoting again would nest quotes and split paths containing
-        # spaces into two arguments. Use the {named} form for safe quoting.
-        cmd = tmpl % (output, mine, theirs)
+    # A template is user-written configuration, so it can be wrong. Both
+    # substitutions raise on a template that does not match: `mergetool=meld`
+    # with no placeholders at all made "meld" % (a, b, c) a TypeError, which
+    # crashed dispatch-conf outright -- in the middle of a review, with files
+    # already retired and no summary of what had been decided.
+    try:
+        if "{" in tmpl:
+            cmd = tmpl.format(base=shlex.quote(base or "/dev/null"),
+                              mine=shlex.quote(mine),
+                              theirs=shlex.quote(theirs),
+                              output=shlex.quote(output))
+        else:
+            # No quoting here on purpose: this is dispatch-conf's positional
+            # form and its templates quote the placeholders themselves
+            # ("... '%s'"), so quoting again would nest quotes and split
+            # paths containing spaces into two arguments. Use the {named}
+            # form for safe quoting.
+            cmd = tmpl % (output, mine, theirs)
+    except (TypeError, ValueError, KeyError, IndexError) as e:
+        eerror(f"cannot use the configured mergetool -- {e}")
+        eerror(f"  template: {tmpl}")
+        eerror("  expected either {output}/{mine}/{theirs}/{base}, or "
+               "dispatch-conf's three positional '%s'.")
+        return False
     return subprocess.call(cmd, shell=True) == 0
 
 def _fsync_dir(path):
@@ -2902,6 +2984,26 @@ def _fsync_dir(path):
         pass
     finally:
         os.close(fd)
+
+def _copy_xattrs(src, dst):
+    """Carry extended attributes across a replacement.
+
+    os.replace swaps in a different inode, so a freshly written file starts
+    with none of what the original carried outside the stat struct: SELinux
+    labels, POSIX ACLs, file capabilities. An /etc file that comes back
+    without its label can stop being readable by the one daemon that needs
+    it, and nothing about the merge would suggest why."""
+    if not hasattr(os, "listxattr"):
+        return
+    try:
+        names = os.listxattr(src)
+    except OSError:
+        return
+    for name in names:
+        try:
+            os.setxattr(dst, name, os.getxattr(src, name))
+        except OSError:
+            pass                     # unprivileged, or the fs has no room
 
 def _write(path, lines):
     """Replace in place, preserving mode/owner of the existing file.
@@ -2923,6 +3025,7 @@ def _write(path, lines):
             os.chown(tmp, st.st_uid, st.st_gid)
         except PermissionError:
             pass
+        _copy_xattrs(path, tmp)
         os.replace(tmp, path)
     except BaseException:
         # never leave a half-written .emerge-tmp lying about in /etc
@@ -3071,11 +3174,23 @@ def dispatch_conf(opts):
                     else:
                         bfile = None
                     shutil.copy2(target, out)
+                    seeded = read_lines(out)
                     if run_mergetool(conf, bfile, target, pending, out):
                         res = read_lines(out)
-                        if res:
+                        if res and res != seeded:
                             _accept(conf, target, pending, res)
                             break
+                        if res == seeded:
+                            # The output file is seeded with your current
+                            # version so the tool has something to edit. A
+                            # tool that exits 0 without writing would
+                            # otherwise have that seed accepted back as if it
+                            # were a merge result -- silently "merging" to
+                            # exactly what you already had.
+                            eerror("mergetool exited without changing the "
+                                   "output; nothing applied. Choose 1 to "
+                                   "keep your version deliberately.")
+                            continue
                     eerror("mergetool did not produce a result.")
             elif choice == "6":
                 color_diff(mine, theirs, target, pending)
@@ -3309,11 +3424,13 @@ Sets:
 Debian notes:
    Repository configuration is read from /etc/apt/sources.list and
    /etc/apt/sources.list.d (both one-line and deb822 .sources formats).
+   A .sources stanza carrying `Enabled: no` is skipped, as apt skips it.
    On apt-less systems, simply create one by hand -- plain `deb` lines
    work. The dpkg backend verifies the SHA256 of every fetched .deb
-   against the index but does not GPG-verify Release files; point it only
-   at mirrors you trust. --newuse (-N), --quiet (-q) and --tree (-t) are
-   accepted for muscle-memory compatibility and ignored.
+   against the index, and the index itself against the archive's signed
+   Release file (see --sync and --no-verify above).
+   --newuse (-N), --quiet (-q) and --tree (-t) are accepted for
+   muscle-memory compatibility and ignored.
 
 For more help consult the man page... which doesn't exist. This is it.
 """
@@ -3346,6 +3463,20 @@ def main(argv):
     if not argv:
         print(HELP); return
     for arg in argv:
+        # First, before anything else claims the token: a bare `--with` takes
+        # the very next argument, whatever it is. Testing this further down
+        # was not enough -- every long option recognised above it consumed
+        # its token first, so `--with --backtrack=5 pkg` silently ate `pkg`
+        # as the allow-list and then reported "no targets given".
+        if opts.get("_with_pending"):
+            opts["_with_pending"] = False
+            if arg.startswith("-"):
+                eerror("--with requires a comma-separated package list, "
+                       f"got the option '{arg}'.")
+                sys.exit(1)
+            opts.setdefault("allow", set())
+            opts["allow"] |= {p for p in arg.split(",") if p}
+            continue
         if arg.startswith("--backend="):
             backend_flag = arg.split("=", 1)[1]; continue
         if arg == "--sync":
@@ -3378,18 +3509,6 @@ def main(argv):
                 opts["_with_pending"] = True
             else:
                 opts["allow"] |= {p for p in val.split(",") if p}
-            continue
-        if opts.get("_with_pending"):
-            opts["_with_pending"] = False
-            if arg.startswith("-"):
-                # This check runs before flag parsing, so without this a bare
-                # `--with` swallows whatever follows: `--with -a pkg` lost the
-                # -a silently, and `--with --help` printed nothing.
-                eerror("--with requires a comma-separated package list, "
-                       f"got the option '{arg}'.")
-                sys.exit(1)
-            opts.setdefault("allow", set())
-            opts["allow"] |= {p for p in arg.split(",") if p}
             continue
         if arg in ("--help", "-h"):
             print(HELP); return

@@ -134,6 +134,21 @@ class TestVercmp(unittest.TestCase):
             self.assertEqual(em.vercmp(a, a), 0)
             self.assertEqual(em.vercmp(b, b), 0)
 
+    def test_a_malformed_epoch_compares_instead_of_raising(self):
+        """int() on a non-numeric epoch raised ValueError, and vercmp sits on
+        every code path there is -- a single odd string in an index would
+        take down an operation that had nothing to do with it."""
+        for odd in (":1.0", "a:1.0", "1.0:2", ":", "x:y:z"):
+            with self.subTest(v=odd):
+                self.assertEqual(em.vercmp(odd, odd), 0)
+                self.assertEqual(sign(em.vercmp(odd, "1.0")),
+                                 -sign(em.vercmp("1.0", odd)))
+
+    def test_a_real_epoch_still_outranks_a_bare_version(self):
+        """The lenient fallback must not swallow epochs that are valid."""
+        self.assertEqual(sign(em.vercmp("1:0.1", "9.9")), 1)
+        self.assertEqual(sign(em.vercmp("2:1.0", "1:9.0")), 1)
+
     def test_sort_is_total_order(self):
         """Sorting by vercmp must agree with pairwise comparison."""
         import functools
@@ -241,8 +256,39 @@ class TestParseDepends(unittest.TestCase):
 
     def test_unparsable_alternative_is_dropped_not_fatal(self):
         # a clause whose alternatives are all junk yields no clause at all
-        self.assertEqual(em.parse_depends("!!! , libc6"),
-                         [[("libc6", None, None)]])
+        em._DEP_WARNED.clear()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(em.parse_depends("!!! , libc6"),
+                             [[("libc6", None, None)]])
+
+    def test_an_unparsable_clause_says_so(self):
+        """Dropping it silently makes an unparseable dependency look
+        *satisfied*, which is the one direction a resolver must never fail
+        in. It cannot be fatal -- one odd field would break every operation
+        -- but it must not pass unremarked."""
+        em._DEP_WARNED.clear()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            em.parse_depends("!!! , libc6")
+        self.assertIn("cannot parse dependency", err.getvalue())
+        self.assertIn("!!!", err.getvalue())
+
+    def test_the_complaint_is_made_once_not_per_stanza(self):
+        """parse_depends runs over every stanza in the index; a per-call
+        warning would print the same line thousands of times."""
+        em._DEP_WARNED.clear()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for _ in range(50):
+                em.parse_depends("!!! , libc6")
+        self.assertEqual(err.getvalue().count("cannot parse dependency"), 1)
+
+    def test_a_well_formed_field_says_nothing(self):
+        em._DEP_WARNED.clear()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            em.parse_depends("libc6 (>= 2.36), libgcc-s1 | libgcc1, ")
+        self.assertEqual(err.getvalue(), "")
 
 
 class TestParseStanzas(unittest.TestCase):
@@ -1062,6 +1108,51 @@ class TestAptBackendHonoursNoDepUpgrade(unittest.TestCase):
         self.assertEqual([m[0] for m in merges], ["libgbm1"])
 
 
+class TestAptActionSelection(unittest.TestCase):
+    """Which apt-get command each flag combination turns into. Whatever ends
+    up here is both what apt executes and -- because apt marks everything it
+    is told to install as manual -- what lands in @selected."""
+
+    def setUp(self):
+        self.mod = load()
+        self.be = self.mod.AptBackend()
+        self.be._sizes = lambda names: {}
+        self.be._installed_version = lambda pkg: None
+
+        class R:
+            stdout, stderr, returncode = "", "", 0
+        self.mod.capture = lambda cmd: R
+
+    def action(self, targets, members=(), had_world=False, **kw):
+        self.be.expand_sets = lambda t: ([x for x in t if not x.startswith("@")],
+                                         list(members), had_world)
+        self.be.resolve(list(targets), **kw)
+        return self.be._action
+
+    def test_full_upgrade_is_dist_upgrade(self):
+        self.assertEqual(self.action(["@world"], had_world=True,
+                                     update=True, deep=True),
+                         ["dist-upgrade"])
+
+    def test_an_atom_alongside_world_is_not_silently_dropped(self):
+        """`emerge -uD @world nano` asks for two things. The dist-upgrade
+        branch took the set and threw the atom away, so nano was never
+        installed and nothing said so -- dist-upgrade does take package
+        arguments."""
+        self.assertEqual(self.action(["@world", "nano"], had_world=True,
+                                     update=True, deep=True),
+                         ["dist-upgrade", "nano"])
+
+    def test_update_without_deep_installs_the_members(self):
+        self.assertEqual(self.action(["@world"], members=["a", "b"],
+                                     had_world=True, update=True),
+                         ["install", "a", "b"])
+
+    def test_no_update_remerges_like_gentoo(self):
+        self.assertEqual(self.action(["nano"]),
+                         ["install", "--reinstall", "nano"])
+
+
 class TestUnmergeShowsTheCascade(unittest.TestCase):
     """`apt-get remove` takes every dependent with it. Showing only the names
     the user typed and then running apt-get -y means confirming a removal
@@ -1144,6 +1235,205 @@ class TestUnmergeShowsTheCascade(unittest.TestCase):
         got = self.be.unmerge_candidates(["tree"],
                                          {"ask": False, "pretend": False})
         self.assertEqual(got, [("tree", "2.2.1-1")])
+
+
+class TestDpkgBackendDrivesDpkg(unittest.TestCase):
+    """The exact dpkg command sequence the dpkg backend issues.
+
+    dpkg is not a solver: it does what it is told, in the order it is told,
+    and refuses anything that does not hold at that moment. Both sequences
+    below were wrong in a way no simulation catches -- only running real dpkg
+    against a throwaway root showed it."""
+
+    def setUp(self):
+        self.mod = load()
+        self.be = self.mod.DpkgBackend()
+        self.mod.need_root = lambda: None
+        self.mod.load_conf = lambda: {}
+        self.mod.archive_settled = lambda conf, pkgs: 0
+        self.mod.pending_notice = lambda conf: None
+        self.mod.einfo = lambda m: None
+        self.calls = []
+
+        class R:
+            stdout, stderr, returncode = "", "", 0
+        self.mod.capture = lambda cmd: (self.calls.append(cmd), R)[1]
+
+    def dpkg_calls(self):
+        return [c for c in self.calls if c and c[0] == "dpkg"]
+
+    # -- merge ------------------------------------------------------------
+
+    def run_merge(self, plan, oneshot=False):
+        self.be._plan = plan
+        self.be._atoms = [plan[0]["Package"]] if plan else []
+        self.be._download = lambda: [f"/d/{s['Package']}.deb" for s in plan]
+        self.be._read_world = lambda: set()
+        self.be._write_world = lambda names: None
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.be.merge([], [], {"fetchonly": False, "oneshot": oneshot})
+
+    def test_a_pre_depends_is_configured_before_its_dependent_unpacks(self):
+        """Reproduced against real dpkg: it refuses to *unpack* a package
+        whose Pre-Depends is merely unpacked --
+
+            a pre-depends on libb
+             libb is unpacked, but has never been configured.
+
+        -- so deferring every configure to the end failed outright on any
+        plan containing a new package that pre-depends on another new one."""
+        self.run_merge([{"Package": "a", "Version": "1", "Pre-Depends": "libb"},
+                        {"Package": "libb", "Version": "1"}])
+        verbs = [c[c.index("--unpack") if "--unpack" in c else -2:]
+                 for c in self.dpkg_calls()]
+        seq = ["unpack:" + c[-1].split("/")[-1] if "--unpack" in c
+               else "configure" for c in self.dpkg_calls()]
+        self.assertEqual(seq, ["unpack:libb.deb", "configure",
+                               "unpack:a.deb", "configure"],
+                         f"got {verbs}")
+
+    def test_an_ordinary_plan_does_not_pay_for_extra_configures(self):
+        """Pre-Depends is rare; a plan without one must still be a single
+        configure pass at the end."""
+        self.run_merge([{"Package": "a", "Version": "1", "Depends": "libb"},
+                        {"Package": "libb", "Version": "1"}])
+        self.assertEqual(
+            len([c for c in self.dpkg_calls() if "--configure" in c]), 1)
+
+    def test_the_first_pre_depends_needs_no_configure_before_it(self):
+        """Nothing is staged yet, so there is nothing to configure."""
+        self.run_merge([{"Package": "a", "Version": "1",
+                         "Pre-Depends": "libc6"}])
+        self.assertEqual([("configure" if "--configure" in c else "unpack")
+                          for c in self.dpkg_calls()],
+                         ["unpack", "configure"])
+
+    def test_dependencies_are_unpacked_before_their_dependents(self):
+        self.run_merge([{"Package": "a", "Version": "1"},
+                        {"Package": "libb", "Version": "1"}])
+        unpacks = [c[-1] for c in self.dpkg_calls() if "--unpack" in c]
+        self.assertEqual(unpacks, ["/d/libb.deb", "/d/a.deb"])
+
+    def test_progress_counts_upwards_in_the_order_things_happen(self):
+        out = io.StringIO()
+        self.be._plan = [{"Package": "a", "Version": "1"},
+                         {"Package": "libb", "Version": "1"}]
+        self.be._atoms = ["a"]
+        self.be._download = lambda: ["/d/a.deb", "/d/libb.deb"]
+        self.be._read_world = lambda: set()
+        self.be._write_world = lambda names: None
+        with contextlib.redirect_stdout(out):
+            self.be.merge([], [], {"fetchonly": False, "oneshot": False})
+        text = out.getvalue()
+        self.assertLess(text.index("Emerging (1 of 2) libb"),
+                        text.index("Emerging (2 of 2) a"),
+                        "the package merged first should be numbered first")
+
+    # -- unmerge ----------------------------------------------------------
+
+    def test_unmerge_is_one_call_so_dpkg_can_order_it(self):
+        """Reproduced against real dpkg: removing one at a time in the order
+        the user typed dies as soon as an earlier victim is depended on by a
+        later one --
+
+            dpkg: dependency problems prevent removal of libb:
+             dep depends on libb.
+
+        -- while one call naming both succeeds, because dpkg orders removals
+        itself."""
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.be._read_world = lambda: {"libb", "dep"}
+            self.be._write_world = lambda names: None
+            self.be.unmerge([("libb", "1.0"), ("dep", "1.0")])
+        removes = [c for c in self.dpkg_calls() if "-r" in c]
+        self.assertEqual(removes, [["dpkg", "-r", "libb", "dep"]])
+
+    def test_an_empty_unmerge_runs_no_dpkg_at_all(self):
+        """`dpkg -r` with no package names is an error, not a no-op."""
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.be.unmerge([])
+        self.assertEqual(self.dpkg_calls(), [])
+
+    def test_the_world_file_loses_every_removed_package(self):
+        written = []
+        self.be._read_world = lambda: {"libb", "dep", "keep"}
+        self.be._write_world = lambda names: written.append(set(names))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.be.unmerge([("libb", "1.0"), ("dep", "1.0")])
+        self.assertEqual(written, [{"keep"}])
+
+
+class TestSeedWorldIsDeferred(unittest.TestCase):
+    """Constructing a backend is not an operation. pick_backend() runs for
+    `emerge -V` too, and creating /var/lib/emerge-dpkg -- and announcing it
+    -- is not something a version query should do."""
+
+    def setUp(self):
+        self.mod = load()
+        self.seeded, self.made, self.opened = [], [], []
+        self.mod.installed_state = lambda: {"bash": {"Package": "bash"}}
+        self.mod.einfo = self.seeded.append
+        # Force the exact conditions under which seeding *would* happen:
+        # running as root, with no world file yet. Without this the guard at
+        # the top of _seed_world returns early for an ordinary user and every
+        # assertion below holds whether the fix is present or not.
+        #
+        # `mod.os` is the real os module, not a copy, so each original has to
+        # be captured *before* it is replaced -- reading it back inside the
+        # addCleanup call would restore the patch over itself and leak a
+        # crippled os.makedirs into every test that runs afterwards.
+        real_exists = self.mod.os.path.exists
+        self.patch(self.mod.os, "geteuid", lambda: 0)
+        self.patch(self.mod.os.path, "exists",
+                   lambda p: False if p == self.mod.WORLD else real_exists(p))
+        self.patch(self.mod.os, "makedirs",
+                   lambda *a, **kw: self.made.append(a))
+        self.mod.open = self.fake_open
+
+    def patch(self, obj, attr, value):
+        original = getattr(obj, attr)
+        self.addCleanup(setattr, obj, attr, original)
+        setattr(obj, attr, value)
+
+    def fake_open(self, path, *a, **kw):
+        self.opened.append(path)
+        return io.StringIO()
+
+    def test_constructing_the_backend_seeds_nothing(self):
+        self.mod.DpkgBackend()
+        self.assertEqual(self.made, [])
+        self.assertEqual(self.opened, [])
+        self.assertEqual(self.seeded, [])
+
+    def test_version_does_not_seed_the_world_file(self):
+        self.mod.shutil.which = lambda p: None       # force the dpkg backend
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.mod.main(["-V"])
+        self.assertEqual(self.made, [])
+        self.assertEqual(self.opened, [])
+        self.assertEqual(self.seeded, [])
+
+    def test_help_does_not_seed_it_either(self):
+        self.mod.shutil.which = lambda p: None
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.mod.main(["--help"])
+        self.assertEqual(self.made, [])
+
+    def test_the_first_real_operation_still_seeds_it(self):
+        """Deferred, not removed: an actual operation must still get a world
+        file seeded from what is installed, or @selected starts out empty and
+        --depclean proposes removing the entire system."""
+        be = self.mod.DpkgBackend()
+        self.assertEqual(self.opened, [], "not seeded before it is needed")
+        be._read_world()
+        self.assertIn(self.mod.WORLD, self.opened)
+        self.assertTrue(self.seeded)
+
+    def test_seeding_happens_once_however_often_world_is_read(self):
+        be = self.mod.DpkgBackend()
+        for _ in range(4):
+            be._read_world()
+        self.assertEqual(len(self.seeded), 1)
 
 
 class TestPrintUnmergeList(unittest.TestCase):
@@ -1453,6 +1743,57 @@ class TestArgParsing(unittest.TestCase):
     def test_with_equals_form_is_accepted(self):
         self.assertAccepted(["--no-dep-upgrade", "--with=libgbm1", "nano"])
 
+    def resolved(self, argv):
+        """Run the parser through to the resolve call and report what the
+        backend was actually asked for."""
+        seen, reached = {}, self.Reached
+
+        class B:
+            name = "apt"
+
+            def resolve(_s, targets, **kw):
+                seen["targets"] = list(targets)
+                seen["allow"] = set(kw.get("allow") or ())
+                raise reached()
+
+        self.mod.pick_backend = lambda flag: B()
+        with self.assertRaises(self.Reached):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.mod.main(argv)
+        return seen
+
+    def test_with_does_not_lose_the_target_to_an_earlier_long_option(self):
+        """The guard used to sit below the specifically-recognised long
+        options, so each of them claimed its token first and `--with` then
+        ate the *package* instead:
+
+            $ emerge --no-dep-upgrade --with --backtrack=5 libsdl3-dev
+             * no targets given.
+        """
+        self.assertRejected(["--no-dep-upgrade", "--with",
+                             "--backtrack=5", "libsdl3-dev"])
+
+    def test_every_recognised_long_option_is_refused_after_bare_with(self):
+        for opt in ("--sync", "--depclean", "--no-verify", "--no-dep-upgrade",
+                    "--dispatch-conf", "--backtrack=5", "--backend=dpkg",
+                    "--with=libz", "--help", "-a"):
+            with self.subTest(opt=opt):
+                self.errors = []
+                self.mod.eerror = self.errors.append
+                self.assertRejected(["--no-dep-upgrade", "--with", opt, "nano"])
+
+    def test_the_allow_set_holds_the_packages_and_the_target_survives(self):
+        got = self.resolved(["--no-dep-upgrade", "--with", "libgbm1,libz1",
+                             "libsdl3-dev"])
+        self.assertEqual(got["allow"], {"libgbm1", "libz1"})
+        self.assertEqual(got["targets"], ["libsdl3-dev"])
+
+    def test_with_still_works_when_it_follows_another_option(self):
+        got = self.resolved(["--backtrack=5", "--no-dep-upgrade",
+                             "--with", "libgbm1", "libsdl3-dev"])
+        self.assertEqual(got["allow"], {"libgbm1"})
+        self.assertEqual(got["targets"], ["libsdl3-dev"])
+
     # -- everything that must keep working -----------------------------------
 
     def test_all_long_flags_are_accepted(self):
@@ -1618,30 +1959,73 @@ class TestPkgConffiles(unittest.TestCase):
         self.mod = load()
 
     def stub(self, stdout):
+        """Fake dpkg-query's real batched layout, verified against dpkg 1.22:
+        `-f=${Package}:${Conffiles}\\n` puts the first conffile on the
+        package's own line and indents the rest beneath it."""
         class R:
             pass
         R.stdout, R.stderr, R.returncode = stdout, "", 0
-        self.mod.capture = lambda cmd: R
+        self.calls = []
+        def capture(cmd):
+            self.calls.append(cmd)
+            return R
+        self.mod.capture = capture
 
     def test_reads_the_paths(self):
-        self.stub(" /etc/foo.conf 0123abc\n /etc/bar.conf 4567def\n")
+        self.stub("p: /etc/foo.conf 0123abc\n /etc/bar.conf 4567def\n")
         self.assertEqual(self.mod.pkg_conffiles("p"),
                          ["/etc/foo.conf", "/etc/bar.conf"])
 
     def test_obsolete_entries_are_skipped(self):
         """dpkg keeps removed conffiles listed as obsolete; archiving one
         would resurrect a file the package no longer ships."""
-        self.stub(" /etc/keep.conf 0123abc\n"
+        self.stub("p: /etc/keep.conf 0123abc\n"
                   " /etc/gone.conf 4567def obsolete\n")
         self.assertEqual(self.mod.pkg_conffiles("p"), ["/etc/keep.conf"])
 
     def test_blank_and_relative_lines_are_ignored(self):
-        self.stub("\n\n not-a-path 0123\n /etc/ok.conf 4567\n")
+        self.stub("p:\n\n not-a-path 0123\n /etc/ok.conf 4567\n")
         self.assertEqual(self.mod.pkg_conffiles("p"), ["/etc/ok.conf"])
 
     def test_package_with_no_conffiles(self):
-        self.stub("\n")
+        self.stub("p:\n")
         self.assertEqual(self.mod.pkg_conffiles("p"), [])
+
+    def test_a_batch_keeps_each_package_to_its_own_files(self):
+        """The whole point of batching: one call, but the paths must not
+        smear across the package boundary."""
+        self.stub("a: /etc/a1.conf 01\n /etc/a2.conf 02\n"
+                  "b:\n"
+                  "c: /etc/c1.conf 03\n")
+        self.assertEqual(self.mod.conffiles_of(["a", "b", "c"]),
+                         {"a": ["/etc/a1.conf", "/etc/a2.conf"],
+                          "b": [],
+                          "c": ["/etc/c1.conf"]})
+
+    def test_many_packages_are_one_call_not_one_each(self):
+        """The regression this replaced: a fork per package cost ~50ms, so a
+        1500-package upgrade spent over a minute starting processes."""
+        self.stub("".join(f"p{i}:\n" for i in range(300)))
+        self.mod.conffiles_of([f"p{i}" for i in range(300)], chunk=500)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][:3], ["dpkg-query", "-W",
+                                             "-f=${Package}:${Conffiles}\n"])
+
+    def test_a_stray_line_does_not_hijack_the_current_package(self):
+        """Only "<package>:" starts a new package. Anything else -- a blank
+        line, a stray note -- must be ignored rather than become the current
+        one, or every conffile after it is filed under the wrong package."""
+        self.stub("a: /etc/a1.conf 01\n"
+                  "\n"
+                  "unexpected chatter\n"
+                  " /etc/a2.conf 02\n")
+        self.assertEqual(self.mod.conffiles_of(["a"]),
+                         {"a": ["/etc/a1.conf", "/etc/a2.conf"]})
+
+    def test_the_batch_is_chunked_so_the_argument_list_cannot_overflow(self):
+        self.stub("")
+        self.mod.conffiles_of([f"p{i}" for i in range(1100)], chunk=500)
+        self.assertEqual(len(self.calls), 3)
 
 
 class TestArchiveSettled(unittest.TestCase):
@@ -1663,7 +2047,11 @@ class TestArchiveSettled(unittest.TestCase):
         self.conf = dict(self.mod.DEFAULT_CONF)
         self.conf["archive-dir"] = os.path.join(self.dir, "archive")
         self.conffiles = []
-        self.mod.pkg_conffiles = lambda pkg: list(self.conffiles)
+        # archive_settled asks for every package's conffiles in one batched
+        # call; the files under test all belong to the first named package
+        self.mod.conffiles_of = lambda pkgs, **kw: {
+            p: (list(self.conffiles) if i == 0 else [])
+            for i, p in enumerate(pkgs)}
 
     def conffile(self, name, content, parked=None,
                  suffix=".dpkg-dist"):
@@ -1839,6 +2227,86 @@ class TestDispatchConf(unittest.TestCase):
 
     def parked_exists(self, target, suffix=".dpkg-dist"):
         return os.path.exists(target + suffix)
+
+    # -- the mergetool branch ------------------------------------------------
+
+    def errors(self):
+        seen = []
+        self.mod.eerror = seen.append
+        return seen
+
+    def test_a_mergetool_that_writes_nothing_is_not_taken_as_a_result(self):
+        """The output file is seeded with your current version so the tool
+        has something to edit. A tool that exits 0 without touching it would
+        otherwise have that seed handed straight back as a merge result --
+        silently "merging" to exactly what you already had, and retiring the
+        update as though you had considered it."""
+        errs = self.errors()
+        self.conf["mergetool"] = "true {output}"
+        t = self.park("app.conf", "mine\n", "theirs\n")
+        self.dispatch("5", "s")
+        self.assertEqual(self.content(t), "mine\n")
+        self.assertTrue(self.parked_exists(t),
+                        "the update must still be pending review")
+        self.assertTrue(any("without changing the output" in e for e in errs),
+                        errs)
+
+    def test_a_real_mergetool_result_is_applied(self):
+        self.conf["mergetool"] = "cp {theirs} {output}"
+        t = self.park("app.conf", "mine\n", "theirs\n")
+        self.dispatch("5")
+        self.assertEqual(self.content(t), "theirs\n")
+        self.assertFalse(self.parked_exists(t))
+        self.assertEqual(self.archived(t), "theirs\n")
+
+    def test_a_template_with_no_placeholders_is_refused_not_a_crash(self):
+        """`mergetool=meld` -- no placeholders at all -- made
+        "meld" % (a, b, c) a TypeError, which took dispatch-conf down in the
+        middle of a review, with earlier files already retired and no
+        summary of what had been decided."""
+        errs = self.errors()
+        self.conf["mergetool"] = "meld"
+        t = self.park("app.conf", "mine\n", "theirs\n")
+        self.dispatch("5", "s")                    # must not raise
+        self.assertEqual(self.content(t), "mine\n")
+        self.assertTrue(self.parked_exists(t))
+        self.assertTrue(any("cannot use the configured mergetool" in e
+                            for e in errs), errs)
+
+    def test_a_positional_template_of_the_wrong_arity_is_refused(self):
+        errs = self.errors()
+        self.conf["merge"] = "sdiff --output='%s' '%s'"     # two, not three
+        t = self.park("app.conf", "mine\n", "theirs\n")
+        self.dispatch("5", "s")
+        self.assertTrue(self.parked_exists(t))
+        self.assertTrue(any("cannot use the configured mergetool" in e
+                            for e in errs), errs)
+
+    def test_an_unknown_named_placeholder_is_refused(self):
+        errs = self.errors()
+        self.conf["mergetool"] = "meld {mine} {nosuchkey}"
+        t = self.park("app.conf", "mine\n", "theirs\n")
+        self.dispatch("5", "s")
+        self.assertTrue(self.parked_exists(t))
+        self.assertTrue(any("cannot use the configured mergetool" in e
+                            for e in errs), errs)
+
+    def test_a_mergetool_that_exits_non_zero_is_reported(self):
+        errs = self.errors()
+        self.conf["mergetool"] = "false {output}"
+        t = self.park("app.conf", "mine\n", "theirs\n")
+        self.dispatch("5", "s")
+        self.assertEqual(self.content(t), "mine\n")
+        self.assertTrue(any("did not produce a result" in e for e in errs),
+                        errs)
+
+    def test_no_mergetool_configured_says_so_rather_than_running_nothing(self):
+        errs = self.errors()
+        self.conf["mergetool"] = self.conf["merge"] = ""
+        t = self.park("app.conf", "mine\n", "theirs\n")
+        self.dispatch("5", "s")
+        self.assertTrue(any("no mergetool configured" in e for e in errs), errs)
+        self.assertTrue(self.parked_exists(t))
 
     # -- the automatic paths -------------------------------------------------
 
@@ -2201,6 +2669,7 @@ class TestMergeAftermath(unittest.TestCase):
         self.mod = load()
         self.be = self.mod.AptBackend()
         self.be._action = ["install", "foo"]
+        self.be._atoms = ["foo"]
         self.mod.need_root = lambda: None
         self.mod.load_conf = lambda: {}
         self.archived, self.noticed, self.warned = [], [], []
@@ -2278,17 +2747,56 @@ class TestMergeAftermath(unittest.TestCase):
 
     def test_oneshot_only_demotes_the_newly_added_ones(self):
         self.be._atoms = ["foo", "bar"]
+        self.be._action = ["install", "foo", "bar"]
         self.manual = {"foo"}
         self.run_merge(0, {"fetchonly": False, "oneshot": True})
         self.assertEqual(self.marked, [["apt-mark", "auto", "bar"]])
 
-    def test_oneshot_never_demotes_a_dependency(self):
-        """Only the atoms the user named are world candidates; dependencies
-        are already auto and must not be touched."""
+    def test_a_dependency_apt_was_told_to_install_does_not_enter_world(self):
+        """The leak this closed. --no-dep-upgrade resolves the whole closure
+        itself and hands apt every package as an explicit `pkg=version` pin,
+        and apt marks everything on its command line manually installed. One
+        `emerge --no-dep-upgrade libsdl3-dev` therefore moved 32 dependencies
+        into @world, where --depclean could never reclaim them again."""
         self.be._atoms = ["foo"]
+        self.be._action = ["install", "foo=1.0", "libdep=2.0", "libdep2=3.0"]
+        self.manual = set()
+        self.run_merge(0, {"fetchonly": False, "oneshot": False})
+        self.assertEqual(self.marked,
+                         [["apt-mark", "auto", "libdep", "libdep2"]])
+
+    def test_the_target_itself_still_enters_world(self):
+        """The other half: demoting the dependencies must not demote the
+        package the user actually asked for."""
+        self.be._atoms = ["foo"]
+        self.be._action = ["install", "foo=1.0", "libdep=2.0"]
+        self.manual = set()
+        self.run_merge(0, {"fetchonly": False, "oneshot": False})
+        self.assertNotIn("foo", self.marked[0][2:])
+
+    def test_a_dependency_already_in_world_is_left_alone(self):
+        """Someone installed libdep deliberately once. Pulling it in as a
+        dependency today is no reason to take it out of their world set."""
+        self.be._atoms = ["foo"]
+        self.be._action = ["install", "foo=1.0", "libdep=2.0"]
+        self.manual = {"libdep"}
+        self.run_merge(0, {"fetchonly": False, "oneshot": False})
+        self.assertEqual(self.marked, [])
+
+    def test_oneshot_demotes_the_atom_and_its_dependencies_alike(self):
+        self.be._atoms = ["foo"]
+        self.be._action = ["install", "foo=1.0", "libdep=2.0"]
         self.manual = set()
         self.run_merge(0, {"fetchonly": False, "oneshot": True})
-        self.assertNotIn("libdep", str(self.marked))
+        self.assertEqual(self.marked, [["apt-mark", "auto", "foo", "libdep"]])
+
+    def test_option_flags_are_not_mistaken_for_package_names(self):
+        """`install --reinstall foo` names one package, not two."""
+        self.be._atoms = ["foo"]
+        self.be._action = ["install", "--reinstall", "foo"]
+        self.manual = set()
+        self.run_merge(0, {"fetchonly": False, "oneshot": True})
+        self.assertEqual(self.marked, [["apt-mark", "auto", "foo"]])
 
     def test_oneshot_reports_what_it_kept_out_of_world(self):
         self.be._atoms = ["foo"]
@@ -2422,6 +2930,24 @@ class TestConfigWrite(unittest.TestCase):
         with self.assertRaises(OSError):
             em._write(self.path, self.failing_lines())
         self.assertEqual(os.listdir(self.dir), ["conf"])
+
+    def test_extended_attributes_survive_the_replacement(self):
+        """os.replace swaps in a different inode, so a freshly written file
+        starts with none of what the original carried outside the stat
+        struct: SELinux labels, POSIX ACLs, file capabilities. An /etc file
+        that comes back unlabelled can stop being readable by the one daemon
+        that needs it, and nothing about the merge would suggest why."""
+        try:
+            os.setxattr(self.path, "user.emerge-test", b"label")
+        except OSError as e:
+            self.skipTest(f"filesystem does not support xattrs: {e}")
+        em._write(self.path, ["x\n"])
+        self.assertEqual(os.getxattr(self.path, "user.emerge-test"), b"label")
+
+    def test_a_file_without_xattrs_is_written_normally(self):
+        em._write(self.path, ["x\n"])
+        with open(self.path) as f:
+            self.assertEqual(f.read(), "x\n")
 
 
 class TestAptIndexHas(unittest.TestCase):
@@ -2919,6 +3445,47 @@ class TestReadSourcesSignedBy(unittest.TestCase):
         self.assertEqual(got, [("http://deb.debian.org/debian", "trixie",
                                 ["main"], None)])
 
+    def test_a_disabled_stanza_is_skipped(self):
+        """sources.list(5): "it is usually easier to add the field
+        Enabled: no to the stanza to disable the entry". Syncing from a
+        repository the admin deliberately switched off is not a small
+        oversight -- it is the one they explicitly asked us not to touch."""
+        got = self.parse({"/etc/apt/sources.list.d/off.sources":
+                          "Types: deb\n"
+                          "URIs: http://example.invalid/debian\n"
+                          "Suites: trixie\nComponents: main\n"
+                          "Enabled: no\n"})
+        self.assertEqual(got, [])
+
+    def test_enabled_no_is_case_insensitive(self):
+        got = self.parse({"/etc/apt/sources.list.d/off.sources":
+                          "Types: deb\nURIs: http://x.invalid/d\n"
+                          "Suites: trixie\nComponents: main\n"
+                          "Enabled: NO\n"})
+        self.assertEqual(got, [])
+
+    def test_enabled_yes_and_a_missing_field_both_stay(self):
+        """Removing the field or setting it to yes re-enables it, so the
+        default when it is absent has to be on."""
+        got = self.parse({"/etc/apt/sources.list.d/on.sources":
+                          "Types: deb\nURIs: http://a.invalid/d\n"
+                          "Suites: trixie\nComponents: main\nEnabled: yes\n"
+                          "\n"
+                          "Types: deb\nURIs: http://b.invalid/d\n"
+                          "Suites: trixie\nComponents: main\n"})
+        self.assertEqual([u for u, *_ in got],
+                         ["http://a.invalid/d", "http://b.invalid/d"])
+
+    def test_only_the_disabled_stanza_of_a_file_is_dropped(self):
+        got = self.parse({"/etc/apt/sources.list.d/mixed.sources":
+                          "Types: deb\nURIs: http://live.invalid/d\n"
+                          "Suites: trixie\nComponents: main\n"
+                          "\n"
+                          "Types: deb\nURIs: http://dead.invalid/d\n"
+                          "Suites: trixie\nComponents: main\n"
+                          "Enabled: no\n"})
+        self.assertEqual([u for u, *_ in got], ["http://live.invalid/d"])
+
     def test_one_line_signed_by_is_captured(self):
         got = self.parse({"/etc/apt/sources.list":
                           "deb [signed-by=/usr/share/keyrings/x.gpg] "
@@ -3073,6 +3640,38 @@ class TestSessionCritical(unittest.TestCase):
         self.assertEqual(files, {"/usr/bin/kwin_wayland",
                                  "/usr/lib/libfoo.so.1",
                                  "/usr/lib/libbar.so.2"})
+
+    def test_a_mapped_path_containing_spaces_is_kept_whole(self):
+        """/proc/PID/maps puts the pathname last precisely because it may
+        contain spaces. Splitting on every space and taking field 6 truncated
+        such a mapping to its first word, so the library went unrecognised
+        and its package was never flagged."""
+        self.no_exe()
+        self.patch(self.mod.shutil, "which", lambda _c: None)
+        self.fake_maps(
+            "7f00-7f01 r-xp 00000000 08:01 100 /usr/lib/my libs/libodd.so.1\n")
+        self.assertEqual(self.mod._proc_mapped_code("1", "kwin_wayland"),
+                         {"/usr/lib/my libs/libodd.so.1"})
+
+    def test_a_deleted_mapping_is_stripped_too(self):
+        """An upgraded library keeps its inode mapped and the kernel appends
+        ' (deleted)'; that is exactly the case worth reporting, so the marker
+        must come off rather than the path being lost."""
+        self.no_exe()
+        self.patch(self.mod.shutil, "which", lambda _c: None)
+        self.fake_maps(
+            "7f00-7f01 r-xp 00000000 08:01 100 /usr/lib/libgbm.so.1 (deleted)\n")
+        self.assertEqual(self.mod._proc_mapped_code("1", "kwin_wayland"),
+                         {"/usr/lib/libgbm.so.1"})
+
+    def test_anonymous_mappings_are_still_ignored(self):
+        self.no_exe()
+        self.patch(self.mod.shutil, "which", lambda _c: None)
+        self.fake_maps("7f00-7f01 rw-p 00000000 00:00 0 \n"
+                       "7f02-7f03 r-xp 00000000 00:00 0 [vdso]\n"
+                       "7f04-7f05 r-xp 00000000 08:01 1 /usr/lib/libok.so\n")
+        self.assertEqual(self.mod._proc_mapped_code("1", "x"),
+                         {"/usr/lib/libok.so"})
 
     def test_executable_is_collected_from_exe(self):
         """The compositor binary is what identifies its package; missing it is
