@@ -142,11 +142,29 @@ jobs:
           man -w dispatch-conf
           man -w etc-update
 
-      - name: Lintian
-        # informational, but not silent: lintian is why the
-        # uses-dpkg-database-directly override exists, and a *new* tag is
-        # something to look at rather than scroll past
-        run: lintian --tag-display-limit 0 dist/*.changes || true
+      # This ran with `|| true` for as long as nobody had read its output.
+      # It has been read now: the binary package is clean, and the one tag
+      # it does emit -- uses-dpkg-database-directly -- is the one the
+      # override in debian/ answers. So a tag here is a regression, and the
+      # step fails on it rather than scrolling past.
+      - name: Lintian, on the binary package
+        run: lintian --tag-display-limit 0 --fail-on error,warning dist/*.changes
+
+      # The source package is built separately because `make deb` builds
+      # --build=binary: its .changes names a .deb and a .buildinfo and no
+      # .dsc, so every source-only check silently had nothing to look at.
+      # Running them found two things at once, one of them a real defect --
+      # an override_dh_auto_test that ignored DEB_BUILD_OPTIONS=nocheck.
+      #
+      # Info-level tags do not fail the build here: out-of-date-standards-
+      # version fires the moment Policy is released, which is news rather
+      # than a defect in this package, and is not worth a red run.
+      - name: Lintian, on the source package
+        run: |
+          set -e
+          dpkg-buildpackage --build=source --no-sign
+          lintian --tag-display-limit 0 --fail-on error,warning \
+                  -I --pedantic ../apt-emerge_*.dsc
 
       - name: Removing it leaves nothing behind
         run: |

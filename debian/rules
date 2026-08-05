@@ -15,8 +15,17 @@ override_dh_auto_build:
 # they are safe and fast in a build chroot; the integration suite drives real
 # dpkg and apt against throwaway roots and belongs in CI, not in a package
 # build that may be running under a restricted environment.
+#
+# The conditional is not decoration. dh_auto_test honours
+# DEB_BUILD_OPTIONS=nocheck by itself, and overriding the target throws that
+# away with it -- so a build that asked for no tests ran them anyway. Found
+# by lintian's source checks, which had never been run against this package:
+# `make deb` builds --build=binary, so the .changes it produces names no
+# .dsc and every source-only tag went unseen.
 override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
 	$(MAKE) version-check check-unit
+endif
 
 override_dh_auto_install:
 	$(MAKE) install DESTDIR=$(CURDIR)/debian/apt-emerge prefix=/usr

@@ -775,9 +775,49 @@ The **`package` CI job** does the part that matters: building a `.deb` proves
 very little, since one full of wrong paths builds perfectly. So it installs
 the result with `apt-get`, runs `emerge --version`, `--help` and `-pv bash`,
 checks `argv[0]` dispatch through the installed symlinks, renders the man
-pages, and removes the package again. `lintian` runs informationally
-(`|| true`) — it has never been run against this package by the author, so
-treat its first output as a to-do list rather than a regression.
+pages, and removes the package again. **`lintian` is a gate now, not a
+note.** It ran with `|| true` for as long as nobody had read its output;
+that has been done, and the result is below.
+
+### What lintian said, the first time anyone looked
+
+The binary package was already clean, and the one tag it emits —
+`uses-dpkg-database-directly` — is the one `debian/apt-emerge.lintian-
+overrides` answers. Confirmed the override is load-bearing rather than
+decorative by removing it: the tag reappears and the run fails. So the
+step now uses `--fail-on error,warning`, and a tag is a regression.
+
+**The source package was never looked at at all.** `make deb` builds
+`--build=binary`, so its `.changes` names a `.deb` and a `.buildinfo` and
+no `.dsc` — every source-only check had nothing to inspect and said
+nothing, which reads exactly like passing. Building a source package
+separately found two things:
+
+- **`override_dh_auto_test` ignored `DEB_BUILD_OPTIONS=nocheck`** — a real
+  defect. `dh_auto_test` honours that option itself, and overriding the
+  target threw it away, so a build that asked for no tests ran them
+  anyway. Now guarded, and checked in both directions: with `nocheck` the
+  build emits no test output at all, without it the suite runs.
+- **`Standards-Version` was 4.7.0**, two releases behind.
+
+The version bump was treated as a claim rather than a formality, because
+that is what the field is. The 4.7.1 and 4.7.2 checklists were read (in a
+container — `debian-policy` is not installed here), and one new rule bears
+directly on this package: **two packages must not install programs of
+different functionality under the same name on `PATH`.** This package
+deliberately takes Gentoo's command names, so that was checked against the
+archive rather than assumed — `apt-file` in a trixie container reports no
+package shipping `emerge`, `dispatch-conf` or `etc-update` in `/usr/bin`
+or `/usr/sbin`. The search was run with a positive control first
+(`/usr/bin/dpkg`, `/usr/bin/apt-mark`), because an index that failed to
+download answers "no collisions" in exactly the same words. The remaining
+4.7.1 and 4.7.2 items are about `/usr/games`, the `/bin` and `/lib`
+merged-usr symlinks, and requiring files under `/usr/share/{locale,man,
+info}` — none of which this package does.
+
+CI now lints the source package too, building one for the purpose. Info
+tags do not fail it: `out-of-date-standards-version` fires the day Policy
+is released, which is news about Debian rather than a defect here.
 
 ## Running CI locally
 
