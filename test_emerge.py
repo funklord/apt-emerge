@@ -1781,6 +1781,94 @@ class TestSeedWorldTiming(unittest.TestCase):
 				                 self.mod.pick_backend(forced).name)
 
 
+class TestStaleWorldEntries(unittest.TestCase):
+	"""A world entry that is not installed is dropped from @selected, and it
+    used to be dropped without a word.
+
+    That left the two ways of asking for one package disagreeing: naming it
+    outright answers `there are no packages to satisfy "foo"` and exits 1,
+    while reaching the same package through @world printed an ordinary plan
+    and exited 0. The world file is the durable record of what the admin
+    asked for, and a package leaving the Debian archive between releases is
+    ordinary, so the entry that can no longer be satisfied is exactly the
+    thing worth saying out loud."""
+
+	def setUp(self):
+		self.mod = load()
+		root = _scratch()
+		lib = os.path.join(root, "lib")
+		os.makedirs(os.path.join(lib, "tree"))
+		self.mod.LIB_DIR = lib
+		self.mod.TREE_DIR = os.path.join(lib, "tree")
+		self.mod.WORLD = os.path.join(lib, "world")
+		self.mod.STATUS = os.path.join(root, "status")
+		self.mod.USE_COLOR = False
+		self.put(self.mod.STATUS,
+		         "Package: real\nStatus: install ok installed\n"
+		         "Version: 1.0\nArchitecture: all\nPriority: optional\n\n")
+		self.put(os.path.join(self.mod.TREE_DIR, "Packages"),
+		         "Package: real\nVersion: 1.0\nArchitecture: all\n"
+		         f"Filename: pool/real.deb\nSize: 100\nSHA256: {'0' * 64}\n\n")
+
+	def put(self, path, text):
+		with open(path, "w") as f:
+			f.write(text)
+
+	def world(self, *names):
+		self.put(self.mod.WORLD, "".join(n + "\n" for n in names))
+
+	def plan(self):
+		"""stdout of `emerge --backend=dpkg -p @world`."""
+		buf = io.StringIO()
+		with contextlib.redirect_stdout(buf):
+			try:
+				self.mod.main(["--backend=dpkg", "-p", "@world"])
+			except SystemExit:
+				pass
+		return buf.getvalue()
+
+	def test_an_entry_that_is_not_installed_is_named(self):
+		self.world("real", "gone-from-the-archive")
+		out = self.plan()
+		self.assertIn("gone-from-the-archive", out,
+		              "the world file names a package that cannot be "
+		              "satisfied and nothing said so")
+
+	def test_the_plan_is_still_produced(self):
+		"""Warn, do not fail. Refusing to compute @world until the file was
+        tidied would block the upgrade that resolves it."""
+		self.world("real", "gone-from-the-archive")
+		out = self.plan()
+		self.assertIn("[ebuild  R    ] real-1.0", out)
+
+	def test_nothing_is_said_when_every_entry_is_installed(self):
+		self.world("real")
+		self.assertNotIn("not installed", self.plan())
+
+	def test_the_warning_waits_for_the_progress_line_to_finish(self):
+		"""`Calculating dependencies... ` is left open with no newline, so a
+        warning printed during the resolve lands in the middle of it. The
+        sync path had this bug and fixed it by reordering; a resolve cannot
+        be reordered, because the problem is found inside it."""
+		self.world("real", "gone-from-the-archive")
+		self.assertIn("Calculating dependencies... done!",
+		              self.plan().splitlines()[0],
+		              "the advisory broke into the progress line")
+
+	def test_it_is_said_once_however_often_the_set_is_expanded(self):
+		self.world("real", "gone-from-the-archive")
+		backend = self.mod.DpkgBackend()
+		inst = self.mod.installed_state()
+		said = []
+		self.mod.ewarn_later = said.append
+		backend.expand_sets(["@world"])
+		backend.expand_sets(["@selected"])
+		backend._selected(inst)
+		self.assertEqual(len(said), 2,
+		                 "one advisory is two lines; repeating it per "
+		                 "expansion would bury the plan")
+
+
 class TestPrintUnmergeList(unittest.TestCase):
 	def render(self, removals, requested=None):
 		buf = io.StringIO()

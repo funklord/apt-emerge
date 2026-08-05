@@ -1152,8 +1152,23 @@ def ask_yesno(prompt):
 def calc_deps_start():
 	print("Calculating dependencies... ", end="", flush=True)
 
+# Warnings raised while the progress line is open, printed once it closes.
+_deferred_warnings = []
+
+def ewarn_later(msg):
+	"""Queue a warning until `Calculating dependencies... ` is finished.
+
+    That line is deliberately left open with no newline, so anything printed
+    during the resolve lands in the middle of it. The sync path avoids the
+    same defect by verifying the archive signature *before* opening its
+    progress line; a resolve cannot be reordered that way, because what is
+    worth warning about is only discovered inside it."""
+	_deferred_warnings.append(msg)
+
 def calc_deps_done(ok=True):
 	print(GREEN("done!") if ok else RED("failed!"))
+	while _deferred_warnings:
+		ewarn(_deferred_warnings.pop(0))
 
 # ---------------------------------------------------------------------------
 # Shared: installed state from dpkg's status file (no subprocesses)
@@ -1731,15 +1746,44 @@ class DpkgBackend:
 
 	# -- resolver -----------------------------------------------------------
 
+	# Set once per process, the first time a stale world file is noticed, so
+	# that a run touching @world several times says it once. A class
+	# attribute rather than anything in __init__: constructing a backend
+	# must not do work, which this project has been bitten by before.
+	_warned_stale_world = False
+
+	def _selected(self, inst):
+		"""The world file's installed members, saying so when some are not.
+
+        A world entry that is not installed is dropped from @selected, and
+        it used to be dropped in silence. That left the two ways of asking
+        for the same package answering differently: naming it outright says
+        `there are no packages to satisfy "foo"` and exits 1, while reaching
+        it through @world printed an ordinary plan and exited 0, with
+        nothing anywhere to say an entry had been ignored.
+
+        Warn rather than fail. On Debian a package that has left the archive
+        between releases is ordinary, and refusing to compute @world until
+        the file was tidied would block the very upgrade that resolves it."""
+		world = self._read_world()
+		installed = world & set(inst)
+		missing = sorted(world - installed)
+		if missing and not DpkgBackend._warned_stale_world:
+			DpkgBackend._warned_stale_world = True
+			ewarn_later(f"{len(missing)} package(s) in {WORLD} are not "
+			            f"installed, and are being skipped:")
+			ewarn_later("  " + " ".join(missing))
+		return installed
+
 	def expand_sets(self, targets):
 		"""Split targets into explicit atoms and set-derived member names."""
 		atoms, members = [], set()
 		inst = installed_state()
 		for t in targets:
 			if t == "@world":
-				members |= (self._read_world() & set(inst)) | system_set(inst)
+				members |= self._selected(inst) | system_set(inst)
 			elif t == "@selected":
-				members |= self._read_world() & set(inst)
+				members |= self._selected(inst)
 			elif t == "@system":
 				members |= system_set(inst)
 			else:
@@ -2059,7 +2103,7 @@ class DpkgBackend:
 	def depclean_candidates(self):
 		self._load_index()
 		inst = installed_state()
-		seed = system_set(inst) | (self._read_world() & set(inst))
+		seed = system_set(inst) | self._selected(inst)
 		keep = self._dep_closure(inst, seed)
 		return [(v, inst[v]["Version"]) for v in sorted(set(inst) - keep)]
 

@@ -191,7 +191,9 @@ its own everything-else.
   `-1` oneshot (don't record in world), `-f` fetchonly.
 - Sets: `@world` = `@selected` + `@system`. `@selected` = world file (dpkg) /
   `apt-mark showmanual` (apt). `@system` = Essential+required. `world`/`system`
-  bare words accepted.
+  bare words accepted. On the dpkg backend `@selected` is really the world
+  file **intersected with what is installed** — see the open question in the
+  backlog; an entry that is not installed is skipped, and now says so.
 - `-C`/`--unmerge`, `--depclean`/`-c` (apt: `autoremove`; dpkg: world-closure).
 - `-b`/`--buildpkg`, `-B`/`--buildpkgonly` (apt only).
 - `--dispatch-conf` / `--etc-update` (config merging).
@@ -1113,6 +1115,35 @@ write surface ever needs testing.
    - *Transitive closure size*, npm especially.
    - *apt backend only*, like `-b/-B`: it needs build tooling, and the dpkg
      backend is binary-only by design.
+
+10. **What `@selected` means when a world entry is not installed.** Open,
+    and deliberately not settled while fixing the silence around it.
+
+    The document above says `@selected` is the world file. The dpkg backend
+    computes `world & installed`, so an entry naming a package that is not
+    installed is dropped. The two readings differ in what `emerge @world`
+    does after somebody removes a package with `dpkg -r` directly:
+
+    - **Portage's reading** — the world file is what you asked to have, so
+      `emerge @world` reinstalls the missing member. This is what real
+      emerge does, and hard rule 4 says to answer in Portage's dialect.
+    - **The current reading** — `@world` means the installed things you
+      chose, so a package you removed stays removed and the stale entry is
+      inert.
+
+    Changing it is a real behaviour change: under Portage's reading, every
+    `emerge -u @world` would try to reinstall what an admin deliberately
+    removed by hand, which on Debian is a common way to work. That is the
+    owner's call, not a decision to make while passing through.
+
+    What *was* wrong either way is that the drop happened in silence, so
+    the two ways of naming one package disagreed: `emerge -p foo` answers
+    `there are no packages to satisfy "foo"` and exits 1, while the same
+    package reached through `@world` printed an ordinary plan and exited 0.
+    It is now reported, and the resolve still proceeds — on Debian a
+    package leaving the archive between releases is ordinary, and refusing
+    to compute `@world` until the file is tidied would block the upgrade
+    that resolves it.
 ---
 
 ## Backend parity is the main source of bugs
