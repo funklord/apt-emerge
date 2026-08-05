@@ -155,8 +155,22 @@ def need_root():
 def run(cmd, **kw):
 	return subprocess.run(cmd, text=True, **kw)
 
-def capture(cmd):
-	return run(cmd, capture_output=True)
+def capture(cmd, env=None):
+	return run(cmd, capture_output=True, **({"env": env} if env else {}))
+
+
+# What dpkg's maintainer scripts run under. The apt backend has always passed
+# this; the dpkg backend did not, and the difference is a hang: capture()
+# takes stdout, so a postinst that asks debconf a question writes the prompt
+# somewhere nobody can see and then waits on inherited stdin forever.
+# Measured as root in a container -- unset blocks indefinitely, set finishes
+# in 0.1s. --force-confold/--force-confdef are still what keep conffiles
+# from being replaced; this only stops the asking.
+NONINTERACTIVE = {"DEBIAN_FRONTEND": "noninteractive"}
+
+
+def dpkg_env():
+	return {**os.environ, **NONINTERACTIVE}
 
 def stream_lines(pipe):
 	"""Yield clean lines from a binary pipe, splitting on both \\n and \\r.
@@ -2232,7 +2246,7 @@ class DpkgBackend:
 
 		def configure_all(what):
 			r = capture(["dpkg", "--force-confold", "--force-confdef",
-			             "--configure", "-a"])
+			             "--configure", "-a"], env=dpkg_env())
 			if r.returncode != 0:
 				print(r.stderr, file=sys.stderr)
 				abort(what)
@@ -2250,7 +2264,8 @@ class DpkgBackend:
 			if staged and st.get("Pre-Depends"):
 				configure_all(f"configure phase failed before {pv}")
 			r = capture(["dpkg", "--force-confold", "--force-confdef",
-			             "--unpack", "--auto-deconfigure", deb])
+			             "--unpack", "--auto-deconfigure", deb],
+			            env=dpkg_env())
 			if r.returncode != 0:
 				print(r.stderr, file=sys.stderr)
 				abort(f"unpack failed for {pv}")
@@ -2360,7 +2375,10 @@ class DpkgBackend:
 		# the removal order itself; going one at a time in the order the user
 		# typed dies as soon as an earlier victim is depended on by a later
 		# one -- `emerge -C libfoo foo` failed on the first package.
-		r = capture(["dpkg", "-r"] + [p for p, _ in removals])
+		# prerm and postrm can ask questions too, and this is the same
+		# captured-stdout situation as the install path.
+		r = capture(["dpkg", "-r"] + [p for p, _ in removals],
+		            env=dpkg_env())
 		if r.returncode != 0:
 			print(r.stderr, file=sys.stderr)
 			print(f"{RED('!!!')} unmerge failed."); sys.exit(1)

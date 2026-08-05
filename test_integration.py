@@ -201,7 +201,7 @@ class DpkgBackendEndToEnd(unittest.TestCase):
 				        f"--log={log}"] + list(cmd[1:])
 			return cmd
 
-		m.capture = lambda cmd: real_capture(inject(cmd))
+		m.capture = lambda cmd, env=None: real_capture(inject(cmd), env=env)
 		m.run = lambda cmd, **kw: real_run(inject(cmd), **kw)
 		return m
 
@@ -550,7 +550,7 @@ class AptBackendEndToEnd(unittest.TestCase):
 				        "--force-not-root"] + cmd[1:]
 			return cmd
 
-		m.capture = lambda cmd: real_capture(inject(cmd))
+		m.capture = lambda cmd, env=None: real_capture(inject(cmd), env=env)
 		m.run = lambda cmd, **kw: real_run(inject(cmd), **kw)
 		m.subprocess.Popen = lambda cmd, **kw: real_popen(inject(cmd), **kw)
 		self.addCleanup(setattr, m.subprocess, "Popen", real_popen)
@@ -797,7 +797,7 @@ class AptlessHttpEndToEnd(unittest.TestCase):
 				return [cmd[0], f"--root={self.sysroot}", "--force-not-root",
 				        f"--log={log}"] + list(cmd[1:])
 			return cmd
-		m.capture = lambda cmd: real_capture(inject(cmd))
+		m.capture = lambda cmd, env=None: real_capture(inject(cmd), env=env)
 		m.run = lambda cmd, **kw: real_run(inject(cmd), **kw)
 		return m
 
@@ -1031,7 +1031,7 @@ class ConfigMergingEndToEnd(unittest.TestCase):
 			if cmd and cmd[0] == "dpkg-query":
 				return [cmd[0], f"--admindir={admin}"] + list(cmd[1:])
 			return cmd
-		m.capture = lambda cmd: real_capture(inject(cmd))
+		m.capture = lambda cmd, env=None: real_capture(inject(cmd), env=env)
 		return m
 
 	def build(self, version, body):
@@ -1375,7 +1375,7 @@ binary: binary-indep
 				        "--force-not-root"] + cmd[1:]
 			return cmd
 
-		m.capture = lambda cmd: real_capture(inject(cmd))
+		m.capture = lambda cmd, env=None: real_capture(inject(cmd), env=env)
 		m.run = lambda cmd, **kw: real_run(inject(cmd), **kw)
 		m.subprocess.Popen = lambda cmd, **kw: real_popen(inject(cmd), **kw)
 		self.addCleanup(setattr, m.subprocess, "Popen", real_popen)

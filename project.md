@@ -1491,7 +1491,16 @@ to be true for it to fail, and go and make that true.
   must special-case these for the escape-hatch labelling.
 - `DEBIAN_FRONTEND=noninteractive` alone (without `--force-conf*`) silently
   keeps old conffiles and hides `.dpkg-dist` files — the whole reason
-  dispatch-conf exists.
+  dispatch-conf exists. **And the reverse: `--force-conf*` alone is not
+  enough either.** Those flags settle conffile questions; they do not stop a
+  maintainer script asking something else. The apt backend always passed the
+  variable and the dpkg backend never did, which is a hang rather than a
+  cosmetic difference — `capture()` takes stdout while leaving stdin
+  attached, so a postinst that prompts writes it where nobody can see and
+  then waits. Reproduced as root in a container: without the variable, still
+  blocked after six seconds; with it, 0.1s and rc=0. Every dpkg call that
+  can run a maintainer script — unpack, configure, remove — now passes
+  `dpkg_env()`.
 - Version comparison must be native `vercmp` (policy 5.6.12), not string compare
   and not thousands of `dpkg --compare-versions` shell-outs.
 - `index.has()` is true for a *virtual* package name — it answers "is this name

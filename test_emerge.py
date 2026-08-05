@@ -1477,7 +1477,7 @@ class TestAptBackendHonoursNoDepUpgrade(unittest.TestCase):
 		class R:
 			returncode = 0
 		R.stdout, R.stderr = stdout, ""
-		self.mod.capture = lambda cmd: R
+		self.mod.capture = lambda cmd, env=None: R
 
 	def test_extra_upgrade_in_apt_plan_is_a_wall(self):
 		self.fake_simulation(
@@ -1521,7 +1521,7 @@ class TestAptActionSelection(unittest.TestCase):
 
 		class R:
 			stdout, stderr, returncode = "", "", 0
-		self.mod.capture = lambda cmd: R
+		self.mod.capture = lambda cmd, env=None: R
 
 	def action(self, targets, members=(), had_world=False, **kw):
 		self.be.expand_sets = lambda t: ([x for x in t if not x.startswith("@")],
@@ -1551,6 +1551,72 @@ class TestAptActionSelection(unittest.TestCase):
 	def test_no_update_remerges_like_gentoo(self):
 		self.assertEqual(self.action(["nano"]),
 		                 ["install", "--reinstall", "nano"])
+
+
+class TestMaintainerScriptsAreNotInteractive(unittest.TestCase):
+	"""Every dpkg run that can execute a maintainer script must pass
+    DEBIAN_FRONTEND=noninteractive, and the dpkg backend did not.
+
+    The apt backend has always set it. The dpkg backend ran dpkg through
+    `capture()`, which takes stdout while leaving stdin attached -- so a
+    postinst that asks debconf a question wrote the prompt somewhere nobody
+    could see and then waited for an answer. Reproduced as root in a
+    container with a package whose postinst reads a line: without the
+    variable it was still blocked after six seconds; with it, 0.1s and
+    rc=0.
+
+    --force-confold and --force-confdef are what stop conffiles being
+    replaced. They do not stop a script asking something else."""
+
+	def setUp(self):
+		self.mod = load()
+		self.mod.need_root = lambda: None
+		self.calls = []
+
+		class R:
+			returncode, stdout, stderr = 0, "", ""
+		self.mod.capture = lambda cmd, env=None: (
+		    self.calls.append((cmd, env)), R)[1]
+
+	def envs_for(self, program):
+		return [env for cmd, env in self.calls if cmd[:1] == [program]]
+
+	def test_unpack_and_configure_run_noninteractive(self):
+		be = self.mod.DpkgBackend()
+		# A plan whose second member pre-depends on the first, so both the
+		# unpack and the mid-run configure pass are exercised.
+		be._plan = [{"Package": "b", "Version": "1"},
+		            {"Package": "a", "Version": "1", "Pre-Depends": "b"}]
+		be._download = lambda: ["/tmp/b.deb", "/tmp/a.deb"]
+		be._read_world = lambda: set()
+		be._write_world = lambda names: None
+		self.mod.load_conf = lambda: {}
+		self.mod.archive_settled = lambda conf, packages: 0
+		self.mod.pending_notice = lambda conf: None
+		with contextlib.redirect_stdout(io.StringIO()):
+			be.merge([("a", "1", None, 0, "ebuild", "")], ["a"],
+			         {"fetchonly": False, "oneshot": True})
+		envs = self.envs_for("dpkg")
+		self.assertTrue(envs, "no dpkg call was made")
+		for env in envs:
+			self.assertEqual((env or {}).get("DEBIAN_FRONTEND"),
+			                 "noninteractive",
+			                 "a dpkg run could stop for a debconf prompt "
+			                 "nobody can see")
+
+	def test_unmerge_runs_noninteractive(self):
+		"""prerm and postrm ask questions too, and it is the same captured
+        stdout on the way out as on the way in."""
+		be = self.mod.DpkgBackend()
+		be._read_world = lambda: set()
+		be._write_world = lambda names: None
+		with contextlib.redirect_stdout(io.StringIO()):
+			be.unmerge([("tree", "2.0")])
+		envs = self.envs_for("dpkg")
+		self.assertTrue(envs)
+		for env in envs:
+			self.assertEqual((env or {}).get("DEBIAN_FRONTEND"),
+			                 "noninteractive")
 
 
 class TestDpkgUnmergeGuard(unittest.TestCase):
@@ -1638,7 +1704,7 @@ class TestUnmergeShowsTheCascade(unittest.TestCase):
 		class R:
 			pass
 		R.stdout, R.stderr, R.returncode = stdout, "", returncode
-		self.mod.capture = lambda cmd: R
+		self.mod.capture = lambda cmd, env=None: R
 
 	def test_dependents_are_returned_not_just_the_target(self):
 		self.sim("Remv libjpeg62-turbo [1:2.1.5-4]\n"
@@ -1719,7 +1785,7 @@ class TestDpkgBackendDrivesDpkg(unittest.TestCase):
 
 		class R:
 			stdout, stderr, returncode = "", "", 0
-		self.mod.capture = lambda cmd: (self.calls.append(cmd), R)[1]
+		self.mod.capture = lambda cmd, env=None: (self.calls.append(cmd), R)[1]
 
 	def dpkg_calls(self):
 		return [c for c in self.calls if c and c[0] == "dpkg"]
@@ -2366,7 +2432,7 @@ class TestPolicyBatch(unittest.TestCase):
 		class R:
 			stdout, stderr, returncode = output, "", 0
 
-		def capture(cmd):
+		def capture(cmd, env=None):
 			self.calls.append(cmd)
 			return R
 		self.mod.capture = capture
@@ -3355,7 +3421,7 @@ class TestPkgConffiles(unittest.TestCase):
 			pass
 		R.stdout, R.stderr, R.returncode = stdout, "", 0
 		self.calls = []
-		def capture(cmd):
+		def capture(cmd, env=None):
 			self.calls.append(cmd)
 			return R
 		self.mod.capture = capture
@@ -3468,13 +3534,23 @@ class TestArchiveSettled(unittest.TestCase):
         after the failing one -- each of which then has no ancestor, so the
         next upgrade reviews it by hand instead of merging it.
 
-        A full /var during an install is the ordinary way in. Permissions
-        stand in for it here, being the failure a test can arrange."""
+        A full /var during an install is the ordinary way in, so the failure
+        is *faked* rather than arranged. The first version of this test used
+        `chmod 000` on the source file, which fails for an ordinary user and
+        not for root -- so it passed here and failed in the container, where
+        everything runs as root and a 000 file is readable. Exactly the
+        machine-dependence this project has been bitten by before, and the
+        reason the container job exists."""
 		first = self.conffile("a.conf", "one\n")
 		bad = self.conffile("unreadable.conf", "two\n")
 		last = self.conffile("c.conf", "three\n")
-		os.chmod(bad, 0o000)
-		self.addCleanup(os.chmod, bad, 0o644)
+		real_store = self.mod._store_ancestor
+
+		def store(conf, target, source):
+			if target == bad:
+				raise OSError(28, "No space left on device")
+			return real_store(conf, target, source)
+		self.mod._store_ancestor = store
 		said = []
 		self.mod.ewarn = said.append
 
@@ -4100,7 +4176,7 @@ class TestMergeAftermath(unittest.TestCase):
 
 		class R:
 			stdout, stderr, returncode = "", "", 0
-		self.mod.capture = lambda cmd: (self.marked.append(cmd), R)[1]
+		self.mod.capture = lambda cmd, env=None: (self.marked.append(cmd), R)[1]
 
 	def run_merge(self, rc, opts=None):
 		class P:
@@ -4225,7 +4301,7 @@ class TestMergeAftermath(unittest.TestCase):
 	def test_a_failed_mark_warns_instead_of_lying(self):
 		class R:
 			stdout, stderr, returncode = "", "apt-mark exploded", 1
-		self.mod.capture = lambda cmd: R
+		self.mod.capture = lambda cmd, env=None: R
 		self.be._atoms = ["foo"]
 		self.run_merge(0, {"fetchonly": False, "oneshot": True})
 		self.assertTrue(any("stayed in @world" in w for w in self.warned))
