@@ -523,6 +523,50 @@ verify; the extracted payload is byte-identical to the detached Release; a
 tampered index, a forged InRelease, and a source pinned to the wrong keyring
 are all refused.
 
+### How much a repository may spend of yours
+
+Verifying *what* the bytes say left open *how many* of them there could be.
+`--sync` read an index with a plain `read()` and unpacked it with
+`gzip`/`lzma.decompress`, both of which produce whatever the input asks for
+— and it did that **before** the hash check, so the bytes had been vouched
+for by nobody at the moment they were unpacked.
+
+Measured rather than assumed: 400 MB of zeros compresses to **61 KB of
+`.xz`**, a ratio of 6,859, and `lzma.decompress` on it took peak RSS from
+108 MB to 828 MB. A mirror serving nine megabytes can therefore ask for
+sixty gigabytes — of the backend whose entire reason for existing is boxes
+that do not have it, over plain http, as root.
+
+Three changes, and the order of the first is the point:
+
+- **Hash first, unpack second.** Release records the hash of the file *as
+  transferred*, so the check reads the same bytes either way; doing it first
+  means a mirror cannot spend this process's memory on the strength of bytes
+  that have not been vouched for. One behaviour change comes with it: an
+  index that is listed in Release and does not match is now refused outright
+  rather than being quietly skipped in favour of another compression format.
+  That is the correct reading of "failure is fatal, inability to check is
+  not" — a mismatch is a failure.
+- **A ceiling on decompression** (`MAX_INDEX_BYTES`, 512 MB), applied in
+  bounded steps, which is the only defence a repository with no Release gets
+  — the USB-stick case, where there is nothing to verify against.
+- **A ceiling on the download**, from the `Size` the index already states
+  for each `.deb`. The SHA256 still decides correctness; this only stops a
+  mirror choosing how much memory is spent before reaching it.
+
+The bounded reader is **no less strict than the one-shot calls it
+replaced**, which had to be checked rather than hoped for: a corrupted
+payload, a corrupted gzip CRC trailer, a removed trailer and a genuine
+truncation are all refused, and there is a test pinning each against
+`gzip.decompress` as the reference. The trailer cases are the ones worth
+having: a deflate stream can end cleanly while the CRC32 after it says the
+bytes are wrong, and a decompressor that stops at the end of the stream
+never looks.
+
+That test also had to be fixed before it meant anything. The first version
+truncated its fixture at a fixed 120 bytes, and this index compresses to 88
+— so it truncated nothing and passed by reading a whole file.
+
 ## Crash-safety
 
 - No persistent pins (see hard rule 3). Interrupted installs recover with the
@@ -1427,6 +1471,11 @@ to be true for it to fail, and go and make that true.
   nothing the original carried outside the stat struct — SELinux labels, ACLs,
   file capabilities. `_write` copies xattrs across; an `/etc` file that comes
   back unlabelled can stop being readable by the one daemon that needs it.
+- **A decompressor produces whatever its input asks for.** `gzip.decompress`
+  and `lzma.decompress` have no ceiling, and neither does `read()` on a
+  socket, so a repository decided how much memory `--sync` used. 61 KB of
+  `.xz` expands to 400 MB. Anything read from a mirror goes through
+  `fetch(..., limit=)` and `decompress_bounded`.
 - **`errors="replace"` on a file you are going to write back is data loss**,
   not error handling. It is spelt like a courtesy and it destroys the byte.
   Anything read to be re-written uses `errors="surrogateescape"` on both

@@ -20,7 +20,9 @@ when those tools are absent, so the suite still runs on a non-Debian box.
 
 import base64
 import contextlib
+import gzip
 import hashlib
+import lzma
 import importlib.machinery
 import importlib.util
 import io
@@ -4185,6 +4187,92 @@ def clearsign(body, headers="Hash: SHA512"):
 	        + body
 	        + "-----BEGIN PGP SIGNATURE-----\n\nAAAA\n-----END PGP "
 	          "SIGNATURE-----\n")
+
+
+class TestBoundedIndexReading(unittest.TestCase):
+	"""A repository decides how many bytes it sends and how far they expand.
+
+    `--sync` fetched an index with a plain read() and unpacked it with
+    gzip/lzma.decompress, both of which produce whatever the input asks for.
+    Measured before this existed: 61 KB of .xz expands to 400 MB, a ratio of
+    6,859, so a mirror serving nine megabytes can demand sixty gigabytes --
+    of a backend whose reason for existing is boxes that do not have it. The
+    one-shot call took peak RSS to 828 MB for that 61 KB input; refusing at
+    a 64 MB ceiling held it to 108 MB.
+
+    It ran on unverified bytes, too: the index was unpacked first and
+    checked against the signed Release afterwards."""
+
+	INDEX = b"Package: tree\nVersion: 2.2.1-1\n\n" * 200
+
+	def test_it_reads_a_real_index_in_each_encoding(self):
+		for ext, data in ((".gz", gzip.compress(self.INDEX)),
+		                  (".xz", lzma.compress(self.INDEX)),
+		                  ("", self.INDEX)):
+			with self.subTest(encoding=ext or "plain"):
+				self.assertEqual(em.decompress_bounded(data, ext), self.INDEX)
+
+	def test_it_refuses_something_that_expands_past_the_ceiling(self):
+		for ext, compress in ((".gz", gzip.compress), (".xz", lzma.compress)):
+			with self.subTest(encoding=ext):
+				bomb = compress(b"\0" * (4 * 1024 * 1024))
+				self.assertLess(len(bomb), 100 * 1024,
+				                "the fixture is not a bomb; the test would "
+				                "pass for the wrong reason")
+				with self.assertRaises(RuntimeError) as caught:
+					em.decompress_bounded(bomb, ext, limit=1024 * 1024)
+				self.assertIn("expands", str(caught.exception))
+
+	def test_a_truncated_index_is_refused_rather_than_returned_short(self):
+		"""Silently returning the part that unpacked would be worse than
+        failing: a truncated Packages parses fine and just has fewer
+        packages in it, so the resolver would answer from half an index.
+
+        Cut at half the *compressed* length, which had to be measured. The
+        first version of this test cut at a fixed 120 bytes, and this index
+        compresses to 88 -- so it truncated nothing, and passed by reading a
+        whole file."""
+		for ext, compress in ((".gz", gzip.compress), (".xz", lzma.compress)):
+			with self.subTest(encoding=ext):
+				whole = compress(self.INDEX)
+				with self.assertRaises(RuntimeError):
+					em.decompress_bounded(whole[:len(whole) // 2], ext)
+
+	def test_it_is_no_less_strict_than_the_one_shot_calls_it_replaced(self):
+		"""Reading in bounded steps must not cost the integrity checking that
+        came free with gzip.decompress. The gzip trailer is the case worth
+        pinning: the deflate stream can end cleanly while the CRC32 that
+        follows it says the bytes are wrong, and a decompressor that stops
+        at the end of the stream never looks."""
+		whole = gzip.compress(self.INDEX)
+		for name, data in (
+		    ("payload corrupted",
+		     whole[:30] + bytes([whole[30] ^ 0xFF]) + whole[31:]),
+		    ("CRC trailer corrupted", whole[:-8] + b"\x00" * 8),
+		    ("trailer removed", whole[:-8]),
+		):
+			with self.subTest(case=name):
+				with self.assertRaises(Exception):
+					gzip.decompress(data)          # the reference refuses it
+				with self.assertRaises(RuntimeError):
+					em.decompress_bounded(data, ".gz")
+
+	def test_plain_bytes_past_the_ceiling_are_refused_too(self):
+		with self.assertRaises(RuntimeError):
+			em.decompress_bounded(b"x" * 2048, "", limit=1024)
+
+	def test_fetch_stops_at_the_limit(self):
+		root = _scratch()
+		os.makedirs(root)
+		path = os.path.join(root, "index")
+		with open(path, "wb") as f:
+			f.write(b"x" * 4096)
+		self.assertEqual(len(em.fetch(path, limit=4096)), 4096,
+		                 "a file exactly at the limit is not too big")
+		with self.assertRaises(RuntimeError):
+			em.fetch(path, limit=4095)
+		self.assertEqual(len(em.fetch(path)), 4096,
+		                 "no limit given, no limit applied")
 
 
 class TestDearmor(unittest.TestCase):

@@ -70,6 +70,7 @@ import email.utils
 import functools
 import gzip
 import hashlib
+import zlib
 import os
 import re
 import shlex
@@ -84,6 +85,13 @@ try:
 	import lzma                       # may be absent on minimal builds
 except ImportError:
 	lzma = None
+
+# What a corrupt compressed stream raises. Built here rather than written out
+# at the catch site because lzma is optional, and LZMAError descends straight
+# from Exception -- naming OSError and ValueError does not cover it.
+DECOMPRESS_ERRORS = (zlib.error, OSError, EOFError, ValueError)
+if lzma is not None:
+	DECOMPRESS_ERRORS += (lzma.LZMAError,)
 
 # ---------------------------------------------------------------------------
 # Paths & constants (dpkg backend)
@@ -1249,13 +1257,82 @@ def read_sources():
 					one_line(line)
 	return entries
 
-def fetch(url, timeout=60):
-	"""http(s):// and file:// both via urllib; bare paths become file://."""
+# A package index is large -- Debian's amd64 main is tens of megabytes
+# uncompressed -- but it is not unbounded, and on this backend nothing else
+# decides how much memory a repository may ask for. Generous enough that no
+# real archive comes close; small enough that an embedded box survives a
+# hostile one.
+MAX_INDEX_BYTES = 512 * 1024 * 1024
+
+
+def fetch(url, timeout=60, limit=None):
+	"""http(s):// and file:// both via urllib; bare paths become file://.
+
+    `limit` caps what will be read. A server decides how many bytes it
+    sends, so a plain read() lets a repository -- or anything sitting on the
+    http:// connection to one -- decide how much memory this process uses."""
 	if url.startswith("/"):
 		url = "file://" + url
 	req = urllib.request.Request(url, headers={"User-Agent": "emerge/1.0"})
 	with urllib.request.urlopen(req, timeout=timeout) as r:
-		return r.read()
+		if limit is None:
+			return r.read()
+		# One byte past the limit, so that hitting it exactly is not an error
+		# while exceeding it is detectable without reading the rest.
+		data = r.read(limit + 1)
+		if len(data) > limit:
+			raise RuntimeError(f"{url}: larger than {limit} bytes; refusing "
+			                   f"to read the rest")
+		return data
+
+
+def decompress_bounded(raw, ext, limit=MAX_INDEX_BYTES):
+	"""Decompress an index, refusing to produce more than `limit` bytes.
+
+    `gzip.decompress`/`lzma.decompress` produce whatever the input asks for,
+    and a compressor is very good at asking. Measured: 61 KB of .xz expands
+    to 400 MB, a ratio of 6,859 -- so a mirror serving nine megabytes can
+    demand sixty gigabytes, and this is the backend written for boxes that
+    do not have it.
+
+    Decompressing in bounded steps costs nothing on a real index and turns
+    the attack into an error message."""
+	if ext == "":
+		if len(raw) > limit:
+			raise RuntimeError(f"index is larger than {limit} bytes")
+		return raw
+	if ext == ".gz":
+		obj = zlib.decompressobj(16 + zlib.MAX_WBITS)
+	elif lzma is not None:
+		obj = lzma.LZMADecompressor()
+	else:
+		raise RuntimeError("no lzma support in this Python")
+
+	out = bytearray()
+	step = 4 * 1024 * 1024
+	data = raw
+	while True:
+		# zlib and lzma each raise their own error type for corrupt input.
+		# One exception type out of here means a caller has one thing to
+		# catch and the message always says which file went wrong.
+		try:
+			chunk = obj.decompress(data, step)
+		except DECOMPRESS_ERRORS as e:
+			raise RuntimeError(f"index is corrupt: {e}") from e
+		out += chunk
+		if len(out) > limit:
+			raise RuntimeError(
+			    f"index expands to more than {limit} bytes; refusing it. "
+			    f"A {len(raw)} byte file that unpacks past this is not an "
+			    f"archive index.")
+		# zlib hands leftover input back; lzma keeps it and wants b"".
+		data = getattr(obj, "unconsumed_tail", b"")
+		if obj.eof:
+			break
+		if not chunk and not data:
+			# No progress and not at the end: truncated or corrupt.
+			raise RuntimeError("index is truncated or corrupt")
+	return bytes(out)
 
 # ---------------------------------------------------------------------------
 # Repository signature verification (dpkg backend)
@@ -1626,32 +1703,39 @@ class DpkgBackend:
 					sys.exit(1)
 				print(f"{ARROW} Fetching {BLUE(f'{base} {suite}/{comp}')} ...",
 				      end=" ", flush=True)
-				data = raw = None
+				data = None
 				used_ext = ""
-				attempts = [(".gz", gzip.decompress), ("", lambda b: b)]
+				this_signed = False
+				exts = [".gz", ""]
 				if lzma:
-					attempts.insert(0, (".xz", lzma.decompress))
-				for ext, dec in attempts:
+					exts.insert(0, ".xz")
+				for ext in exts:
 					try:
-						raw = fetch(stem + ext)
-						data = dec(raw)
-						used_ext = ext
-						break
+						raw = fetch(stem + ext, limit=MAX_INDEX_BYTES)
 					except Exception:
 						continue
-				this_signed = False
-				if data is not None:
-					# Release records the hash of the file as transferred, so
-					# this has to check the bytes before decompression.
+					# Check the hash BEFORE unpacking. Release records the
+					# hash of the file as transferred, so the check is on
+					# `raw` whichever order these run in -- but decompressing
+					# first let a mirror spend this process's memory on bytes
+					# nothing had vouched for yet, and a compressor is very
+					# good at asking for memory.
 					try:
-						this_signed = verifier.check_index(
-						    base, suite, signed_by, relbase + used_ext, raw)
-						signed += this_signed
+						signed_now = verifier.check_index(
+						    base, suite, signed_by, relbase + ext, raw)
 					except RuntimeError as e:
 						print(RED("FAILED"))
 						verifier.close()
 						eblock(str(e))
 						sys.exit(1)
+					try:
+						data = decompress_bounded(raw, ext)
+					except Exception:
+						data = None
+						continue
+					used_ext, this_signed = ext, signed_now
+					signed += this_signed
+					break
 				if data is None and flat and base.startswith("file://"):
 					directory = base[len("file://"):]
 					if os.path.isdir(directory):
@@ -1960,10 +2044,20 @@ class DpkgBackend:
 				paths.append(dest); continue
 			print(f"{ARROW} Fetching ({i} of {total}) {BGREEN(pv)} ...",
 			      end=" ", flush=True)
+			# The index says how big the file is, so anything past that is
+			# already wrong and there is no reason to hold it in memory to
+			# find out. The SHA256 below is what decides correctness; this
+			# only stops a mirror choosing how much memory to spend before
+			# getting there. A stanza without a usable Size gets no limit,
+			# which is the old behaviour.
+			try:
+				cap = int(st.get("Size", ""))
+			except ValueError:
+				cap = None
 			data = None
 			for base in bases:
 				try:
-					data = fetch(f"{base}/{st['Filename']}")
+					data = fetch(f"{base}/{st['Filename']}", limit=cap)
 					break
 				except Exception:
 					continue
