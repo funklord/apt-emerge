@@ -1182,14 +1182,34 @@ def calc_deps_done(ok=True):
 # Shared: installed state from dpkg's status file (no subprocesses)
 # ---------------------------------------------------------------------------
 
+# name -> the architectures it is installed for, when there is more than one.
+# A property of the status file rather than of any one call, and
+# installed_state() is called from a dozen places, so it is recorded here as
+# that parse happens rather than being worked out again by each caller.
+MULTIARCH_INSTANCES = {}
+
+
 def installed_state():
-	"""{name: stanza} of installed packages, parsed from dpkg status."""
+	"""{name: stanza} of installed packages, parsed from dpkg status.
+
+    Keyed by name alone, which a multiarch system makes ambiguous: after
+    `dpkg --add-architecture i386`, `libfoo:amd64` and `libfoo:i386` are two
+    installed packages sharing one name, and the later stanza silently wins
+    here. Any name that collided is recorded in MULTIARCH_INSTANCES so that
+    the callers who cannot cope say so, instead of working from half a
+    view."""
 	inst = {}
+	arches = {}
 	with open(STATUS, errors="replace") as f:
 		for st in parse_stanzas(f.read()):
 			status = st.get("Status", "")
 			if "installed" in status and "not-installed" not in status:
-				inst[st["Package"]] = st
+				name = st["Package"]
+				arches.setdefault(name, []).append(st.get("Architecture", "?"))
+				inst[name] = st
+	MULTIARCH_INSTANCES.clear()
+	MULTIARCH_INSTANCES.update(
+	    {n: sorted(set(a)) for n, a in arches.items() if len(set(a)) > 1})
 	return inst
 
 def is_protected(st):
@@ -1854,6 +1874,32 @@ class DpkgBackend:
 	# must not do work, which this project has been bitten by before.
 	_warned_stale_world = False
 
+	_warned_multiarch = False
+
+	def _warn_multiarch(self):
+		"""Say when the system holds packages this backend cannot represent.
+
+        `installed_state()` is keyed by name, so on a multiarch system one
+        instance of each shared name is simply dropped -- and the resolver
+        then plans against a view of the machine that is missing packages.
+        The right fix is to key by name:architecture throughout, which
+        reaches the resolver, the world file, depclean and the index (which
+        is fetched for the native architecture only). That is a real piece of
+        work rather than a patch, and the backend exists for embedded boxes
+        that are single-architecture, so for now this says so plainly instead
+        of pretending otherwise."""
+		if DpkgBackend._warned_multiarch or not MULTIARCH_INSTANCES:
+			return
+		DpkgBackend._warned_multiarch = True
+		names = sorted(MULTIARCH_INSTANCES)
+		ewarn_later(f"{len(names)} package(s) are installed for more than "
+		            f"one architecture, and this backend keys packages by "
+		            f"name alone:")
+		ewarn_later("  " + " ".join(names[:8])
+		            + (" ..." if len(names) > 8 else ""))
+		ewarn_later("Only one instance of each is visible to it. Use the apt "
+		            "backend on a multiarch system.")
+
 	def _selected(self, inst):
 		"""The world file's installed members, saying so when some are not.
 
@@ -1915,6 +1961,7 @@ class DpkgBackend:
 	            no_dep_upgrade=False, allow=None):
 		self._load_index(all_versions=no_dep_upgrade)
 		inst = installed_state()
+		self._warn_multiarch()
 		iprov = self._inst_provides(inst)
 
 		atoms, set_members = self.expand_sets(targets)
@@ -2194,10 +2241,25 @@ class DpkgBackend:
 
 	def unmerge_candidates(self, targets, opts):
 		inst = installed_state()
+		self._warn_multiarch()
 		removals = []
 		for t in targets:
 			if t not in inst:
 				ewarn(f"{t} is not installed; skipping."); continue
+			if t in MULTIARCH_INSTANCES:
+				# dpkg refuses this itself -- "ambiguous package name 'libfoo'
+				# with more than one installed instance" -- but only after the
+				# plan has been shown and confirmed, and it says nothing about
+				# which instance was meant. Stop here, where the names can be
+				# spelled out.
+				arches = MULTIARCH_INSTANCES[t]
+				eerror(f"{t} is installed for {len(arches)} architectures: "
+				       + ", ".join(f"{t}:{a}" for a in arches))
+				eerror("This backend keys packages by name, so it cannot say "
+				       "which you mean, and dpkg would refuse the removal as "
+				       "ambiguous. Name the instance to dpkg directly:")
+				eerror(f"    dpkg -r {t}:{arches[0]}")
+				sys.exit(1)
 			if is_protected(inst[t]):
 				eerror(f"{t} is Essential/required; refusing to unmerge.")
 				sys.exit(1)

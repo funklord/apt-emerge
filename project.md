@@ -182,6 +182,34 @@ used at all.**
 dpkg backend uses only: `dpkg`, `dpkg-deb`, `dpkg-query`, `tar`, `urllib`, and
 its own everything-else.
 
+**The dpkg backend is single-architecture, and now says so.** `installed_state()`
+is keyed by package name, and after `dpkg --add-architecture i386` that is
+ambiguous: `libfoo:amd64` and `libfoo:i386` are two installed packages
+sharing one name, and the later stanza in the status file silently won. So
+the resolver planned against a view of the machine with packages missing
+from it, and `emerge -C libfoo` went all the way to dpkg, which refuses —
+"ambiguous package name 'libfoo' with more than one installed instance",
+verified against real dpkg with two hand-built `.debs`.
+
+Keying by `name:architecture` throughout is the real fix and a real piece of
+work: it reaches the resolver, the world file, depclean, and the index,
+which `sync` fetches for `binary-<native>` only, so a foreign-arch package
+has no index entry to be resolved against at all. The backend exists for
+embedded boxes, which are single-architecture, and the apt backend — what
+runs on any desktop that has i386 enabled — delegates to apt and is
+unaffected. So the position is: **detect it and say so**, rather than
+half-supporting it.
+
+- `installed_state()` records every colliding name in `MULTIARCH_INSTANCES`
+  as it parses, since it is a property of the file and the function is
+  called from a dozen places.
+- `resolve` warns once, after the progress line, naming the packages.
+- `unmerge` refuses a name it cannot disambiguate and prints the command
+  that works (`dpkg -r libfoo:amd64`), rather than letting dpkg produce the
+  raw error after the plan has already been shown and confirmed.
+
+Whether to implement multiarch properly is open, and is the owner's call.
+
 ### CLI surface (Portage dialect)
 
 - `--sync` — apt: `apt-get update`; dpkg: fetch `Packages` indexes into

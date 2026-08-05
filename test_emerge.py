@@ -2089,6 +2089,93 @@ class TestPretendWritesNothing(unittest.TestCase):
 		                 "pick_backend did not pass --pretend to the backend")
 
 
+class TestMultiarchIsNoticed(unittest.TestCase):
+	"""`installed_state()` is keyed by name, and a multiarch system makes
+    that ambiguous.
+
+    After `dpkg --add-architecture i386`, `libfoo:amd64` and `libfoo:i386`
+    are two installed packages sharing one name, and the later stanza won --
+    silently, so the resolver planned against a view of the machine with
+    packages missing from it. `emerge -C libfoo` then reached dpkg, which
+    refuses: "ambiguous package name 'libfoo' with more than one installed
+    instance", verified against real dpkg with two hand-built .debs.
+
+    Keying by name:architecture throughout is the real fix and a real piece
+    of work -- it reaches the resolver, the world file, depclean and the
+    index, which is fetched for the native architecture only. The backend is
+    for single-architecture embedded boxes, so this says so rather than
+    pretending otherwise."""
+
+	MULTI = ("Package: libfoo\nStatus: install ok installed\nVersion: 1.0\n"
+	         "Architecture: amd64\nPriority: optional\n\n"
+	         "Package: libfoo\nStatus: install ok installed\nVersion: 0.9\n"
+	         "Architecture: i386\nPriority: optional\n\n"
+	         "Package: tree\nStatus: install ok installed\nVersion: 2.0\n"
+	         "Architecture: amd64\nPriority: optional\n\n")
+	SINGLE = ("Package: tree\nStatus: install ok installed\nVersion: 2.0\n"
+	          "Architecture: amd64\nPriority: optional\n\n")
+
+	def setUp(self):
+		self.mod = load()
+		root = _scratch()
+		os.makedirs(root)
+		self.mod.STATUS = os.path.join(root, "status")
+		self.said = []
+		self.mod.ewarn = self.said.append
+		self.mod.ewarn_later = self.said.append
+		self.mod.eerror = self.said.append
+
+	def status(self, text):
+		with open(self.mod.STATUS, "w") as f:
+			f.write(text)
+
+	def test_an_ordinary_single_architecture_system_says_nothing(self):
+		"""The false-positive case, and the one that matters most: every
+        normal machine must go through here silently."""
+		self.status(self.SINGLE)
+		self.mod.installed_state()
+		self.assertEqual(self.mod.MULTIARCH_INSTANCES, {})
+
+	def test_the_collision_is_recorded_with_its_architectures(self):
+		self.status(self.MULTI)
+		inst = self.mod.installed_state()
+		self.assertEqual(self.mod.MULTIARCH_INSTANCES,
+		                 {"libfoo": ["amd64", "i386"]})
+		self.assertEqual(len(inst), 2, "still one entry per name")
+
+	def test_it_is_cleared_when_the_system_no_longer_has_one(self):
+		"""It is module state, so a stale entry would outlive its status
+        file and warn about a machine that had been fixed."""
+		self.status(self.MULTI)
+		self.mod.installed_state()
+		self.status(self.SINGLE)
+		self.mod.installed_state()
+		self.assertEqual(self.mod.MULTIARCH_INSTANCES, {})
+
+	def test_unmerging_an_ambiguous_name_is_refused_with_the_instances(self):
+		self.status(self.MULTI)
+		be = self.mod.DpkgBackend()
+		with self.assertRaises(SystemExit):
+			with contextlib.redirect_stdout(io.StringIO()):
+				be.unmerge_candidates(["libfoo"],
+				                      {"ask": False, "pretend": False})
+		joined = " ".join(self.said)
+		self.assertIn("libfoo:amd64", joined)
+		self.assertIn("libfoo:i386", joined)
+		self.assertIn("dpkg -r libfoo:amd64", joined,
+		              "the refusal should name the command that works")
+
+	def test_an_unambiguous_name_on_the_same_system_still_unmerges(self):
+		"""The warning must not become a refusal for everything else on the
+        machine."""
+		self.status(self.MULTI)
+		be = self.mod.DpkgBackend()
+		with contextlib.redirect_stdout(io.StringIO()):
+			removals = be.unmerge_candidates(["tree"],
+			                                 {"ask": False, "pretend": False})
+		self.assertEqual(removals, [("tree", "2.0")])
+
+
 class TestPrintUnmergeList(unittest.TestCase):
 	def render(self, removals, requested=None):
 		buf = io.StringIO()
