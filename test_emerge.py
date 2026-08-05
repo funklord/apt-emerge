@@ -2016,6 +2016,79 @@ class TestDeselect(unittest.TestCase):
 		self.assertEqual(caught.exception.code, 1)
 
 
+class TestPretendWritesNothing(unittest.TestCase):
+	"""--pretend must leave the system exactly as it found it.
+
+    The dpkg backend seeds its world file when the backend is constructed,
+    and that timing is load-bearing: deferring it to the first read meant
+    merge() seeded *after* dpkg had run, pulling every dependency of the
+    first install into @world for good. But construction happens for a
+    pretend run too, so on a fresh root box `emerge -p bash` created a
+    92-entry world file -- on a run that then failed for want of a package
+    tree. That is the shape of the `emerge -V` bug that moved seeding out of
+    pick_backend(), arriving through a different door.
+
+    Both properties are asserted here because the fix has to keep the first
+    while removing the second, and either one alone is easy."""
+
+	def setUp(self):
+		self.mod = load()
+		root = _scratch()
+		os.makedirs(root)
+		self.mod.LIB_DIR = os.path.join(root, "lib")
+		self.mod.WORLD = os.path.join(self.mod.LIB_DIR, "world")
+		self.mod.STATUS = os.path.join(root, "status")
+		with open(self.mod.STATUS, "w") as f:
+			for name in ("bash", "coreutils", "tree"):
+				f.write(f"Package: {name}\nStatus: install ok installed\n"
+				        f"Version: 1.0\nArchitecture: all\n"
+				        f"Priority: optional\n\n")
+		# Seeding returns early for anyone but root, which is why this went
+		# unnoticed on a workstation and showed up in a container.
+		original = os.geteuid
+		self.addCleanup(setattr, os, "geteuid", original)
+		os.geteuid = lambda: 0
+
+	def test_a_pretend_run_creates_no_world_file(self):
+		with contextlib.redirect_stdout(io.StringIO()):
+			self.mod.DpkgBackend(pretend=True)
+		self.assertFalse(os.path.exists(self.mod.WORLD),
+		                 "--pretend wrote a world file")
+		self.assertFalse(os.path.exists(self.mod.LIB_DIR),
+		                 "--pretend created /var/lib/emerge-dpkg")
+
+	def test_a_pretend_run_still_shows_the_set_a_real_run_would_use(self):
+		"""Skipping the seed entirely would have been the easy fix and the
+        wrong one: @selected would read empty, so `emerge -p @world` would
+        show a smaller set than the run it is previewing."""
+		with contextlib.redirect_stdout(io.StringIO()):
+			pretend = self.mod.DpkgBackend(pretend=True)
+			_, members = pretend.expand_sets(["@selected"])
+		self.assertEqual(sorted(members), ["bash", "coreutils", "tree"])
+
+	def test_a_real_run_still_seeds_at_construction(self):
+		"""The load-bearing half. Seeding must happen before anything is
+        installed, so it belongs at construction and not at first read."""
+		with contextlib.redirect_stdout(io.StringIO()):
+			self.mod.DpkgBackend()
+		with open(self.mod.WORLD) as f:
+			self.assertEqual(sorted(f.read().split()),
+			                 ["bash", "coreutils", "tree"])
+
+	def test_pick_backend_passes_the_flag_through(self):
+		"""The wiring is the part that silently does nothing when it is
+        wrong, because the default is the old behaviour.
+
+        Forced by name rather than by hiding apt-get: stubbing shutil.which
+        would patch the module object the script shares with this process,
+        and the first version of this test did exactly that and restored the
+        stub over itself. The module sentinel caught it."""
+		with contextlib.redirect_stdout(io.StringIO()):
+			self.mod.pick_backend("dpkg", pretend=True)
+		self.assertFalse(os.path.exists(self.mod.WORLD),
+		                 "pick_backend did not pass --pretend to the backend")
+
+
 class TestPrintUnmergeList(unittest.TestCase):
 	def render(self, removals, requested=None):
 		buf = io.StringIO()
@@ -2624,7 +2697,7 @@ class TestArgParsing(unittest.TestCase):
 		self.mod.eerror = self.errors.append
 		self.mod.ewarn = lambda m: None
 
-		def stop(_flag):
+		def stop(_flag, pretend=False):
 			raise self.Reached()
 		self.mod.pick_backend = stop
 
@@ -2687,7 +2760,7 @@ class TestArgParsing(unittest.TestCase):
 				seen["allow"] = set(kw.get("allow") or ())
 				raise reached()
 
-		self.mod.pick_backend = lambda flag: B()
+		self.mod.pick_backend = lambda flag, pretend=False: B()
 		with self.assertRaises(self.Reached):
 			with contextlib.redirect_stdout(io.StringIO()):
 				self.mod.main(argv)

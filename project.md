@@ -1451,10 +1451,25 @@ to be true for it to fail, and go and make that true.
   so the tool has something to edit. A tool that exits 0 without writing would
   otherwise have that seed accepted back as a merge result — silently
   "merging" to exactly what you already had and retiring the update.
-- Constructing a backend must not do work. `pick_backend()` runs for
-  `emerge -V` too, and `DpkgBackend.__init__` seeded the world file — so a
+- **Constructing a backend must not create state, and world seeding has now
+  broken that twice.** `pick_backend()` used to run for `emerge -V`, so a
   version query, as root, created `/var/lib/emerge-dpkg` and announced it.
-  Seeding is deferred to the first `_read_world()`.
+  That was fixed by deferring the seed to the first `_read_world()` — which
+  was **worse**, because `merge()` reads the world file *after* dpkg has
+  run, so the seed then captured what the merge had just installed and put
+  every dependency of the first install into `@world` permanently.
+
+  So seeding sits at construction, where it happens before anything is
+  installed, and `emerge -V` avoids it by not constructing a backend at all
+  (`backend_name()`). This entry said the opposite for a while; the code's
+  own docstring is the record to trust here, and it explains why.
+
+  The third door was `--pretend`, which constructs a backend like anything
+  else: `emerge -p bash` on a fresh root box wrote a 92-entry world file, on
+  a run that then failed for want of a package tree. A pretend run now seeds
+  **in memory** — not skipped, because `@selected` reading empty would make
+  `emerge -p @world` preview a smaller set than the run it is previewing.
+  All three properties have tests, since each fix here has broken another.
 - `int(epoch)` in `vercmp` raised `ValueError` on a malformed version, and
   `vercmp` sits on every code path there is: one odd string in an index took
   down an operation that had nothing to do with it. A non-numeric epoch now

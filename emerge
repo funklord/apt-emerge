@@ -1584,12 +1584,14 @@ class Verifier:
 class DpkgBackend:
 	name = "dpkg"
 
-	def __init__(self):
+	def __init__(self, pretend=False):
 		self.pkgs = {}        # name -> best index stanza
 		self.provides = {}    # virtual -> [(provider, version|None)]
 		self.versions = None  # name -> [stanza,...] (built lazily on demand)
 		self._plan = []       # resolver output stanzas, kept for merge()
 		self._seeded = False
+		self._pretend = pretend
+		self._world_seed = set()
 		self._seed_world()
 
 	# -- world file ---------------------------------------------------------
@@ -1616,15 +1618,31 @@ class DpkgBackend:
 		self._seeded = True
 		if os.path.exists(WORLD) or os.geteuid() != 0:
 			return
-		os.makedirs(LIB_DIR, exist_ok=True)
 		inst = installed_state()
+		if self._pretend:
+			# A pretend run must leave nothing behind, and this is the only
+			# place the dpkg backend writes without being asked to -- so
+			# `emerge -p bash` on a fresh root box created a 92-entry world
+			# file, on a run that then failed for want of a package tree.
+			# Exactly the shape of the `emerge -V` bug that moved this out of
+			# pick_backend(), reached through a different door.
+			#
+			# Keep the seed in memory rather than skipping it: @selected is
+			# what it is whether or not the file exists yet, and a --pretend
+			# that showed a different set from the real run would be a worse
+			# answer than the file.
+			self._world_seed = set(inst)
+			return
+		os.makedirs(LIB_DIR, exist_ok=True)
 		with open(WORLD, "w") as f:
 			f.write("\n".join(sorted(inst)) + "\n")
 		einfo(f"Seeded world file with {len(inst)} currently installed packages.")
 
 	def _read_world(self):
 		if not os.path.exists(WORLD):
-			return set()
+			# Empty unless a pretend run seeded in memory above, in which
+			# case this is the set the real run would have written.
+			return set(self._world_seed)
 		with open(WORLD) as f:
 			return {l.strip() for l in f if l.strip()}
 
@@ -3806,12 +3824,16 @@ def backend_name(forced):
 		eerror(f"unknown backend '{choice}' (use apt or dpkg)"); sys.exit(1)
 	return "apt" if shutil.which("apt-get") else "dpkg"
 
-def pick_backend(forced):
+def pick_backend(forced, pretend=False):
+	"""The backend for this run. `pretend` reaches the dpkg backend because
+    constructing it seeds the world file, which a --pretend run must not
+    write. The apt backend keeps @selected in apt's marks and creates
+    nothing, so it does not need telling."""
 	if backend_name(forced) == "apt":
 		if not shutil.which("apt-get"):
 			eerror("apt backend requested but apt-get not found."); sys.exit(1)
 		return AptBackend()
-	return DpkgBackend()
+	return DpkgBackend(pretend=pretend)
 
 def main(argv):
 	opts = {k: False for k in ("ask", "verbose", "pretend", "update", "deep",
@@ -3931,7 +3953,7 @@ def main(argv):
 	if opts["dispatch"]:
 		dispatch_conf(opts); return
 
-	be = pick_backend(backend_flag)
+	be = pick_backend(backend_flag, pretend=opts["pretend"])
 
 	if opts["sync"]:
 		# the apt backend's sync is apt-get update, which verifies on its own
