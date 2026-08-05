@@ -3123,6 +3123,24 @@ def _write(path, lines):
     against a concurrent reader but not against power loss -- without the
     fsync the file can come back empty afterwards, and an empty sshd_config
     is worse than either version we were choosing between."""
+	# A conffile is quite often a symlink. An admin pointing /etc/foo at a
+	# git-managed tree is the usual reason; Debian's own alternatives system
+	# is another. os.replace would swap the LINK itself for a regular file,
+	# with two silent consequences: the indirection disappears, and the
+	# merged content lands at the link's name while the file it pointed at
+	# keeps the old text -- so the admin's source of truth goes stale and
+	# their next edit of it changes nothing.
+	#
+	# Resolving first is also what the rest of this function already assumed.
+	# os.stat follows symlinks, so the mode and owner being preserved so
+	# carefully below were the TARGET's all along, and were being applied to
+	# the regular file that replaced the link.
+	#
+	# What this does not preserve is a hard link: os.replace swaps in a new
+	# inode, so a conffile with a second link to it will diverge. That is
+	# not fixable without giving up the atomic replace, which is a much worse
+	# trade for /etc than a broken hard link is.
+	path = os.path.realpath(path)
 	st = os.stat(path)
 	tmp = path + ".emerge-tmp"
 	try:

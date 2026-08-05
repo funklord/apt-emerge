@@ -3648,6 +3648,78 @@ class TestConfigWrite(unittest.TestCase):
 		em._write(self.path, ["x\n"])
 		self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
 
+	# A conffile is quite often a symlink -- an admin pointing /etc/foo at a
+	# git-managed tree, or Debian's own alternatives. os.replace swaps the
+	# LINK for a regular file, so the indirection vanished and the merged
+	# text landed at the link's name while the file it pointed at kept the
+	# old content. Both halves are asserted below, because fixing only the
+	# first would leave the update going to the wrong file.
+	def link_to(self, name="link.conf"):
+		link = os.path.join(self.dir, name)
+		os.symlink(self.path, link)
+		return link
+
+	def test_a_symlinked_conffile_is_still_a_symlink_afterwards(self):
+		link = self.link_to()
+		em._write(link, ["merged\n"])
+		self.assertTrue(os.path.islink(link),
+		                "dispatch-conf replaced the admin's symlink with a "
+		                "regular file")
+
+	def test_writing_through_a_symlink_updates_the_file_it_points_at(self):
+		link = self.link_to()
+		em._write(link, ["merged\n"])
+		with open(self.path) as f:
+			self.assertEqual(f.read(), "merged\n",
+			                 "the update landed at the link's name and left "
+			                 "the real file stale")
+
+	def test_a_relative_symlink_resolves_too(self):
+		"""The usual spelling in /etc, and the one that breaks if the target
+        is joined against the wrong directory."""
+		sub = os.path.join(self.dir, "sub")
+		os.mkdir(sub)
+		target = os.path.join(sub, "real.conf")
+		with open(target, "w") as f:
+			f.write("original\n")
+		link = os.path.join(self.dir, "rel.conf")
+		os.symlink(os.path.join("sub", "real.conf"), link)
+		em._write(link, ["merged\n"])
+		self.assertTrue(os.path.islink(link))
+		with open(target) as f:
+			self.assertEqual(f.read(), "merged\n")
+
+	def test_the_temporary_file_lands_beside_the_target(self):
+		"""os.replace is only atomic within one filesystem, so the temp file
+        has to be made next to the file it will replace -- not next to the
+        symlink, which may be on another mount entirely.
+
+        Asserted by capturing what os.replace was actually called with. The
+        obvious version of this test -- write, then look for leftovers --
+        passes whether or not the fix is present, because there is no
+        leftover either way; it was written that way first and the mutation
+        went straight through it."""
+		sub = os.path.join(self.dir, "elsewhere")
+		os.mkdir(sub)
+		target = os.path.join(sub, "real.conf")
+		with open(target, "w") as f:
+			f.write("original\n")
+		link = os.path.join(self.dir, "link.conf")
+		os.symlink(target, link)
+
+		seen = []
+		original = os.replace          # captured BEFORE patching, or the
+		self.addCleanup(setattr, os, "replace", original)   # cleanup restores
+		def spy(src, dst):             # the patch over itself
+			seen.append(src)
+			return original(src, dst)
+		os.replace = spy
+
+		em._write(link, ["merged\n"])
+		self.assertEqual([os.path.dirname(s) for s in seen], [sub],
+		                 "the temporary file was created next to the symlink "
+		                 "rather than next to the file being replaced")
+
 	def test_leaves_no_temporary_file(self):
 		em._write(self.path, ["x\n"])
 		self.assertEqual(os.listdir(self.dir), ["conf"])

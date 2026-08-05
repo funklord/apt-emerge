@@ -448,6 +448,26 @@ corrupted. `printable()` renders the original byte escaped (`caf\xe9`), and
 encodes the captured output rather than just capturing it, because a
 `StringIO` holds surrogates quite happily and would pass either way.
 
+**A conffile is quite often a symlink**, and `_write` used to destroy it.
+`os.replace` swaps the *link* for a regular file, so an admin who points
+`/etc/nginx/nginx.conf` at a git-managed tree lost two things silently: the
+indirection, and the update itself — the merged text landed at the link's
+name while the file it pointed at kept the old content, so their source of
+truth went stale and their next edit of it changed nothing. `_write` now
+resolves with `os.path.realpath` first.
+
+That the function was already inconsistent is the tell worth remembering:
+`os.stat` follows symlinks, so the mode and owner it takes such care to
+preserve were the *target's* all along, and were being applied to the
+regular file that had just replaced the link. Two lines apart, disagreeing
+about which file they were operating on.
+
+What it still does not preserve is a **hard link** — `os.replace` swaps in
+a new inode, so a conffile with a second link to it will diverge. Left
+alone deliberately: fixing it means writing in place and giving up the
+atomic replace, which is a far worse trade for `/etc` than a broken hard
+link.
+
 The same read-then-write-back shape appears in `_bump_changelog`, which is
 the likeliest file in a source tree to carry such a byte — it is full of
 maintainer names — and it raised `UnicodeDecodeError` rather than
