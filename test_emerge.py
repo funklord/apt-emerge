@@ -1075,6 +1075,87 @@ class TestNduSolve(unittest.TestCase):
 # The --no-dep-upgrade guarantee, independent of any solver
 # ---------------------------------------------------------------------------
 
+class TestTheLockstepWall(unittest.TestCase):
+	"""The libsdl3-dev case, rebuilt so it no longer needs this machine.
+
+    `--no-dep-upgrade` was validated against the live trixie tree, where
+    installing libsdl3-dev dragged the Mesa stack from 25.0.7-2 to
+    25.0.7-2+deb13u1 and produced a wall. Running it found three bugs, all
+    fixed and unit-tested since. But the *scenario* lived only on the box,
+    and the box has since been updated: Mesa is at 25.0.7-2+deb13u1 now, so
+    the same command resolves cleanly with 33 new packages and no wall at
+    all. The evidence expired without anything failing, which is the way
+    live-system evidence always expires.
+
+    So the shape is pinned here instead: a same-upstream revision bump that
+    an uninstalled target requires, which is the case the escape hatch and
+    the `(session rebuild)` label both exist for."""
+
+	# Two packages, because a lockstep stack walls one at a time and the
+	# interesting behaviour is what the second wall suggests. With only one
+	# mover there are no earlier grants to carry, so the test that claims to
+	# pin that cannot fail -- which is how this was first written, and the
+	# mutation went straight through it.
+	def index(self):
+		return FakeIndex({
+		    "libsdl3-dev": [stanza(
+		        "libsdl3-dev", "3.2.10+ds-1",
+		        depends="libgbm1 (>= 25.0.7-2+deb13u1), "
+		                "mesa-libgallium (>= 25.0.7-2+deb13u1)")],
+		    "libgbm1": [stanza("libgbm1", "25.0.7-2+deb13u1"),
+		                stanza("libgbm1", "25.0.7-2")],
+		    "mesa-libgallium": [stanza("mesa-libgallium", "25.0.7-2+deb13u1"),
+		                        stanza("mesa-libgallium", "25.0.7-2")],
+		})
+
+	def solve(self, allow=None):
+		inst = installed(("libgbm1", "25.0.7-2"),
+		                 ("mesa-libgallium", "25.0.7-2"))
+		return em.ndu_solve(self.index(), inst, {}, ["libsdl3-dev"],
+		                    {"libsdl3-dev"}, False, allow)
+
+	def test_it_walls_rather_than_dragging_the_installed_ones_up(self):
+		with self.assertRaises(em.NduWall) as caught:
+			self.solve()
+		moved = {m["name"] for m in caught.exception.movers}
+		self.assertTrue(moved <= {"libgbm1", "mesa-libgallium"}, moved)
+		self.assertTrue(moved, "a wall that names nothing cannot be acted on")
+
+	def test_the_wall_knows_it_is_only_a_revision_bump(self):
+		"""What separates this from a real upgrade: same upstream version,
+        so the session keeps running and the warning says `(session
+        rebuild)` rather than threatening to close the user's apps."""
+		with self.assertRaises(em.NduWall) as caught:
+			self.solve()
+		mover = caught.exception.movers[0]
+		self.assertTrue(em.same_upstream(mover["installed"], mover["wanted"]),
+		                f"{mover} should read as a same-upstream bump")
+
+	def test_following_the_suggestion_converges_instead_of_looping(self):
+		"""The hint has to accumulate. One of the three bugs found on the
+        live tree was a --with suggestion that dropped the earlier grants,
+        so following it walled on the package you had just permitted and
+        sent you round again.
+
+        Walked here the way a user would: wall, take the suggested line,
+        wall again, take that line, resolve."""
+		with self.assertRaises(em.NduWall) as first:
+			self.solve()
+		allow = set(em._with_arg(set(), first.exception.movers).split(","))
+
+		with self.assertRaises(em.NduWall) as second:
+			self.solve(allow=allow)
+		suggested = em._with_arg(allow, second.exception.movers)
+		self.assertEqual(sorted(suggested.split(",")),
+		                 ["libgbm1", "mesa-libgallium"],
+		                 "the second suggestion dropped the first grant, so "
+		                 "following it returns to the wall it just cleared")
+
+		_, merges = self.solve(allow=set(suggested.split(",")))
+		self.assertEqual({row[0] for row in merges},
+		                 {"libsdl3-dev", "libgbm1", "mesa-libgallium"})
+
+
 class TestNduSolveAgainstBruteForce(unittest.TestCase):
 	"""The solver against an exhaustive oracle, on random package graphs.
 

@@ -333,6 +333,15 @@ completeness guarantee beyond the step budget.
 made once instead of being repeatedly rejected and restarted. On this box:
 libsdl3-dev wall 4.6s (was 7.7s), `@world` 36s (was 47s).
 
+Those two figures are **not reproducible any more, and not because anything
+regressed** — see the section below. Re-measured 2026-08-05 on the same box,
+now fully updated: `--no-dep-upgrade -p libsdl3-dev` is 7.9s and
+`--no-dep-upgrade -p @world` is 23.8s. Neither is comparable to the number
+above it: the first used to be a *wall* (stop at the first thing that cannot
+move) and is now a full 33-package resolve, and the second has far less left
+to consider on an up-to-date system. A timing tied to live system state
+measures the state as much as the code.
+
 ### Validated against the live trixie tree (the libsdl3-dev case)
 
 `libsdl3-dev` is not installed on trixie and pulls the Mesa stack from
@@ -357,6 +366,25 @@ three bugs, all now fixed and regression-tested:
 Current behaviour: the wall reports the whole Mesa block at once with the full
 `--with` line, and converges in two steps. Lockstep stacks genuinely move
 together — that is the archive's doing, not a solver defect.
+
+**This scenario has since expired, and nothing failed when it did.** The box
+was updated: Mesa is at `25.0.7-2+deb13u1` now, so there is nothing left to
+drag up and `--no-dep-upgrade -p libsdl3-dev` resolves cleanly — 33 new
+packages, no wall. Anyone re-running it to check this section would find the
+feature apparently doing nothing, and conclude either that the section is
+wrong or that the flag is broken.
+
+That is how live-system evidence always expires: silently, because the
+machine moved rather than the code. The three bugs above stay covered by
+their own unit tests, and the *scenario* is now pinned by
+`TestTheLockstepWall`, which rebuilds it from a synthetic index — two
+packages installed at `25.0.7-2`, a target needing both at
+`25.0.7-2+deb13u1`. It walks the wall the way a user does: wall, take the
+suggested `--with`, wall again, take that line, resolve. Written the obvious
+way first with a single mover, where the assertion about accumulating grants
+**could not fail**, because with one mover there is no earlier grant to
+drop; the mutation walked straight through it. Two movers is the smallest
+version of this scenario that tests what it claims to.
 
 ---
 
