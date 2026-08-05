@@ -238,6 +238,29 @@ and
 are accepted aliases. An unrecognised
 .B @name
 is an error rather than a package lookup.
+.SH ATOMS
+An atom is a Debian package name. Portage's category is accepted and
+ignored, so
+.B app-misc/sl
+means
+.BR sl ,
+Debian having no categories.
+.PP
+For an exact version use apt's spelling,
+.BR sl=5.02-1+b1 ,
+rather than Portage's
+.BR =sl-5.02-1+b1 ,
+which is refused with that advice. Version ranges
+.RB ( >= ", " <= )
+have no command-line equivalent here;
+.B --no-dep-upgrade
+is what holds installed versions down.
+.PP
+A multiarch qualifier such as
+.B sl:i386
+is Debian's own syntax and is passed through, as is a path to a
+.B .deb
+file.
 .SH CONFIG FILE MERGING
 Debian already parks updated config files beside the originals \(em dpkg
 writes

@@ -222,6 +222,25 @@ Whether to implement multiarch properly is open, and is the owner's call.
   bare words accepted. On the dpkg backend `@selected` is really the world
   file **intersected with what is installed** — see the open question in the
   backlog; an entry that is not installed is skipped, and now says so.
+- **Atoms are Debian names, and Portage spellings are met halfway.** A
+  category is accepted and dropped (`app-misc/sl` is `sl`), because Debian
+  has none. A leading version operator is refused with the spelling that
+  works: apt's `sl=5.02-1+b1`, not Portage's `=sl-5.02-1+b1`. Position is
+  what separates them — the same `=` is Debian's syntax when it follows the
+  name and Portage's when it leads.
+
+  All of this used to fall through to apt and come back in apt's words, and
+  the worst of them was actively misleading: `emerge app-misc/sl` answered
+  *"Unable to locate package app-misc"*, naming a package nobody had asked
+  for. A tool whose premise is that emerge's command line works here should
+  not answer in the vocabulary of the thing it is driving.
+
+  Two things are deliberately *not* reinterpreted, because Debian already
+  owns the syntax: `sl:i386` is a multiarch qualifier rather than a Portage
+  slot, and anything path-shaped is a local `.deb` for apt to install.
+  That second one is why category-stripping is guarded — `pool/sl.deb` has
+  a category-shaped first component, and dropping it hands apt a file that
+  is not there.
 - `-C`/`--unmerge`, `--depclean`/`-c` (apt: `autoremove`; dpkg: world-closure).
 - `--deselect` — drop packages from `@selected` without unmerging them.
   apt: `apt-mark auto`; dpkg: edit the world file. Honours `-p`.

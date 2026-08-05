@@ -46,6 +46,12 @@ Sets behave like Portage's: @world = @selected + @system, where
 (apt backend), and @system is Debian's Essential/Priority:required base.
 Sets expand into targets, so they mix freely with atoms and each other.
 
+Atoms are Debian package names. A Portage category is accepted and ignored
+(app-misc/sl means sl), since Debian has none. For an exact version use
+apt's spelling, sl=5.02-1+b1, rather than Portage's =sl-5.02-1+b1; version
+ranges have no command-line equivalent, and --no-dep-upgrade is what holds
+installed versions down. A path to a .deb is passed to apt as it stands.
+
 Flags compose like Gentoo's:
 
     emerge cowsay              # installed and current? re-merge (reinstall)
@@ -3906,6 +3912,51 @@ LONG_FLAGS = {"--ask": "a", "--verbose": "v", "--pretend": "p", "--update": "u",
               "--oneshot": "1", "--quiet": "q",
               "--buildpkg": "b", "--buildpkgonly": "B"}
 
+# A Portage category: lowercase words joined by hyphens, then a slash --
+# app-misc/sl, sys-apps/portage, virtual/editor. Debian has no categories, so
+# the part before the slash is noise here rather than a name.
+CATEGORY_RE = re.compile(r"[a-z][a-z0-9]*(-[a-z0-9]+)*")
+# Portage's version operators, and only when they LEAD. `sl=5.02-1+b1` is
+# apt's own exact-version spelling and works; `=sl-5.02-1+b1` is Portage's
+# and does not. The position is what tells them apart.
+VERSION_OP_RE = re.compile(r"^(>=|<=|!=|~|=|>|<)")
+
+
+def translate_atom(atom):
+	"""A Portage atom in Debian's vocabulary, or a complaint that fits.
+
+    The premise of this program is that emerge's command line works here, so
+    the spellings a Portage user's fingers produce should not fall through
+    to apt and come back in apt's words. `emerge app-misc/sl` answered
+    "Unable to locate package app-misc" -- naming a package nobody asked
+    for, and leaking which tool was really being driven.
+
+    Returns `(name, complaint)`, where a complaint is a list of lines and
+    means the atom cannot be run at all."""
+	# A local .deb is a path, not an atom, and apt installs those directly.
+	# Nothing below may touch a token with a slash in it until this is out
+	# of the way, or `emerge ./sl.deb` becomes `emerge sl.deb`.
+	if atom.startswith(("./", "../", "/")) or atom.endswith(".deb"):
+		return atom, None
+
+	if VERSION_OP_RE.match(atom):
+		return atom, [
+		    f"{atom}: that is a Portage version atom, and Debian spells it "
+		    f"differently.",
+		    "    an exact version:  emerge sl=5.02-1+b1",
+		    "    the newest:        emerge sl",
+		    "    Ranges (>=, <=) have no command-line equivalent here.",
+		    "    --no-dep-upgrade is the tool for holding versions down.",
+		]
+
+	if "/" in atom:
+		category, _, rest = atom.partition("/")
+		if CATEGORY_RE.fullmatch(category) and rest and "/" not in rest:
+			return rest, None
+
+	return atom, None
+
+
 def backend_name(forced):
 	"""Which backend would be used, without constructing it.
 
@@ -4044,6 +4095,19 @@ def main(argv):
 
 	if opts.get("_with_pending"):
 		eerror("--with requires a comma-separated package list."); sys.exit(1)
+
+	# Portage spellings, before anything hands them to apt in its own words.
+	translated, complaints = [], []
+	for pkg in pkgs:
+		name, complaint = translate_atom(pkg)
+		translated.append(name)
+		if complaint:
+			complaints.extend(complaint)
+	if complaints:
+		for line in complaints:
+			eerror(line)
+		sys.exit(1)
+	pkgs = translated
 
 	if opts["dispatch"]:
 		dispatch_conf(opts); return

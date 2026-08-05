@@ -2888,6 +2888,92 @@ class TestPortability(unittest.TestCase):
 		self.assertEqual(sorted(mods - set(sys.stdlib_module_names)), [])
 
 
+class TestPortageAtoms(unittest.TestCase):
+	"""The premise is that emerge's command line works here, so the spellings
+    a Portage user's fingers produce should not fall through to apt and come
+    back in apt's words.
+
+    `emerge app-misc/sl` used to answer "Unable to locate package app-misc"
+    -- naming a package nobody asked for, and leaking which tool was really
+    being driven. `=sl-5.02-1+b1` answered "Unable to locate package" with no
+    name in it at all."""
+
+	def kept(self, atom):
+		name, complaint = em.translate_atom(atom)
+		self.assertIsNone(complaint, f"{atom} was rejected: {complaint}")
+		return name
+
+	def test_a_portage_category_is_dropped(self):
+		"""Debian has no categories, so the part before the slash is noise
+        rather than a name."""
+		self.assertEqual(self.kept("app-misc/sl"), "sl")
+		self.assertEqual(self.kept("virtual/editor"), "editor")
+		self.assertEqual(self.kept("sys-apps/coreutils"), "coreutils")
+
+	def test_an_ordinary_name_is_untouched(self):
+		for atom in ("sl", "libsdl3-dev", "gcc-12", "python3.11", "@world",
+		             "world", "@system"):
+			with self.subTest(atom=atom):
+				self.assertEqual(self.kept(atom), atom)
+
+	def test_apts_own_exact_version_spelling_still_works(self):
+		"""The one that must not regress: `sl=5.02-1+b1` is Debian's syntax,
+        apt accepts it, and it contains the same `=` the Portage form does.
+        Position is what tells them apart -- Portage's operator leads."""
+		self.assertEqual(self.kept("sl=5.02-1+b1"), "sl=5.02-1+b1")
+
+	def test_a_multiarch_qualifier_is_left_alone(self):
+		"""`sl:i386` is Debian's own syntax and apt handles it. Portage's
+        slot atom is spelled the same way, and Debian's meaning wins: this
+        is not ours to reinterpret."""
+		self.assertEqual(self.kept("sl:i386"), "sl:i386")
+
+	def test_a_local_deb_is_a_path_and_not_an_atom(self):
+		"""apt installs a .deb given by path, and every one of these has a
+        slash in it. Category stripping had to be taught the difference
+        first, or `emerge ./sl.deb` becomes `emerge sl.deb`."""
+		for atom in ("./sl.deb", "../build/sl.deb", "/tmp/sl.deb", "sl.deb",
+		             # The case that needs the guard. The others are caught
+		             # anyway, because `.`, `..` and the empty string before
+		             # a leading slash are not category-shaped -- but `pool`
+		             # is, so without the guard this becomes `sl.deb` and
+		             # apt is handed a file that is not there.
+		             "pool/sl.deb"):
+			with self.subTest(atom=atom):
+				self.assertEqual(self.kept(atom), atom)
+
+	def test_something_that_is_not_a_category_keeps_its_slash(self):
+		"""Only a Portage-shaped category is dropped. Anything else with a
+        slash is left for apt to reject in its own words, which is right --
+        we do not know what it is."""
+		self.assertEqual(self.kept("Foo/bar"), "Foo/bar")
+		self.assertEqual(self.kept("a/b/c"), "a/b/c")
+
+	def test_a_leading_version_operator_is_explained(self):
+		for atom in ("=sl-5.02-1+b1", ">=sl-5.0", "<sl-6", "~sl-5.0"):
+			with self.subTest(atom=atom):
+				_, complaint = em.translate_atom(atom)
+				self.assertIsNotNone(complaint, f"{atom} was accepted")
+				joined = " ".join(complaint)
+				self.assertIn(atom, joined, "the complaint should quote it")
+				self.assertIn("sl=5.02-1+b1", joined,
+				              "and name the spelling that works")
+
+	def test_the_whole_command_stops_rather_than_running_a_partial_list(self):
+		"""A rejected atom must not leave the others to be installed on
+        their own -- the user asked for a set of things."""
+		mod = load()
+		said = []
+		mod.eerror = said.append
+		mod.pick_backend = lambda flag, pretend=False: self.fail(
+		    "reached the backend with a bad atom in the list")
+		with self.assertRaises(SystemExit) as exit:
+			with contextlib.redirect_stdout(io.StringIO()):
+				mod.main(["-p", "sl", "=sl-5.02"])
+		self.assertEqual(exit.exception.code, 1)
+		self.assertTrue(said)
+
+
 class TestArgParsing(unittest.TestCase):
 	"""A mistyped safety flag must not be silently dropped. `emerge
     --no-dep-upgrades pkg` -- one letter off -- used to run an ordinary
