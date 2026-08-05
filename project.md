@@ -1210,6 +1210,21 @@ For portability, run a real old interpreter rather than reasoning about one:
 *not* a substitute — it does not reject PEP 701 syntax, which is how a
 3.12-only f-string reached CI.
 
+**A guard that everything else has to stub out is a guard nothing tests.**
+Sweeping `need_root()` — replacing each of the ten calls with `pass` — left
+the whole suite green. The reason is structural rather than careless: the
+integration harness *must* stub `need_root`, because it runs unprivileged on
+purpose, and the unit tests reach those functions with it already replaced.
+The guard was invisible precisely because everything else needs it gone.
+
+Asserting `SystemExit(1)` was not enough, and looked like it was: without
+the guard, `merge` and `unmerge` still exit 1, from dpkg failing on
+permissions several steps later. Three mutations survived a test that
+appeared to cover them. The distinction the guard exists for is *refusing
+before doing anything*, so the test forbids subprocesses outright — any
+command executed means it did not fire first — and checks the message says
+superuser rather than something else. All ten are caught now.
+
 **The wiring from a flag to the thing that acts on it is its own test.**
 Found by sweeping: replace every *read* of an option in `main()` with
 `False`, run both suites, and see which mutations nobody notices. Five did

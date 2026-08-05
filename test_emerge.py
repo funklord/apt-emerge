@@ -1619,6 +1619,96 @@ class TestMaintainerScriptsAreNotInteractive(unittest.TestCase):
 			                 "noninteractive")
 
 
+class TestPrivilegedOperationsNeedRoot(unittest.TestCase):
+	"""Every operation that writes to the system refuses before it starts.
+
+    Found by sweeping rather than by reading: replacing any of the ten
+    `need_root()` calls with `pass` left the whole suite green. Nothing
+    checked them, and for a good reason that makes it easy to miss -- the
+    integration harness has to stub `need_root` out, because it runs
+    unprivileged on purpose, and the unit tests reach these functions with
+    it already replaced. The guard was untested precisely because
+    everything else needs it gone.
+
+    The guard is the first statement of each function, so what it buys is
+    the difference between one clear line and a failure deep inside dpkg --
+    or, for `dispatch_conf`, a review that shows diffs and asks questions
+    and only then cannot write the answers."""
+
+	def setUp(self):
+		self.mod = load()
+		original = os.geteuid
+		self.addCleanup(setattr, os, "geteuid", original)
+		os.geteuid = lambda: 1000          # anybody but root
+
+	def assertRefuses(self, what, call):
+		"""Refused *before doing anything*, which is the whole point.
+
+        Asserting only on SystemExit(1) was not enough and looked fine:
+        without the guard, `merge` and `unmerge` still exit 1 -- from dpkg
+        failing on permissions several steps later -- so the mutation
+        survived a test that appeared to cover it. Nothing may be executed,
+        so any subprocess at all means the guard did not fire first."""
+		def forbidden(*a, **kw):
+			raise AssertionError(f"{what} ran a command without root")
+
+		self.mod.capture = forbidden
+		self.mod.run = forbidden
+		self.mod.subprocess = types.SimpleNamespace(
+		    Popen=forbidden, run=forbidden, DEVNULL=None, PIPE=None,
+		    STDOUT=None, CalledProcessError=Exception)
+
+		with self.subTest(operation=what):
+			buf = io.StringIO()
+			with self.assertRaises(SystemExit) as exit:
+				with contextlib.redirect_stdout(buf), \
+				     contextlib.redirect_stderr(buf):
+					call()
+			self.assertEqual(exit.exception.code, 1,
+			                 f"{what} ran without root")
+			self.assertIn("uperuser", buf.getvalue(),
+			              f"{what} failed for some other reason: "
+			              f"{buf.getvalue()[:120]}")
+
+	def test_the_dpkg_backend_refuses_every_write(self):
+		be = self.mod.DpkgBackend()
+		# deselect asks for root only when it has something to remove, which
+		# is deliberate -- so it needs a world file with the name in it, or
+		# it correctly does nothing and correctly asks for nothing.
+		be._read_world = lambda: {"x"}
+		opts = {"fetchonly": False, "oneshot": False}
+		self.assertRefuses("dpkg sync", lambda: be.sync())
+		self.assertRefuses("dpkg merge", lambda: be.merge([], [], opts))
+		self.assertRefuses("dpkg unmerge", lambda: be.unmerge([("x", "1")]))
+		self.assertRefuses("dpkg deselect",
+		                   lambda: be.deselect(["x"], False))
+
+	def test_the_apt_backend_refuses_every_write(self):
+		be = self.mod.AptBackend()
+		be._manual_set = lambda: {"x"}
+		opts = {"fetchonly": False, "oneshot": False}
+		self.assertRefuses("apt sync", lambda: be.sync())
+		self.assertRefuses("apt merge", lambda: be.merge([], [], opts))
+		self.assertRefuses("apt unmerge", lambda: be.unmerge([("x", "1")]))
+		self.assertRefuses("apt build", lambda: be.build(opts))
+		self.assertRefuses("apt deselect",
+		                   lambda: be.deselect(["x"], False))
+
+	def test_dispatch_conf_refuses(self):
+		self.assertRefuses("dispatch-conf",
+		                   lambda: self.mod.dispatch_conf({}))
+
+	def test_a_pretend_deselect_still_needs_none(self):
+		"""The counterpart. Asking for root when nothing will be written is
+        its own defect, and `--pretend` is the case that proves the guard
+        is placed rather than sprinkled."""
+		be = self.mod.DpkgBackend()
+		be._read_world = lambda: {"x"}
+		be._write_world = lambda names: self.fail("pretend wrote the world")
+		with contextlib.redirect_stdout(io.StringIO()):
+			be.deselect(["x"], True)
+
+
 class TestDpkgUnmergeGuard(unittest.TestCase):
 	"""The other half of the cascade story, and the backends really differ.
 
