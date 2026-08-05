@@ -505,6 +505,17 @@ Debian already parks updated conffiles as `.dpkg-dist`/`.ucf-dist` (== Portage's
   install, making new==ancestor and silently discarding every update.
   One copy per file, overwritten, so the archive is bounded by the number of
   conffiles on the system (1,148 here) rather than growing per upgrade.
+- **A file it cannot retire is skipped too**, for the same reason and with
+  a sharper edge: `_accept` writes the merged file into `/etc` and *then*
+  calls `_retire`, so a failure there ended the review with the change
+  already applied, the parked copy still in place, every later file
+  unreviewed and no summary of what had been decided. That is the shape a
+  mergetool template with no placeholders once produced — the entry in the
+  gotchas below — reached through a different door. Tolerating it is safe
+  because both halves self-correct: a file left parked is offered again next
+  run, where it now matches what is on disk and resolves without a question,
+  and an unpromoted ancestor costs a 2-way review that dispatch-conf
+  announces.
 - **A file it cannot copy is skipped, not fatal.** The copy was unguarded, so
   one unreadable or unwritable conffile raised out of the whole pass — which
   runs after a *successful* install, and again from the failure path where

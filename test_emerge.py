@@ -3780,6 +3780,49 @@ class TestDispatchConf(unittest.TestCase):
 		self.answers = []
 		self.mod.input = lambda prompt="": self.answers.pop(0)
 
+	def test_a_file_that_cannot_be_retired_does_not_end_the_review(self):
+		"""`_accept` writes the merged file into /etc and *then* retires the
+        parked copy, so a failure there used to abort with the change
+        already applied, the parked file still in place, every later file
+        unreviewed and no summary of what had been decided. That is the
+        same shape a mergetool template with no placeholders once produced,
+        which is why that one is guarded.
+
+        Reproduced with a full disk rather than permissions, because this
+        runs as root and root can write where an ordinary user cannot."""
+		first = self.park("first.conf", "old\n", "new\n", ancestor="old\n")
+		second = self.park("second.conf", "old\n", "new\n", ancestor="old\n")
+		real = self.mod._store_ancestor
+
+		def store(conf, target, source):
+			if source.endswith(".dpkg-dist"):     # the promotion _retire does
+				raise OSError(28, "No space left on device")
+			return real(conf, target, source)
+		self.mod._store_ancestor = store
+		said = []
+		self.mod.ewarn = said.append
+
+		out = self.dispatch()          # both auto-apply; no answers needed
+
+		self.assertEqual(sum("could not retire" in s for s in said), 2,
+		                 f"the review stopped at the first failure: {said}")
+		for target in (first, second):
+			with self.subTest(target=os.path.basename(target)):
+				self.assertEqual(self.content(target), "new\n",
+				                 "the update was applied, as it was before")
+				self.assertTrue(self.parked_exists(target),
+				                "a file that could not be retired must stay "
+				                "parked, so it comes back next run")
+
+	def test_a_file_left_parked_resolves_itself_next_run(self):
+		"""The claim that makes tolerating the failure safe: the file comes
+        back, and the second time it needs no decision because what is on
+        disk already matches what was parked."""
+		target = self.park("x.conf", "new\n", "new\n", ancestor="old\n")
+		self.dispatch()
+		self.assertFalse(self.parked_exists(target),
+		                 "an identical parked file should retire itself")
+
 	def park(self, name, current, incoming, ancestor=None,
 	         suffix=".dpkg-dist"):
 		"""A config file plus the update dpkg parked beside it."""

@@ -3587,9 +3587,27 @@ def _write(path, lines):
 
 def _retire(conf, target, pending):
 	"""The parked file is what the package now ships: it becomes the ancestor
-    for the next upgrade, whatever the user decided to keep on disk."""
-	_store_ancestor(conf, target, pending)
-	os.unlink(pending)
+    for the next upgrade, whatever the user decided to keep on disk.
+
+    Tolerant of failure on purpose. `_accept` calls this *after* writing the
+    merged file into `/etc`, so raising here ends the review with the change
+    already applied, the parked copy still in place, every later file
+    unreviewed and no summary of what was decided — the same shape a
+    mergetool template with no placeholders once produced, and the reason
+    that one is guarded.
+
+    Neither half is worth that. A parked file left behind is offered again
+    next run, where it now matches what is on disk and resolves itself; an
+    unpromoted ancestor costs a 2-way review, which dispatch-conf already
+    announces when it happens."""
+	try:
+		_store_ancestor(conf, target, pending)
+		os.unlink(pending)
+	except OSError as e:
+		ewarn(f"could not retire {pending}: {e.strerror or e}")
+		ewarn("  it stays parked and will be offered again next time")
+		return False
+	return True
 
 def _accept(conf, target, pending, lines):
 	_write(target, lines)
