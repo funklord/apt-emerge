@@ -2649,6 +2649,43 @@ class TestPackaging(unittest.TestCase):
 			self.assertIn(line, readme,
 			              f"README no longer shows what -pv prints: {line!r}")
 
+	def test_every_command_the_readme_advertises_is_accepted(self):
+		"""The README opens with a table of verbs, and nothing checked it.
+
+        The man page and --help are cross-checked in both directions two
+        tests above, precisely because an option can be renamed in one place
+        and left behind in another -- and the README is the copy a user
+        meets first. A row advertising a flag the parser rejects is worse
+        than an undocumented one: it is an instruction that fails.
+
+        Only parsing is exercised. `pick_backend` is stubbed, so nothing
+        here reaches apt, dpkg or the network."""
+		readme = self.read("README.md")
+		rows = re.findall(r"^\| `emerge ([^`]+)`", readme, re.M)
+		self.assertGreater(len(rows), 5,
+		                   "the verb table scrape found almost nothing; it "
+		                   "would pass for a README that lost its table")
+		mod = load()
+
+		class Reached(Exception):
+			pass
+
+		mod.pick_backend = lambda flag, pretend=False: (_ for _ in ()).throw(
+		    Reached())
+		for row in rows:
+			# The table writes placeholders; a parser needs real words.
+			argv = [{"<pkg>": "nano", "<regex>": "^sl$"}.get(a, a)
+			        for a in row.split()]
+			with self.subTest(command=f"emerge {row}"):
+				try:
+					with contextlib.redirect_stdout(io.StringIO()):
+						mod.main(argv)
+				except Reached:
+					pass          # parsed, and stopped before doing anything
+				except SystemExit as exit:
+					self.fail(f"the README advertises `emerge {row}` and the "
+					          f"parser rejected it (exit {exit.code})")
+
 	def test_the_installed_paths_are_system_ones(self):
 		"""A .deb may not install into /usr/local; that belongs to the
         local admin, and dpkg must not own anything there."""

@@ -161,6 +161,17 @@ covered:
   and went undetected.
 - `--no-dep-upgrade` searches per target, so on a large set it runs many
   dependency simulations and can be slow.
+- The dpkg backend is single-architecture. It keys packages by name, so where
+  a foreign architecture has been added (`dpkg --add-architecture i386`) and
+  a package is installed for both, it sees only one of them. It says so
+  rather than working from half a view, and refuses an unmerge it cannot
+  disambiguate — but use the apt backend on such a system. The apt backend is
+  unaffected, since apt does the resolving there.
+- `emerge -C` means slightly different things on the two backends, because
+  the underlying tools do. `apt-get remove` takes everything depending on the
+  target with it, so the apt backend shows you that whole list and asks;
+  dpkg refuses to remove a package another installed one needs, so the dpkg
+  backend tells you to name the dependents in the same command.
 
 `project.md` carries the design notes, the reasoning behind the parts that
 went through several revisions, and the mistakes worth not repeating.
