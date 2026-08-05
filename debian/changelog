@@ -1,4 +1,4 @@
-apt-emerge (3.0.66) unstable; urgency=medium
+apt-emerge (1.0) unstable; urgency=medium
 
   * Initial packaging.
 

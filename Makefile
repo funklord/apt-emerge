@@ -99,18 +99,21 @@ style:
 # version are two different things, and both are hand-written. This stops
 # them drifting: debian/changelog must carry the same upstream version that
 # `emerge -V` prints, minus the -deb dialect suffix.
+# The VERSION file is this program's version and the source for the package.
+# The script's VERSION is the Portage dialect it emulates and is deliberately
+# not tied to it: they described the same number until apt-emerge had one of
+# its own.
 version-check:
-	@script=$$(sed -n 's/^VERSION *= *"\(.*\)-deb"/\1/p' emerge); \
-	changelog=$$(dpkg-parsechangelog -SVersion 2>/dev/null \
-	             | sed 's/-[^-]*$$//'); \
+	@file=$$(cat VERSION); \
+	changelog=$$(dpkg-parsechangelog -SVersion 2>/dev/null); \
 	if [ -z "$$changelog" ]; then \
 		echo "version-check: skipped (dpkg-parsechangelog unavailable)"; \
-	elif [ "$$script" != "$$changelog" ]; then \
-		echo "version-check: emerge says $$script-deb but"; \
+	elif [ "$$file" != "$$changelog" ]; then \
+		echo "version-check: VERSION says $$file but"; \
 		echo "               debian/changelog says $$changelog"; \
 		exit 1; \
 	else \
-		echo "version-check: $$script, in step"; \
+		echo "version-check: $$file, in step"; \
 	fi
 
 # -- install -----------------------------------------------------------------

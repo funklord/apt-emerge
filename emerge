@@ -117,7 +117,14 @@ PORTAGE_TMPDIR = "/var/tmp/portage"
 
 # Single source of truth for what -V prints; the notice at the top of this
 # file is a comment and cannot be shared with it, so keep the two in step.
-VERSION   = "3.0.66-deb"
+# The Portage release whose dialect this speaks, with -deb marking it as the
+# Debian reimplementation. It is a compatibility surface -- `emerge --version`
+# prints "Portage 3.0.66-deb" and scripts read it -- and NOT this program's
+# own version, which is in the VERSION file at the root. The two moved
+# together until apt-emerge got a version of its own; they are independent
+# now, and reporting "Portage 1.0" would be a false claim about the dialect.
+PORTAGE_DIALECT = "3.0.66"
+VERSION   = PORTAGE_DIALECT + "-deb"
 AUTHOR    = "Nabeel Sowan <nabeel@vibes.se>"
 COPYRIGHT = "Copyright (C) 2026 " + AUTHOR
 LICENCE   = "GPL-2.0-or-later"

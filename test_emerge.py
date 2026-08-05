@@ -2671,15 +2671,25 @@ class TestPackaging(unittest.TestCase):
 		with open(path) as f:
 			return f.read()
 
-	def test_the_package_version_matches_the_script(self):
-		"""debian/changelog and VERSION are both hand-written. `make deb`
-        enforces this too, but failing here is faster and works without
+	def test_the_package_version_matches_the_version_file(self):
+		"""VERSION states this program's version; debian/changelog is the
+        only other place dpkg will read one from. `make version-check`
+        enforces it too, but failing here is faster and works without
         dpkg-dev installed."""
 		head = self.read("debian/changelog").splitlines()[0]
 		m = re.match(r"^apt-emerge \(([^)]+)\)", head)
 		self.assertIsNotNone(m, f"unparsable changelog header: {head}")
-		self.assertEqual(m.group(1), em.VERSION.replace("-deb", ""),
-		                 "debian/changelog and emerge's VERSION disagree")
+		self.assertEqual(m.group(1), self.read("VERSION").strip(),
+		                 "debian/changelog and VERSION disagree")
+
+	def test_the_dialect_version_is_not_this_program_s_version(self):
+		"""em.VERSION is the Portage release whose dialect this speaks, and
+        is deliberately independent of the package version. They described
+        the same number until apt-emerge had one of its own, and tying them
+        again would make `emerge --version` claim a Portage dialect that
+        does not exist."""
+		self.assertTrue(em.VERSION.endswith("-deb"))
+		self.assertEqual(em.VERSION, em.PORTAGE_DIALECT + "-deb")
 
 	def man_entries(self):
 		"""Long options the man page gives an entry of their own.

@@ -1000,11 +1000,16 @@ Layout decisions worth not re-litigating:
   anything there. The manual install in the README still uses it, correctly —
   that is the un-packaged path.
 - **`Rules-Requires-Root: no`**, so the build needs no fakeroot.
-- **Version.** `debian/changelog` carries `3.0.66`; the script reports
-  `3.0.66-deb`, the `-deb` marking it as the Debian reimplementation rather
-  than real Portage. These are two hand-written strings, so both `make
-  version-check` (wired into `dh_auto_test`) and a unit test assert they stay
-  in step. Bump both together.
+- **Version.** Two numbers that describe different things and are no longer
+  tied. `VERSION` at the root states apt-emerge's own version and is what
+  `debian/changelog` must agree with; `make version-check` and a unit test
+  hold those two together. The script's `VERSION` is `PORTAGE_DIALECT` plus
+  `-deb` -- the Portage release whose dialect this speaks, with `-deb`
+  marking it as the Debian reimplementation. `emerge --version` prints it and
+  scripts read it, so it is a compatibility surface rather than a version of
+  this program. They carried the same number until apt-emerge had one of its
+  own; tying them again would make the tool claim a Portage dialect that does
+  not exist.
 - **`emerge.1`** is hand-written, and `TestPackaging` checks it against
   `--help` in *both* directions: every option documented in `--help` must have
   its own `.TP` entry, and every option the man page gives an entry must exist
