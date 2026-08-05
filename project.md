@@ -102,9 +102,12 @@ conversion. Read that file before editing; do not work from memory of it.
 
 ## File layout (single file, top to bottom)
 
-Line numbers below are from the ~2619-line version and are now roughly 1,000
-lines out (the file is ~3600 lines). Treat the *order* as the map and re-grep
-for anything specific — the sequence has not changed, only the offsets.
+The line numbers below are from a much older and much shorter version of the
+file, and they have been wrong by a growing margin ever since. Treat the
+*order* as the map and re-grep for anything specific — the sequence has not
+changed, only the offsets. (This paragraph used to carry both figures and
+they went stale twice, which is the same lesson the file table above states
+as a rule: `wc -l` is right there.)
 
 - **Imports + path constants** (~11–39): stdlib only; `lzma` is optional
   (minimal builds strip it — code falls back to `.gz`/plain). Paths:
@@ -658,26 +661,27 @@ truncated its fixture at a fixed 120 bytes, and this index compresses to 88
 - No persistent pins (see hard rule 3). Interrupted installs recover with the
   normal `dpkg --configure -a` / `apt-get -f install`.
 - World file, config **and index** writes are atomic (temp + fsync +
-  `os.replace`), and all three go through one `write_atomic()`. They did
-  not: there were three copies of that sequence, and consolidating them
-  found that the world file's copy was the one **missing the cleanup on
-  failure**, so an interrupted write left a `world.tmp` beside it — the sort
-  of thing nobody looks for until the next crash. Every step of the sequence
-  has to be right and a drifted copy looks identical from the outside, which
-  is the argument for having one. `_write` keeps what is genuinely its own
-  through a `prepare` hook (mode, owner and xattrs, which `os.replace` drops
-  with the old inode) and its own `.emerge-tmp` suffix, because a bare
-  `.tmp` beside somebody's config in `/etc` says nothing about whose it is.
+  `os.replace`), and all three go through one `write_atomic()`. Getting
+  there took two passes, and the second corrected the first.
 
-  The index was the exception until it was looked for: `sync()`
-  opened the file and started filling it, so an interrupted `--sync` — the
-  slow operation that talks to the network, and therefore the one people
-  interrupt — left a **truncated** `Packages` behind. Truncated does not mean
-  unreadable, which is the whole problem: cutting a 500-package index a third
-  of the way through leaves 168 packages that parse perfectly, so the
-  resolver plans against part of the archive and reports "there are no
-  packages to satisfy" for things that plainly exist. `write_atomic()` now
-  does it the way the other two writers already did.
+  **The index was not atomic at all.** `sync()` opened the file and started
+  filling it, so an interrupted `--sync` — the slow operation that talks to
+  the network, and therefore the one people interrupt — left a **truncated**
+  `Packages` behind. Truncated does not mean unreadable, which is the whole
+  problem: cutting a 500-package index a third of the way through leaves 168
+  packages that parse perfectly, so the resolver plans against part of the
+  archive and reports "there are no packages to satisfy" for things that
+  plainly exist.
+
+  **Then the three copies were merged, and one of them turned out to be
+  wrong too.** The world file's copy was missing the cleanup on failure, so
+  an interrupted write left a `world.tmp` beside it — the sort of thing
+  nobody looks for until the next crash. That is the argument for one
+  writer rather than three: every step has to be right, and a drifted copy
+  looks identical from the outside. `_write` keeps what is genuinely its
+  own through a `prepare` hook (mode, owner and xattrs, which `os.replace`
+  drops with the old inode) and its own `.emerge-tmp` suffix, because a bare
+  `.tmp` beside somebody's config in `/etc` says nothing about whose it is.
 - `--with` allow-set is per-invocation, never persisted.
 
 **What is not protected: two runs at once.** Nothing takes a lock. On the apt
@@ -1176,12 +1180,14 @@ write surface ever needs testing.
    **Half of this is now done.** The owner chose to keep one file, so there is
    no `src/` tree and no amalgamation step, but the `Makefile` and `debian/`
    dir exist — see **Packaging** below. What is still open is only the module
-   split, and there is no pressure for it: at ~3,700 lines the file is
-   navigable and the layout map above is enough.
+   split, and there is no pressure for it: the file is still navigable and
+   the layout map above is enough.
 2. ~~A real test suite~~ — **done**, and so is everything this entry listed as
-   next: `make check` (plus `check-unit` / `check-integration`) and four CI
+   next: `make check` (plus `check-unit` / `check-integration`) and the CI
    jobs, including one that builds the package, installs it and runs the
-   installed binary. See **Packaging** and **CI**.
+   installed binary. See **Packaging** and **CI**, which is where the job
+   list lives — this entry carried a count of its own and fell a job behind
+   the moment one was added.
 3. ~~`ndu_solve` completeness~~ — the greedy false wall is **fixed** (real
    backtracking), and so is the alternatives half: `ndu_search` escalates to
    an exhaustive pass that branches on `a | b` before a wall is believed, so
@@ -1777,3 +1783,51 @@ check is not evidence until you know what it checked.**
   difference is diff3 producing the worse answer. Replacing difflib with a
   minimal Myers diff changed nothing in 12,000 merges. Both are written down
   so nobody spends the day again.
+
+Then a long session with no feature list at all, working outward from
+whatever the last piece had exposed. The shape of it is worth keeping
+because the same shape will happen again.
+
+**Data loss in `/etc`, twice, on the one path that edits it.** A conffile is
+bytes and not necessarily UTF-8 ones: `errors="replace"` on the way in and
+an encode on the way out rewrote any byte that did not decode, and made two
+different files compare equal so a genuine update was discarded as
+already-applied. Then `_write` was found replacing a *symlinked* conffile
+with a regular file, sending the merge to the link's name and leaving the
+admin's real file stale. Both silent, both on the path whose own docstring
+worries about writing a bad `sshd_config`.
+
+**Things a repository or a locale can do to you.** `--sync` unpacked an
+index before checking its hash and with no ceiling, so 61 KB of `.xz` could
+ask for 400 MB — of the backend written for boxes that do not have it. It
+wrote that index straight over the old one, so an interrupted sync left a
+*truncated* `Packages` that parses perfectly with a third of the archive in
+it. And every English pattern in the file stops matching under
+`LANGUAGE=de`, which cost `emerge -s` its versions and a merge its
+Portage-style output.
+
+**Backend parity again, and again the backend that implements it itself.**
+`emerge -C` promised `-a` would override a wall that dpkg will not let you
+past; the dpkg backend ran maintainer scripts without
+`DEBIAN_FRONTEND=noninteractive`, so a package that asks a debconf question
+hangs with the prompt written where nobody can see it. Diffing the two
+classes' shared methods by counting their guards found both in minutes,
+which is worth remembering as a technique.
+
+**Promises the CLI was not keeping.** `-p` created a 92-entry world file;
+two actions in one command ran whichever the dispatch order reached first
+and dropped the other; Portage's own atom spellings fell through to apt and
+came back in apt's words; `--deselect` announced work before checking it
+could do it. None of these failed loudly, and all of them were found by
+asking what the program promises rather than by reading it.
+
+**And the recurring lesson, which is about the tests rather than the code.**
+Four separate times a check of mine passed for the wrong reason: a fixture
+truncated at 120 bytes when the file was 88, a wall test with one mover
+where the assertion needed two, an exit-code survey reading `$?` after a
+pipe, and an archive test using `chmod 000` — invisible as an ordinary user,
+readable as root, so it passed here and failed in the container. Mutation
+testing caught every one; reading them caught none. The container job earned
+its place again, and the habit that generalises is the one already written
+above: after something passes, work out what would have had to be true for
+it to fail, and go and make that true.
