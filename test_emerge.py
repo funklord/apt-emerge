@@ -4152,6 +4152,85 @@ class TestStreamApt(unittest.TestCase):
 		self.assertNotIn("chatter line 100\n", out)
 
 
+class TestParsedOutputIsNotTranslated(unittest.TestCase):
+	"""apt and dpkg translate their messages, and this file reads them.
+
+    Under `LANGUAGE=de`, `Installed:` becomes `Installiert:` and `Setting up
+    x` becomes `Einrichten von x`, so every English pattern here silently
+    stops matching. Measured before the fix: `emerge -s '^tree$'` reported
+    `Latest version available: ?`, and a merge printed apt's raw output
+    instead of Portage's -- which is the one thing this program exists to
+    do. Nothing errored in either case.
+
+    Not everything was at risk, and the difference is why these three sites
+    and no others: `Inst`/`Remv` from `apt-get -s`, the `apt-cache showpkg`
+    headings and RFC822 field names are emitted untranslated, so the
+    resolver, the virtual-provider lookup and the index parser were always
+    safe. Checked, not assumed."""
+
+	def setUp(self):
+		self.mod = load()
+		self.mod.need_root = lambda: None
+		self.mod.load_conf = lambda: {}
+		self.mod.archive_settled = lambda conf, pkgs: 0
+		self.mod.pending_notice = lambda conf: None
+		self.mod.einfo = lambda m: None
+		self.envs = []
+
+	def record_popen(self):
+		class P:
+			def __init__(self):
+				# Per instance: stream_apt closes the pipe when it is done,
+				# so a shared one leaves the second call reading a closed
+				# file.
+				self.stdout = io.BytesIO(b"")
+
+			def wait(self):
+				return 0
+		original = self.mod.subprocess.Popen
+		self.addCleanup(setattr, self.mod.subprocess, "Popen", original)
+		self.mod.subprocess.Popen = lambda *a, **k: (
+		    self.envs.append(k.get("env")), P())[1]
+
+	def test_apt_cache_policy_is_read_in_c(self):
+		"""The one that produced wrong data rather than plain output: every
+        version came back `?`."""
+		class R:
+			stdout, stderr, returncode = "", "", 0
+		self.mod.capture = lambda cmd, env=None: (self.envs.append(env), R)[1]
+		self.mod.AptBackend()._policy_batch(["bash"])
+		self.assertEqual(self.envs[0].get("LC_ALL"), "C")
+
+	def test_the_merge_stream_is_read_in_c(self):
+		self.record_popen()
+		be = self.mod.AptBackend()
+		be._action, be._atoms = ["install", "foo"], ["foo"]
+		be._manual_set = lambda: set()
+		be._apply_marks = lambda before, oneshot: None
+		with contextlib.redirect_stdout(io.StringIO()):
+			be.merge([("foo", "1.0", None, 0, "ebuild", "")], ["foo"],
+			         {"fetchonly": False, "oneshot": False})
+		self.assertEqual(self.envs[0].get("LC_ALL"), "C")
+
+	def test_forcing_the_locale_did_not_drop_the_frontend(self):
+		"""Both stream sites already passed DEBIAN_FRONTEND, and adding the
+        locale to them is exactly where it would get overwritten instead of
+        joined -- which is what happened on the first attempt."""
+		self.record_popen()
+		be = self.mod.AptBackend()
+		be._action, be._atoms = ["install", "foo"], ["foo"]
+		be._manual_set = lambda: set()
+		be._apply_marks = lambda before, oneshot: None
+		with contextlib.redirect_stdout(io.StringIO()):
+			be.merge([("foo", "1.0", None, 0, "ebuild", "")], ["foo"],
+			         {"fetchonly": False, "oneshot": False})
+			be.unmerge([("foo", "1.0")])
+		self.assertEqual(len(self.envs), 2, "expected a merge and an unmerge")
+		for env in self.envs:
+			self.assertEqual(env.get("LC_ALL"), "C")
+			self.assertEqual(env.get("DEBIAN_FRONTEND"), "noninteractive")
+
+
 class TestMergeAftermath(unittest.TestCase):
 	"""A merge that fails partway still installed something. Those packages'
     conffiles are settled on disk and have to become the new ancestor, and

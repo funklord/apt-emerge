@@ -1552,6 +1552,20 @@ to be true for it to fail, and go and make that true.
   `emerge -uD @world foo` branch appends the atoms to `dist-upgrade`, and the
   synopsis is exactly the sort of thing that gets someone to "fix" that back —
   reintroducing the bug where `foo` was silently dropped.
+- **apt and dpkg translate their output, and this program reads it.** Under
+  `LANGUAGE=de`, `Installed:` is `Installiert:` and `Setting up x` is
+  `Einrichten von x`, so every English pattern here silently stops matching.
+  Two things broke and neither errored: `emerge -s` reported
+  `Latest version available: ?` for every package, and a merge printed apt's
+  raw output instead of Portage's — the one thing the program exists to do.
+  Anything whose output is *read* now runs under `parse_env()` (`LC_ALL=C`,
+  which beats `LANGUAGE`; checked rather than assumed).
+
+  What was never at risk is worth knowing too, because it is why this is
+  three call sites and not thirty: `Inst`/`Remv` from `apt-get -s`, the
+  `apt-cache showpkg` headings and RFC822 field names are all emitted
+  untranslated, so the resolver, the virtual-provider lookup and the index
+  parser were always safe.
 - Anything parsing apt's `Inst`/`Remv` lines must stop the package name at
   `:` — `(\S+)` swallows the `:arch` qualifier apt emits on multiarch, and a
   name captured as `tree:amd64` then matches nothing you asked for.

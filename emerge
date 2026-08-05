@@ -168,9 +168,31 @@ def capture(cmd, env=None):
 # from being replaced; this only stops the asking.
 NONINTERACTIVE = {"DEBIAN_FRONTEND": "noninteractive"}
 
+# Tools whose output we read must speak one language, and apt and dpkg
+# translate theirs. Under LANGUAGE=de, `Installed:` is `Installiert:` and
+# `Setting up x` is `Einrichten von x`, so every English pattern in this file
+# quietly stops matching: `emerge -s` reported `?` for every version, and a
+# merge printed apt's raw output instead of Portage's, which is the one thing
+# this program exists to do.
+#
+# Not everything needed it, and the difference is worth knowing before
+# reaching for this: `Inst`/`Remv` from `apt-get -s`, the `apt-cache showpkg`
+# headings, and RFC822 field names are emitted untranslated, so the resolver,
+# the virtual-provider lookup and the index parser were never at risk.
+#
+# LC_ALL=C is enough on its own -- it beats LANGUAGE, checked rather than
+# assumed -- and LANGUAGE is cleared as well because it is the variable that
+# would otherwise win.
+C_MESSAGES = {"LC_ALL": "C", "LANGUAGE": ""}
+
 
 def dpkg_env():
 	return {**os.environ, **NONINTERACTIVE}
+
+
+def parse_env(**extra):
+	"""Environment for a tool whose output this program reads."""
+	return {**os.environ, **C_MESSAGES, **extra}
 
 def stream_lines(pipe):
 	"""Yield clean lines from a binary pipe, splitting on both \\n and \\r.
@@ -2644,7 +2666,7 @@ class AptBackend:
 		     "-o", "Dpkg::Options::=--force-confold",
 		     "-o", "Dpkg::Options::=--force-confdef"] + self._action,
 		    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-		    env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"})
+		    env=parse_env(**NONINTERACTIVE))
 		def translate(line):
 			m = re.match(r"^(Unpacking|Setting up) ([^\s:]+)(?::\S+)? ", line)
 			if m:
@@ -2741,8 +2763,7 @@ class AptBackend:
 		total = len(removals)
 		proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
 		                        stderr=subprocess.STDOUT,
-		                        env={**os.environ,
-		                             "DEBIAN_FRONTEND": "noninteractive"})
+		                        env=parse_env(**NONINTERACTIVE))
 		seen = [0]
 
 		def translate(line):
@@ -3023,7 +3044,8 @@ class AptBackend:
         policy and the installed version made that search never finish."""
 		out = {}
 		for i in range(0, len(names), chunk):
-			r = capture(["apt-cache", "policy"] + names[i:i + chunk])
+			r = capture(["apt-cache", "policy"] + names[i:i + chunk],
+			            env=parse_env())
 			cur = None
 			for line in r.stdout.splitlines():
 				if line[:1] not in (" ", "\t") and line.rstrip().endswith(":"):
