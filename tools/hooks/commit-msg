@@ -1,0 +1,47 @@
+#!/bin/sh
+# Copied from ~/.claude/tools/commit-msg -- the source. Keep in sync;
+# fix drift the moment you notice it. Install with `make hooks`.
+# Commit message checks, following kernel practice.
+#
+# The copy that runs lives in .git/hooks, which is untracked; this one is in
+# the tree so it is reviewable, survives a clone, and can be diffed against
+# its siblings. `make hooks` installs it. Bypass with `git commit
+# --no-verify`, which is at least a decision rather than an accident.
+#
+# Two rules, and only two. An earlier version of this hook also rejected a
+# trailing period and any `word:` prefix, neither of which was ever asked
+# for, and rejected Signed-off-by, which is wanted -- it is the Developer
+# Certificate of Origin, and what a reviewer adds when taking responsibility
+# for a change.
+
+msg="$1"
+
+# 1. No AI or tooling attribution. The single deviation from kernel practice,
+#    and it is absolute. Human co-authors and reviewers are fine; a generator
+#    is not an author and does not sign anything.
+if grep -qiE '^[[:space:]]*(assisted-by|generated-by|co-developed-by)[[:space:]]*:.*(claude|anthropic|copilot|chatgpt|gpt|gemini|llm|ai)\b' "$msg" \
+	|| grep -qiE '^[[:space:]]*(assisted-by|generated-by)[[:space:]]*:' "$msg"; then
+	echo "commit-msg: generator attribution trailer. A tool is not an author." >&2
+	grep -inE '^[[:space:]]*(assisted-by|generated-by|co-developed-by)[[:space:]]*:' "$msg" >&2
+	exit 1
+fi
+
+if grep -qiE 'generated with|claude|anthropic|copilot|chatgpt|noreply@anthropic' "$msg"; then
+	echo "commit-msg: tooling reference in the message." >&2
+	grep -inE 'generated with|claude|anthropic|copilot|chatgpt|noreply@anthropic' "$msg" >&2
+	exit 1
+fi
+
+# 2. Subject at 75 columns, the kernel's limit, taken deliberately: it is what
+#    keeps `git log --oneline` and `git shortlog` readable at a terminal width.
+subject=$(sed -n '1p' "$msg")
+case "$subject" in
+	'#'*) exit 0 ;;
+esac
+if [ "${#subject}" -gt 75 ]; then
+	echo "commit-msg: subject is ${#subject} columns, limit is 75." >&2
+	echo "commit-msg:   $subject" >&2
+	exit 1
+fi
+
+exit 0

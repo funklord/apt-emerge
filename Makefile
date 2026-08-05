@@ -36,7 +36,7 @@ INSTALL_DATA    = $(INSTALL) -m 644
 ALIASES = dispatch-conf etc-update
 
 .PHONY: all check check-unit check-integration check-isolation style install \
-        uninstall deb clean version-check help test veryclean distclean
+        uninstall deb clean version-check help test veryclean distclean hooks
 
 all:
 	@:
@@ -204,3 +204,12 @@ veryclean: clean
 distclean: veryclean
 	find . -name '*~' -o -name '*.swp' -o -name '*.orig' | xargs -r rm -f
 	find . -name __pycache__ -o -name .pytest_cache -type d -prune -exec rm -rf {} +
+
+# The commit-msg hook lives in the tree so it is reviewable, survives a
+# clone, and can be kept in sync. .git/hooks is untracked, so a hook that
+# exists only there enforces a rule nobody can see and vanishes silently on
+# a fresh clone.
+hooks:
+	@test -d .git || { echo "hooks: not a git repository" >&2; exit 1; }
+	@install -m 0755 tools/hooks/commit-msg .git/hooks/commit-msg
+	@echo "hooks: commit-msg installed from tools/hooks/"
