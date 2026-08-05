@@ -1171,15 +1171,51 @@ write surface ever needs testing.
    rule 1 intact: they are external programs, exactly like dpkg-buildpackage
    is today.
 
-   **Suggested first pass: Python only.** `stdeb` is mature, PEP 668 makes it
-   the most-wanted, and it exercises the whole pipeline before anyone has to
-   face npm's dependency graphs.
+   **Suggested first pass: Python only.** PEP 668 makes it the most-wanted,
+   and it exercises the whole pipeline before anyone has to face npm's
+   dependency graphs.
+
+   **`stdeb` was evaluated for that job on 2026-08-05 and does not hold it.**
+   Run, not read about: `python3-stdeb` 0.10.0-5 from trixie, driven with
+   `py2dsc` in a container.
+
+   - **It cannot process a `pyproject.toml`-only package at all.** It shells
+     out to `setup.py`, and a modern sdist does not ship one:
+     `can't open file '.../setup.py'`. That is most of PyPI now, and it is
+     the finding that decides the question.
+   - **Its version translation is wrong in the direction that matters.**
+     `1.0.0.dev3` correctly becomes `1.0.0~dev3`, but `1.0.0rc1`,
+     `2.0.0b2` and `1.0.0a1` pass through unchanged — and
+     `dpkg --compare-versions 1.0.0rc1 gt 1.0.0` is **true**, so a packaged
+     release candidate is never superseded by the release. `emerge -u
+     @world` would decline the upgrade forever, silently. Confirmed against
+     dpkg and against this project's own `vercmp`, which agree on all six
+     forms tested.
+   - **It crashes on ordinary missing metadata.** No `description` is a
+     `TypeError` in `common.py`; no `long_description` is an
+     `AttributeError` in `util.py`. Both are optional fields upstream.
+   - **Its name mapping is mechanical**: `python3-<name lowercased>`, so
+     PyPI `PyYAML` becomes `python3-pyyaml` while Debian ships
+     `python3-yaml`. It does nothing about the collision; that stays ours.
+   - **`fpm`, named above as the generic fallback, is not packaged for
+     Debian at all** — neither `fpm` nor `ruby-fpm` is in trixie.
+
+   What this changes: the converter was supposed to be the part we did not
+   write. Two of the three hard parts below — version translation and name
+   mapping — have to be ours whichever tool is driven, and the tool that was
+   going to do the rest cannot read a modern package. So the shape to
+   evaluate next is `dh-python`/`pybuild-plugin-pyproject` (6.20250414,
+   current, and what Debian itself builds with) with emerge generating a
+   minimal `debian/` directory, rather than a converter that owns the
+   process. That is a bigger piece of work than "drive stdeb", and worth
+   knowing before starting rather than after.
 
    **The hard parts, none of them optional:**
    - *Name mapping.* PyPI `PyYAML` is Debian `python3-yaml`. Either keep a
      mapping or vendor everything and accept the duplication.
    - *Version translation.* PEP 440 `1.0.0rc1` must become `1.0.0~rc1` or it
-     sorts **above** the final release. `vercmp` already gets `~` right, so
+     sorts **above** the final release — measured above, not feared.
+     `vercmp` already gets `~` right, so
      this is mechanical — but getting it wrong is silent.
    - *Collision with archive packages*, which is the problem being solved
      reappearing in new clothes. A self-built `python3-requests` shadowing
