@@ -3210,6 +3210,73 @@ class TestArgParsing(unittest.TestCase):
 		with self.assertRaises(SystemExit, msg=f"{argv} was accepted"):
 			self.parse(argv)
 
+	# -- flags reaching the thing that acts on them --------------------------
+	#
+	# Found by mutation rather than by reading: replacing every *read* of an
+	# option in main() with False and running both suites leaves -v, -u, -D,
+	# --no-dep-upgrade and --no-verify entirely unnoticed. Their behaviour is
+	# tested thoroughly -- ndu_solve against brute force, sync's verification
+	# against real gpgv, print_merge_list against the README -- but the line
+	# in main() that carries the flag to any of them could be deleted and
+	# nothing would fail.
+	#
+	# That is the shape of two bugs this project has already shipped: the
+	# no_dep_upgrade branch of AptBackend.resolve() that did not return, so
+	# the flag produced exactly the no-flag plan; and `emerge -uD @world foo`
+	# dropping foo. Both were wiring, not behaviour.
+
+	def test_update_and_deep_reach_the_resolver(self):
+		self.assertEqual(self.resolved(["-uD", "bash"])["kw"],
+		                 {"update": True, "deep": True,
+		                  "no_dep_upgrade": False, "allow": set()})
+
+	def test_neither_is_set_when_not_asked_for(self):
+		"""The other half: a flag that is always on is as broken as one that
+        never is, and a test that only checks the on case cannot tell."""
+		kw = self.resolved(["bash"])["kw"]
+		self.assertEqual((kw["update"], kw["deep"]), (False, False))
+
+	def test_no_dep_upgrade_reaches_the_resolver(self):
+		self.assertTrue(self.resolved(["--no-dep-upgrade", "bash"])["kw"]
+		                ["no_dep_upgrade"])
+		self.assertFalse(self.resolved(["bash"])["kw"]["no_dep_upgrade"])
+
+	def test_no_verify_reaches_sync(self):
+		"""`--no-verify` turns off the archive signature check, so the wire
+        from the flag to `sync(verify=...)` is worth as much as the check
+        itself."""
+		seen = {}
+
+		class B:
+			name = "dpkg"
+
+			def sync(_s, **kw):
+				seen.update(kw)
+		self.mod.pick_backend = lambda flag, pretend=False: B()
+		with contextlib.redirect_stdout(io.StringIO()):
+			self.mod.main(["--sync", "--no-verify"])
+		self.assertEqual(seen, {"verify": False})
+		seen.clear()
+		with contextlib.redirect_stdout(io.StringIO()):
+			self.mod.main(["--sync"])
+		self.assertEqual(seen, {"verify": True},
+		                 "the default must still verify")
+
+	def test_verbose_reaches_the_merge_list(self):
+		seen = []
+		self.mod.print_merge_list = lambda merges, verbose: seen.append(verbose)
+
+		class B:
+			name = "apt"
+
+			def resolve(_s, targets, **kw):
+				return [("bash", "1.0", None, 0, "ebuild", "")]
+		self.mod.pick_backend = lambda flag, pretend=False: B()
+		with contextlib.redirect_stdout(io.StringIO()):
+			self.mod.main(["-pv", "bash"])
+			self.mod.main(["-p", "bash"])
+		self.assertEqual(seen, [True, False])
+
 	# -- one action per run --------------------------------------------------
 	#
 	# main() dispatches in a fixed order and returns, so a second action was
@@ -3300,6 +3367,7 @@ class TestArgParsing(unittest.TestCase):
 			def resolve(_s, targets, **kw):
 				seen["targets"] = list(targets)
 				seen["allow"] = set(kw.get("allow") or ())
+				seen["kw"] = dict(kw)
 				raise reached()
 
 		self.mod.pick_backend = lambda flag, pretend=False: B()

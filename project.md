@@ -1210,6 +1210,30 @@ For portability, run a real old interpreter rather than reasoning about one:
 *not* a substitute — it does not reject PEP 701 syntax, which is how a
 3.12-only f-string reached CI.
 
+**The wiring from a flag to the thing that acts on it is its own test.**
+Found by sweeping: replace every *read* of an option in `main()` with
+`False`, run both suites, and see which mutations nobody notices. Five did
+— `-v`, `-u`, `-D`, `--no-dep-upgrade` and `--no-verify`. Every one of those
+behaviours is tested hard (the solver against brute force, sync's
+verification against real `gpgv`, `print_merge_list` against the README),
+and the tests reach them by calling the backend directly, so the line in
+`main()` that carries the flag could be deleted with nothing failing.
+
+That is the shape of two bugs already shipped here: the `no_dep_upgrade`
+branch of `AptBackend.resolve()` that did not return, so the flag produced
+*exactly* the no-flag plan; and `emerge -uD @world foo` dropping `foo`.
+Both were wiring rather than behaviour. `TestArgParsing` now asserts each
+flag arrives, and asserts the default too — a flag that is always on is as
+broken as one that never is, and a test that only checks the on case cannot
+tell the difference.
+
+A grep-based version of this survey was tried first and was wrong in both
+directions: it reported `--buildpkg` and `--no-verify` as untested, because
+their tests pass options through a helper's defaults rather than a literal
+dict, and it counted `fetchonly`'s twenty-one mentions as coverage when
+every one of them was `False`. Counting occurrences measures how a suite is
+written; mutation measures what it protects.
+
 **Test the tests by mutation, not by watching them pass.** Everything here was
 checked by deliberately breaking `emerge` and confirming the suite fails —
 that is how three tests that never actually exercised their target were found
