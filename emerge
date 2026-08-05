@@ -125,6 +125,16 @@ PORTAGE_TMPDIR = "/var/tmp/portage"
 # now, and reporting "Portage 1.0" would be a false claim about the dialect.
 PORTAGE_DIALECT = "3.0.66"
 VERSION   = PORTAGE_DIALECT + "-deb"
+
+# This program's own version -- the one a bug report needs, and the one the
+# dialect above deliberately is not. Duplicated from the VERSION file at the
+# root because the shipped artifact is a single script somebody scp'd onto a
+# box with nothing else of ours on it: there is no VERSION file to read
+# there, and a program that cannot say which version it is answers "Portage
+# 3.0.66-deb" to that question, which is the same in every release. Two
+# hand-written strings, so `make version-check` and a test hold them in step
+# -- the same arrangement debian/changelog is under, for the same reason.
+APT_EMERGE_VERSION = "1.0"
 AUTHOR    = "Nabeel Sowan <nabeel@vibes.se>"
 COPYRIGHT = "Copyright (C) 2026 " + AUTHOR
 LICENCE   = "GPL-2.0-or-later"
@@ -4063,6 +4073,9 @@ def show_info(backend_flag):
 	print(f"Portage {VERSION} (python {sys.version.split()[0]}, "
 	      f"{backend_name(backend_flag)} backend)")
 	print("=" * 65)
+	# First, because it is the question a bug report is about. The line
+	# above names the dialect, which is the same in every release.
+	print(f"{'apt-emerge:':<22}{APT_EMERGE_VERSION}")
 
 	def row(label, value):
 		print(f"{label + ':':<22}{value}")
@@ -4242,7 +4255,11 @@ def main(argv):
 		if arg in ("--version", "-V"):
 			print(f"Portage {VERSION} (python {sys.version.split()[0]}, "
 			      f"{backend_name(backend_flag)} backend)")
-			print(f"emerge for Debian -- {COPYRIGHT}")
+			# The line above is what scripts parse, so it keeps its
+			# shape. This one can carry the version that actually
+			# identifies the program.
+			print(f"emerge for Debian {APT_EMERGE_VERSION} -- "
+			      f"{COPYRIGHT}")
 			print(f"Licence {LICENCE}: GNU GPL version 2 or later. This is "
 			      f"free software;")
 			print("there is NO WARRANTY, to the extent permitted by law.")

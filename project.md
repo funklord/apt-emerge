@@ -1010,6 +1010,16 @@ Layout decisions worth not re-litigating:
   this program. They carried the same number until apt-emerge had one of its
   own; tying them again would make the tool claim a Portage dialect that does
   not exist.
+
+  Splitting them left the program unable to say which version it *was*:
+  both `-V` and `--info` answered `Portage 3.0.66-deb`, which is the same
+  string in every release. So the script carries `APT_EMERGE_VERSION` too.
+  That duplicates the `VERSION` file deliberately — the shipped artifact is
+  one script somebody scp'd onto a box where no `VERSION` file exists, and
+  a bug report opened with `--info` is exactly where the answer is needed.
+  Three hand-written strings now (file, changelog, script), and
+  `make version-check` compares all three; the script/file half needs no
+  `dpkg-parsechangelog`, so it still runs where the changelog check skips.
 - **`emerge.1`** is hand-written, and `TestPackaging` checks it against
   `--help` in *both* directions: every option documented in `--help` must have
   its own `.TP` entry, and every option the man page gives an entry must exist

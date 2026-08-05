@@ -103,11 +103,23 @@ style:
 # The script's VERSION is the Portage dialect it emulates and is deliberately
 # not tied to it: they described the same number until apt-emerge had one of
 # its own.
+#
+# Three places now, not two. The script carries the version as well, because
+# the shipped artifact is one file somebody scp'd onto a box where there is
+# no VERSION file to read -- and a program that cannot say which version it
+# is answers with the Portage dialect, which is the same in every release.
 version-check:
 	@file=$$(cat VERSION); \
+	script=$$(sed -n 's/^APT_EMERGE_VERSION *= *"\(.*\)"/\1/p' emerge); \
 	changelog=$$(dpkg-parsechangelog -SVersion 2>/dev/null); \
+	if [ "$$file" != "$$script" ]; then \
+		echo "version-check: VERSION says $$file but"; \
+		echo "               emerge says $$script"; \
+		exit 1; \
+	fi; \
 	if [ -z "$$changelog" ]; then \
-		echo "version-check: skipped (dpkg-parsechangelog unavailable)"; \
+		echo "version-check: $$file, script in step "; \
+		echo "               (changelog skipped, no dpkg-parsechangelog)"; \
 	elif [ "$$file" != "$$changelog" ]; then \
 		echo "version-check: VERSION says $$file but"; \
 		echo "               debian/changelog says $$changelog"; \

@@ -2682,6 +2682,18 @@ class TestPackaging(unittest.TestCase):
 		self.assertEqual(m.group(1), self.read("VERSION").strip(),
 		                 "debian/changelog and VERSION disagree")
 
+	def test_the_script_reports_its_own_version(self):
+		"""The shipped artifact is one file somebody scp'd onto a box with
+        nothing else of ours on it, so the VERSION file is not there to be
+        read. A program that cannot say which version it is answers with
+        the Portage dialect, which is identical in every release -- and
+        `--info` exists precisely to be pasted into a bug report.
+
+        `make version-check` enforces this too; failing here is faster and
+        needs no dpkg-dev."""
+		self.assertEqual(em.APT_EMERGE_VERSION, self.read("VERSION").strip(),
+		                 "the script and the VERSION file disagree")
+
 	def test_the_dialect_version_is_not_this_program_s_version(self):
 		"""em.VERSION is the Portage release whose dialect this speaks, and
         is deliberately independent of the package version. They described
@@ -3030,6 +3042,14 @@ class TestInfo(unittest.TestCase):
 		with contextlib.redirect_stdout(buf):
 			self.mod.main(list(argv))
 		return buf.getvalue()
+
+	def test_it_names_this_program_s_own_version(self):
+		"""The first question a bug report answers, and the one the header
+        line above it cannot: that names the Portage dialect, which is the
+        same string in every release of apt-emerge."""
+		out = self.info("--info")
+		self.assertIn(self.mod.APT_EMERGE_VERSION, out)
+		self.assertIn("apt-emerge", out)
 
 	def test_it_reports_the_things_that_have_caused_misdiagnoses(self):
 		out = self.info("--info")
