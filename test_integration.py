@@ -218,11 +218,42 @@ class DpkgBackendEndToEnd(unittest.TestCase):
 		except OSError:
 			return []
 
-	def merge(self, atoms, **kw):
+	def merge(self, atoms, fetchonly=False, **kw):
 		be = self.m.DpkgBackend()
 		merges = be.resolve(atoms, **kw)
-		be.merge(merges, atoms, {"fetchonly": False, "oneshot": False})
+		be.merge(merges, atoms,
+		         {"fetchonly": fetchonly, "oneshot": False})
 		return merges
+
+	def test_fetchonly_downloads_without_installing(self):
+		"""`-f` had no coverage at all. Both test files mention `fetchonly`
+        twenty-one times between them and every one passes it as False, so
+        grepping for it suggests the flag is exercised while nothing runs
+        it -- a green check that checks nothing, in the shape this project
+        keeps finding.
+
+        What it must do is download and then stop: the .deb in DISTFILES,
+        nothing installed, and the world file untouched."""
+		self.quiet()
+		self.make_deb("emtest-fetch", "1.0")
+		self.m.DpkgBackend().sync(verify=False)
+
+		self.merge(["emtest-fetch"], fetchonly=True)
+
+		with self.subTest("the archive was downloaded"):
+			self.assertTrue(
+			    [f for f in os.listdir(self.m.DISTFILES)
+			     if f.startswith("emtest-fetch")],
+			    f"nothing landed in {self.m.DISTFILES}")
+		with self.subTest("nothing was installed"):
+			self.assertNotIn("emtest-fetch", self.installed())
+		with self.subTest("the world file was left alone"):
+			self.assertNotIn("emtest-fetch", self.world())
+
+		# and the same command without -f does install it, so the assertions
+		# above are about the flag rather than about a broken fixture
+		self.merge(["emtest-fetch"])
+		self.assertEqual(self.installed().get("emtest-fetch"), "1.0")
 
 	def quiet(self):
 		"""Silence the Portage-style narration; failures still surface."""
@@ -651,6 +682,43 @@ class AptBackendEndToEnd(unittest.TestCase):
 			self.assertNotIn("emtest-app", self.manual())
 		with self.subTest("--deselect leaves the package installed"):
 			self.assertEqual(self.installed().get("emtest-app"), "1.0")
+
+	def test_fetchonly_downloads_without_installing(self):
+		"""The apt half of a flag neither backend had a test for. It is a
+        different implementation -- `apt-get -y -d`, then `sys.exit` rather
+        than a return -- so the dpkg test says nothing about it.
+
+        The exit is part of the contract here: exiting non-zero on a failed
+        download is how a script driving `-f` finds out."""
+		self.make_deb("emtest-fetch", "1.0")
+		self.publish()
+		self.m = self.load()
+		be = self.m.AptBackend()
+		merges = be.resolve(["emtest-fetch"])
+
+		seen = []
+		real_run = self.m.run
+		self.m.run = lambda cmd, **kw: (seen.append(list(cmd)),
+		                                real_run(cmd, **kw))[1]
+		with self.assertRaises(SystemExit) as exit:
+			be.merge(merges, ["emtest-fetch"],
+			         {"fetchonly": True, "oneshot": False})
+		self.assertEqual(exit.exception.code, 0,
+		                 "a successful fetch should exit 0")
+
+		with self.subTest("nothing was installed"):
+			self.assertNotIn("emtest-fetch", self.installed())
+		with self.subTest("@selected was left alone"):
+			self.assertNotIn("emtest-fetch", self.manual())
+		with self.subTest("apt was told to download and stop"):
+			# Asserted on the invocation rather than on apt's cache. This
+			# repository is a file:// one, and apt uses a local archive
+			# where it lies instead of copying it in -- it reports
+			# "Download complete and in download only mode" and the cache
+			# stays empty. The first version of this test looked for the
+			# .deb there and was about to report a bug that is not there.
+			self.assertTrue(any("-d" in cmd for cmd in seen),
+			                f"no download-only invocation among {seen}")
 
 	def test_no_dep_upgrade_does_not_drag_dependencies_into_world(self):
 		"""The @world leak, against a real apt and a real apt-mark.

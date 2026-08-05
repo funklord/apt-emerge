@@ -800,6 +800,20 @@ uses, so a missing cleanup corrupts whatever runs next — in another file,
 with no clue where it came from. Three such leaks have happened; the sentinel
 names the culprit in the run that caused it, and costs nothing.
 
+**`--fetchonly` had no coverage at all until it was looked for**, and
+looking was misleading: the two test files mention `fetchonly` twenty-one
+times between them and every one passes it as `False`. Grepping says the
+flag is exercised; nothing ran it. Both backends are covered now, separately,
+because they implement it differently — the dpkg one downloads and returns,
+the apt one runs `apt-get -y -d` and exits with its status.
+
+The apt half also shows why an assertion has to match the fixture: with a
+`file://` repository apt uses the archive where it lies rather than copying
+it into the cache ("Download complete and in download only mode"), so the
+obvious check for a `.deb` under `Dir::Cache` fails for a reason that has
+nothing to do with the flag. That test asserts the download-only invocation
+instead, and says so.
+
 `test_integration.py` is the end-to-end half: real `.debs` built with
 `dpkg-deb`, a real `file://` repository, real installs, and the real resolver
 deciding what to do. It is the **only** place `merge`, `unmerge`, `depclean`,
