@@ -3596,6 +3596,54 @@ class TestConfigWrite(unittest.TestCase):
 		with open(self.path) as f:
 			self.assertEqual(f.read(), "new\nlines\n")
 
+	# A conffile is bytes, and not necessarily UTF-8 ones. An older /etc
+	# file with a latin-1 accent in a comment is the ordinary case, and it
+	# used to come back through dispatch-conf with that byte replaced by
+	# U+FFFD -- read with errors="replace", written back as the replacement
+	# character, no way to recover the original. Silent, and on the one path
+	# in the program that edits /etc.
+	LATIN1 = b"# caf\xe9 settings\nkey = value\n"
+
+	def test_a_byte_that_is_not_utf8_survives_the_round_trip(self):
+		with open(self.path, "wb") as f:
+			f.write(self.LATIN1)
+		em._write(self.path, em.read_lines(self.path))
+		with open(self.path, "rb") as f:
+			self.assertEqual(f.read(), self.LATIN1,
+			                 "dispatch-conf rewrote a byte it was only "
+			                 "supposed to be moving")
+
+	def test_the_encoding_does_not_depend_on_the_locale(self):
+		"""Without an explicit encoding, what a file means is whatever LANG
+        said. CPython's UTF-8 mode covers the C locale -- the one anybody
+        would think to test -- and not a latin-1 one, so the bug would have
+        been invisible exactly where it was looked for."""
+		with open(self.path, "wb") as f:
+			f.write(self.LATIN1)
+		self.assertEqual(em.read_lines(self.path)[0],
+		                 "# caf\udce9 settings\n")
+
+	def test_content_that_is_not_utf8_can_still_be_displayed(self):
+		"""Reading losslessly puts lone surrogates in the string, and print()
+        cannot encode one: it raises UnicodeEncodeError unless stdout is in
+        UTF-8 mode. Displaying the file is the first thing a review does, so
+        that would have been a crash on the same files, which is worse than
+        the corruption it replaced. Encoding the captured output is what
+        makes this a real check -- a StringIO holds surrogates happily and
+        would pass either way."""
+		with open(self.path, "wb") as f:
+			f.write(self.LATIN1)
+		mod = load()
+		mod.USE_COLOR = False
+		buf = io.StringIO()
+		with contextlib.redirect_stdout(buf):
+			mod.color_diff(mod.read_lines(self.path), ["# other\n"],
+			               "a", "b")
+		buf.getvalue().encode("utf-8")
+		self.assertIn(r"caf\xe9", buf.getvalue(),
+		              "the undecodable byte should be shown escaped, not "
+		              "dropped or replaced")
+
 	def test_preserves_mode(self):
 		em._write(self.path, ["x\n"])
 		self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)

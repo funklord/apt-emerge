@@ -2482,7 +2482,11 @@ class AptBackend:
 		"""Prepend a changelog entry so the build carries +local1 --
         higher than the repo version, so @world upgrades won't clobber it."""
 		cl = os.path.join(srcdir, "debian", "changelog")
-		with open(cl) as f:
+		# Same read-then-write-back shape as dispatch-conf, and the same
+		# reasoning: a changelog is full of maintainer names, so it is the
+		# most likely file in the tree to carry a byte the locale cannot
+		# decode. Without this the bump raised UnicodeDecodeError instead.
+		with open(cl, encoding="utf-8", errors="surrogateescape") as f:
 			old = f.read()
 		m = re.match(r"^(\S+) \(([^)]+)\)", old)
 		if m is None:
@@ -2493,7 +2497,7 @@ class AptBackend:
 		         f"  * Local rebuild by emerge.\n\n"
 		         f" -- emerge <root@localhost>  "
 		         f"{email.utils.formatdate(localtime=True)}\n\n")
-		with open(cl, "w") as f:
+		with open(cl, "w", encoding="utf-8", errors="surrogateescape") as f:
 			f.write(entry + old)
 
 	def build(self, opts):
@@ -2881,15 +2885,41 @@ def _significant(lines):
 	return out
 
 def read_lines(path):
+	"""A config file's lines, losslessly.
+
+    `errors="replace"` was wrong here in a way that only shows up on the
+    write side. A byte that is not valid UTF-8 -- a latin-1 accent in a
+    comment, say -- decodes to U+FFFD, and _write then stores *that*, so a
+    round trip through dispatch-conf silently rewrote the byte and there is
+    no way back. surrogateescape keeps the original byte in the string and
+    puts it back byte-for-byte on the way out.
+
+    It also stops depending on the locale: without an explicit encoding,
+    what a file means is whatever LANG happened to say. CPython's UTF-8
+    mode hides that for the C locale, which is the case anybody would test,
+    and not for the latin-1 locales it does not cover."""
 	try:
-		with open(path, errors="replace") as f:
+		with open(path, encoding="utf-8", errors="surrogateescape") as f:
 			return f.readlines()
 	except OSError:
 		return None
 
+def printable(line):
+	"""A line safe to print, whatever bytes it came from.
+
+    Reading losslessly means a byte that is not valid UTF-8 stays in the
+    string as a lone surrogate, and print() cannot encode one: it raises
+    UnicodeEncodeError unless stdout happens to be in UTF-8 mode. That would
+    take down the review at the moment it displayed the file -- worse than
+    the corruption it replaced, and on the same files. Show the original
+    byte escaped instead."""
+	return line.encode("utf-8", "surrogateescape") \
+	           .decode("utf-8", "backslashreplace")
+
+
 def color_diff(a, b, fromfile, tofile):
 	for line in difflib.unified_diff(a, b, fromfile, tofile, lineterm="\n"):
-		line = line.rstrip("\n")
+		line = printable(line.rstrip("\n"))
 		if line.startswith("+"):   print(GREEN(line))
 		elif line.startswith("-"): print(RED(line))
 		elif line.startswith("@"): print(BCYAN(line))
@@ -3096,7 +3126,10 @@ def _write(path, lines):
 	st = os.stat(path)
 	tmp = path + ".emerge-tmp"
 	try:
-		with open(tmp, "w") as f:
+		# Paired with read_lines: surrogateescape on both sides is what makes
+		# a byte that is not valid UTF-8 survive the round trip instead of
+		# being replaced by U+FFFD and written into /etc that way.
+		with open(tmp, "w", encoding="utf-8", errors="surrogateescape") as f:
 			f.writelines(lines)
 			f.flush()
 			os.fsync(f.fileno())
@@ -3228,6 +3261,8 @@ def dispatch_conf(opts):
 				editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") \
 				         or "vi"
 				with tempfile.NamedTemporaryFile("w", suffix=".merge",
+				                                 encoding="utf-8",
+				                                 errors="surrogateescape",
 				                                 delete=False) as tf:
 					tf.writelines(merged)
 					tmp = tf.name
@@ -3249,7 +3284,8 @@ def dispatch_conf(opts):
 						# close it before the mergetool reads it -- relying on
 						# the handle being collected to flush is only true by
 						# accident of refcounting
-						with open(bfile, "w") as bf:
+						with open(bfile, "w", encoding="utf-8",
+						          errors="surrogateescape") as bf:
 							bf.writelines(base)
 					else:
 						bfile = None

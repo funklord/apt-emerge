@@ -422,6 +422,44 @@ Debian already parks updated conffiles as `.dpkg-dist`/`.ucf-dist` (== Portage's
 - Scope: dpkg conffiles + ucf-managed files only. Files a maintainer script
   writes into `/etc` are NOT protected (would need pre/post snapshots).
 
+**A conffile is bytes, and not necessarily UTF-8 ones.** `read_lines` and
+`_write` pair `encoding="utf-8", errors="surrogateescape"` so a byte that
+does not decode survives the round trip exactly. They used to read with
+`errors="replace"` and write back whatever that produced, which broke two
+things at once on ordinary input — an older `/etc` file with a latin-1
+accent in a comment:
+
+- **The byte was rewritten.** `0xe9` came back as U+FFFD's three bytes,
+  silently, on the one path in the program that edits `/etc`. Nothing else
+  in the run mentioned it and there is no way back from it.
+- **Two different files compared equal.** `dispatch_conf` opens with
+  `if mine == theirs: _retire(...)`, and `caf\xe9` and `caf\xff` both
+  decode to the same replacement character — so a genuine update was
+  treated as already applied and discarded. Same shape as the archive-timing
+  bug above, reached by a different road.
+
+Reading losslessly costs something, and it has to be paid on the way out:
+a byte that is not valid UTF-8 lives in the string as a lone surrogate, and
+`print()` cannot encode one — it raises `UnicodeEncodeError` unless stdout
+happens to be in UTF-8 mode. Displaying the file is the first thing a review
+does, so that would have been a crash on exactly the files that used to be
+corrupted. `printable()` renders the original byte escaped (`caf\xe9`), and
+`color_diff` is the only display path it has to cover. There is a test that
+encodes the captured output rather than just capturing it, because a
+`StringIO` holds surrogates quite happily and would pass either way.
+
+The same read-then-write-back shape appears in `_bump_changelog`, which is
+the likeliest file in a source tree to carry such a byte — it is full of
+maintainer names — and it raised `UnicodeDecodeError` rather than
+corrupting. Fixed with it.
+
+Not a locale bug, though the locale hides it: without an explicit encoding
+a file means whatever `LANG` said, and CPython's UTF-8 mode covers the C
+locale — the one anybody would think to test — while leaving a latin-1
+locale to decode as latin-1. Measured before assuming: under `LC_ALL=C`,
+`LC_ALL=POSIX`, and even with `PYTHONCOERCECLOCALE=0`, Python 3.13 reports
+`utf-8` and `utf8_mode: 1`.
+
 ---
 
 ## Repository signature verification (dpkg backend)
@@ -1278,6 +1316,14 @@ to be true for it to fail, and go and make that true.
   nothing the original carried outside the stat struct — SELinux labels, ACLs,
   file capabilities. `_write` copies xattrs across; an `/etc` file that comes
   back unlabelled can stop being readable by the one daemon that needs it.
+- **`errors="replace"` on a file you are going to write back is data loss**,
+  not error handling. It is spelt like a courtesy and it destroys the byte.
+  Anything read to be re-written uses `errors="surrogateescape"` on both
+  sides; anything read only to be parsed may keep `replace`, which is why
+  `/var/lib/dpkg/status` and the `Packages` indexes still do. And a string
+  read that way cannot simply be printed: a lone surrogate raises
+  `UnicodeEncodeError` on a strict stdout, so display goes through
+  `printable()`.
 - `emerge -uD @world foo` dropped `foo`: the `dist-upgrade` branch took the
   set and threw the atoms away. `apt-get dist-upgrade` does take package
   arguments.
