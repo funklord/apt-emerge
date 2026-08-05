@@ -159,11 +159,11 @@ jobs:
   # is tools/style_gate.py, shared verbatim with the sibling projects.
   #
   # The interpreter is pinned rather than left to the runner because the
-  # gate reads .style-gate.toml with tomllib: on 3.10 or older it would warn
-  # once and then check a *smaller* set of files -- without `emerge`, the
-  # only file that ships -- and report that as success. `make style` refuses
-  # to run on such an interpreter, so an unpinned runner would fail the job
-  # rather than pass it quietly; pinning means it does neither.
+  # gate reads .style-gate.toml with tomllib, which is 3.11+. It refuses to
+  # run without it rather than checking a smaller set of files and calling
+  # that success, so an unpinned runner that went backwards would fail the
+  # job honestly -- but failing over the runner's Python version is not what
+  # this job is for, and pinning means it never comes up.
   style:
     name: style gate
     runs-on: ubuntu-latest

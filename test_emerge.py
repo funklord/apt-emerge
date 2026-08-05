@@ -2205,14 +2205,13 @@ class TestStyleGate(unittest.TestCase):
 	"""The gate reports what it checked, and it is the file list that goes
     wrong -- not the rules.
 
-    `tools/style_gate.py` decides scope by suffix or by exact name, and the
-    one file that ships has neither: `emerge` is extensionless because it is
-    a command. `.style-gate.toml` names it, and without that line the gate
-    walks past the whole program and calls the remaining eight files clean.
-    Measured, not feared: dropping `emerge` from `indent_names` leaves the
-    gate reporting `9 files conform`, exit 0, and the tool's own collapse
-    floor cannot see it because 9 is not a collapse -- and because the floor
-    lives in the same file that stopped being read."""
+    Two things are pinned here. That the gate's scope still covers what this
+    project writes: `emerge` has no suffix, being a command rather than a
+    module, and was invisible to a version of the gate that selected on
+    suffix alone -- it reported the documentation clean and never opened the
+    program. And that a config it cannot apply stops the run, because the
+    alternative is falling back to defaults and checking a DIFFERENT set of
+    files successfully, which is indistinguishable from a clean tree."""
 
 	GATE = os.path.join(HERE, "tools", "style_gate.py")
 
@@ -2226,14 +2225,35 @@ class TestStyleGate(unittest.TestCase):
 		if not os.path.exists(self.GATE):
 			self.skipTest("tools/style_gate.py is not present in this tree")
 
+	def gate(self, *args, root=None):
+		return subprocess.run([sys.executable, self.GATE, *args,
+		                       "--root", root or HERE],
+		                      capture_output=True, text=True, timeout=120)
+
+	def rooted(self, config):
+		"""A throwaway tree holding one source file and the given config.
+
+        `config` is written as bytes so a test can hand over something that
+        is not valid TOML at all, and None means 'make it a directory' --
+        the case where a config exists but cannot be opened."""
+		root = _scratch()
+		os.makedirs(root)
+		with open(os.path.join(root, "sample.py"), "w") as f:
+			f.write("def f():\n\tpass\n")
+		path = os.path.join(root, ".style-gate.toml")
+		if config is None:
+			os.makedirs(path)
+		else:
+			with open(path, "wb") as f:
+				f.write(config)
+		return root
+
 	@unittest.skipUnless(sys.version_info >= (3, 11),
-	                     "tomllib is 3.11+; the gate cannot read its config "
-	                     "here, which is why `make style` refuses to run on "
-	                     "such an interpreter -- see the test below")
+	                     "the gate needs tomllib to read .style-gate.toml, "
+	                     "and refuses to run at all without it -- which is "
+	                     "the behaviour the other tests here pin")
 	def test_the_gate_looks_at_the_file_that_ships(self):
-		proc = subprocess.run(
-		    [sys.executable, self.GATE, "list", "--root", HERE],
-		    capture_output=True, text=True, timeout=120)
+		proc = self.gate("list")
 		self.assertEqual(proc.returncode, 0, proc.stderr)
 		listed = {line.split("\t")[0] for line in proc.stdout.splitlines()
 		          if "\t" in line}
@@ -2242,26 +2262,52 @@ class TestStyleGate(unittest.TestCase):
 		                 f"the style gate does not look at {missing}; check "
 		                 f"indent_names in .style-gate.toml")
 
-	def test_make_style_refuses_an_interpreter_that_cannot_read_the_config(self):
-		"""The guard that makes the skip above harmless.
+	def test_a_config_it_cannot_open_is_refused_not_ignored(self):
+		"""A .style-gate.toml that is a directory -- or a broken symlink --
+        answers False to is_file(), which once read as 'no config here' and
+        fell back to the defaults. Both mean somebody intended a config.
 
-        An interpreter without tomllib does not fail the gate -- it prints
-        one line to stderr and checks a smaller set of files successfully,
-        which is the failure mode this whole class exists for. `make style`
-        therefore declines to run at all rather than produce a green result
-        that means less than it appears to. /bin/false stands in for such an
-        interpreter: it fails the `import tomllib` probe the same way."""
-		if not shutil.which("make"):
-			self.skipTest("make is not installed")
-		proc = subprocess.run(["make", "style", "PYTHON=/bin/false"],
-		                      cwd=HERE, capture_output=True, text=True,
-		                      timeout=120)
-		self.assertNotEqual(proc.returncode, 0,
-		                    "make style ran the gate on an interpreter that "
-		                    "would have ignored .style-gate.toml")
-		self.assertIn("tomllib", proc.stdout + proc.stderr,
-		              "make style failed, but not with the explanation that "
-		              "says why a green run would have been misleading")
+        This case needs no tomllib, so it holds on every interpreter the
+        project supports: the refusal happens before the parse."""
+		proc = self.gate("check", root=self.rooted(None))
+		self.assertEqual(proc.returncode, 2,
+		                 f"expected a refusal, got {proc.returncode}: "
+		                 f"{proc.stdout}{proc.stderr}")
+		self.assertIn(".style-gate.toml", proc.stderr)
+
+	@unittest.skipUnless(sys.version_info >= (3, 11), "needs tomllib")
+	def test_a_config_that_is_not_valid_toml_is_refused(self):
+		proc = self.gate("check", root=self.rooted(b'indent_names = ["x"\n'))
+		self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+		self.assertIn("not valid TOML", proc.stderr)
+
+	@unittest.skipUnless(sys.version_info >= (3, 11), "needs tomllib")
+	def test_a_wrong_typed_value_is_refused_rather_than_half_applied(self):
+		"""The quiet one, and the reason the type check exists.
+
+        `indent_names = "emerge"` -- quotes where brackets belong -- is
+        valid TOML and was accepted. A set() of a string is a set of its
+        characters, so the name matched nothing, the scope silently shrank,
+        and the run passed. Measured at the time: a three-file list became
+        one, exit 0, with no output but the count."""
+		proc = self.gate("check", root=self.rooted(b'indent_names = "sample"\n'))
+		self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+		self.assertIn("indent_names", proc.stderr)
+		self.assertIn("list of strings", proc.stderr)
+
+	def test_the_local_copy_is_verbatim_apart_from_its_provenance_header(self):
+		"""The gate is one tool spread across the projects, so the copy here
+        must not drift from the source. It carries two added lines saying
+        where it came from, and they sit BELOW the shebang: above it the
+        kernel does not see `#!` at all, and the file -- which is mode 755 --
+        gets run by the shell instead, where it hangs on the first unbalanced
+        quote in the docstring rather than failing."""
+		with open(self.GATE, encoding="utf-8") as f:
+			lines = f.read().splitlines()
+		self.assertTrue(lines[0].startswith("#!"),
+		                "the shebang must be the first line or the kernel "
+		                "will not honour it")
+		self.assertIn("Copied from", lines[1] + lines[2])
 
 
 class TestPortability(unittest.TestCase):

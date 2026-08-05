@@ -83,23 +83,15 @@ check-integration:
 	$(PYTHON) -m unittest test_integration
 
 # The indentation and whitespace gate, shared verbatim with the sibling
-# projects. Its scope here comes from .style-gate.toml, because `emerge` has
-# no suffix and the gate would otherwise not look at the one file that ships.
+# projects; `docs` additionally holds project.md to the tree it describes.
 #
-# Hence the interpreter guard. The config is TOML, the tool reads it with
-# tomllib, and on Python 3.10 or older it prints one line to stderr and
-# carries on with its defaults -- which drops `emerge` and `debian/rules`
-# from the file list and then reports the remaining eight as conforming,
-# exit 0. That is a check that has quietly stopped checking, and the floor
-# cannot catch it because the floor is in the file that was ignored. Refuse
-# to run instead.
+# There was a guard here refusing to run on a Python older than 3.11, on the
+# grounds that the gate would then be unable to read .style-gate.toml, would
+# fall back to its defaults, and would check a smaller set of files
+# successfully. That was worth guarding, and it is no longer this Makefile's
+# job: the gate refuses a config it cannot read on its own now. The fix went
+# upstream instead of being kept here, so the other six projects get it too.
 style:
-	@$(PYTHON) -c 'import tomllib' 2>/dev/null || { \
-		echo "style: $(PYTHON) predates tomllib (3.11), so .style-gate.toml"; \
-		echo "       would be ignored and the gate would silently stop"; \
-		echo "       checking emerge itself. Try: make style PYTHON=python3.13"; \
-		exit 1; \
-	}
 	$(PYTHON) tools/style_gate.py check
 	$(PYTHON) tools/style_gate.py docs
 

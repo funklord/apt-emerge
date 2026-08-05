@@ -114,25 +114,30 @@ mentions a tab width -- the conversion above is what a width was needed for,
 and it is over. `tools/style_gate.py fix` writes the conversion, and refuses
 to write one that would change the file's AST.
 
-### `.style-gate.toml`, and why it is load-bearing
+### `.style-gate.toml`
 
-The gate decides what to look at by suffix or exact name, and **`emerge` has
-no suffix**. Without the `indent_names` line naming it, the gate walks past
-the entire program and reports the remaining files as a clean tree. That is
-not a hypothetical: dropping the name leaves it printing `9 files conform`,
-exit 0.
+Short, and shorter than it was. It named `emerge` because the gate selected
+files by suffix and a command has none -- so the program itself was the one
+file it never opened. That is fixed in the tool now: an extensionless file
+starting with `#!` is a program and is in scope by itself. `debian/rules`
+came back the same way.
 
-The tool's own collapse floor does not catch this, for two reasons worth
-knowing before trusting it: nine files is not a collapse, and the floor is
-configured in the very file that stopped being read. So the invariant is
-pinned by a test instead -- `TestStyleGate` asserts that `emerge`,
-`Makefile`, `debian/rules` and both test modules are in the gate's list.
+What remains is `Makefile`, which has neither a suffix nor a shebang. Naming
+it is not merely a relaxation of the tab rule either way: without the line
+it is not checked **at all**, losing the trailing-whitespace and final-
+newline checks with it. The shipped default leaves Makefiles out because an
+`ifeq` body must be space-indented -- a tab there reads as a recipe line --
+and this Makefile has none, so the rule costs nothing today. Add one and
+that changes; raise it rather than deleting the line to quieten the gate.
 
-The config is TOML, read with `tomllib`, which is Python 3.11+. An older
-interpreter does not fail: it prints one line to stderr and then checks a
-smaller set of files *successfully*. `make style` therefore refuses to run
-on one at all, because a green result that quietly meant less is the failure
-this project keeps finding by other names.
+**A config that is present is applied exactly, or the run fails.** The gate
+enforces that itself now: an unreadable file, a directory or broken symlink
+where the config should be, invalid TOML, an unknown key, or a value of the
+wrong type all exit 2 with a diagnosis. The last is the one worth naming --
+`indent_names = "emerge"`, quotes where brackets belong, is valid TOML, and
+a `set()` of a string is a set of its characters, so the name matches
+nothing and the scope silently shrinks. `TestStyleGate` pins these, because
+this project is where the failure was found.
 
 ## 3. Filenames
 

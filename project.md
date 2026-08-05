@@ -19,9 +19,10 @@ installed.
 | `README.md` | user-facing front page |
 | `code-style.md` | copy of the global style source, plus this project's own |
 | `tools/style_gate.py` | the shared indentation gate, copied verbatim |
-| `.style-gate.toml` | its scope here; load-bearing, see `code-style.md` |
+| `tools/hooks/commit-msg` | the shared commit-msg hook; `make hooks` installs it |
+| `.style-gate.toml` | the gate's scope here, see `code-style.md` |
 | `LICENSE` | GPL-2, verbatim from `/usr/share/common-licenses/GPL-2` |
-| `.github/workflows/tests.yml` | CI: interpreters, Debian, package, stdlib-only |
+| `.github/workflows/tests.yml` | CI: interpreters, Debian, package, style, stdlib-only |
 | `project.md` | this file |
 
 No line counts here on purpose — every one written down has gone stale,
@@ -671,42 +672,58 @@ mechanical holding it: `code-style.md` said indentation was a review item.
 The tree passed on the first run, so nothing needed fixing — what needed
 doing was making the check exist and cover the right files.
 
-**The scope is the part that goes wrong, and it did.** The gate selects
-files by suffix or by exact name, and `emerge` has no suffix — it is a
+**The scope is the part that goes wrong, and it did.** The gate used to
+select files by suffix or exact name, and `emerge` has no suffix — it is a
 command, not a module. Out of the box it therefore checked six files and
-reported them clean while never opening the program. `.style-gate.toml`
-names it (and `debian/rules`, which is Makefile syntax under a name dpkg
-chose), taking the list to ten.
+reported them clean while never opening the program. That was worked around
+here first, by naming `emerge` in `.style-gate.toml`, and then **fixed in
+the tool**: an extensionless file beginning with `#!` is a program and is in
+scope on its own. Three projects had the same hole — `fmake` *is* fmake,
+`situc` is situ's entry point — which is what made it the tool's problem
+rather than this one's. The workaround is gone; `TestStyleGate` still pins
+the outcome.
 
-Two things about that config are worth knowing before trusting the gate:
+Everything else the config used to carry has gone the same way, and the
+remaining file is short on purpose: only `Makefile` is still named, because
+it has neither a suffix nor a shebang and is otherwise not checked at all.
 
-- **The tool's collapse floor cannot protect it.** Dropping `emerge` from
-  `indent_names` takes the list from 10 to 9, which is not a collapse — and
-  the floor is configured in the file that stopped being read anyway. So the
-  scope is pinned by `TestStyleGate` instead, which asserts that `emerge`,
-  `Makefile`, `debian/rules` and both test modules are in the gate's list.
-- **`tomllib` is 3.11+, and an older interpreter does not fail.** It prints
-  one line to stderr and then checks a *smaller* set of files successfully:
-  measured at `8 files conform`, exit 0, with `emerge` and `debian/rules`
-  silently outside it. `make style` refuses to run on such an interpreter,
-  and the CI job pins 3.13 rather than trusting the runner's default.
-- **The gate has two discovery paths and they must be made to agree.** Git
-  is preferred and drops ignored files on its own; with no `.git` it falls
-  back to a plain walk, which is exactly how the container recipe below runs
-  it. That walk found twelve files rather than ten — pytest's cache README
-  and `.claude/settings.local.json`, neither of them this project's content.
-  Both conformed, so the gate passed on luck; a generated file that did not
-  would have failed CI with no defect behind it. The `exclude` list closes
-  it, and the two paths now list the same ten files.
+The finding underneath all of it is one rule, now enforced by the tool:
+**a config that is present is applied exactly, or the run fails.** There is
+no half-applied setting, because the failure it produces is the worst one
+available — a gate that checks a *different* set of files and reports
+success, which reads exactly like a clean tree. Four ways in, all measured
+before they were fixed:
 
-Mutation-tested rather than assumed, all five confirmed by running them: a
-4-space-indented function appended to `emerge` is caught at the line
-(`indented 0 tab(s), structure says 1`), so is one in `test_emerge.py`, so
-is a space-indented line inside an existing block (as a `TabError`), so is
-trailing whitespace in `project.md` — and dropping `emerge` from the config
-is **not**, which is why the test above exists. Note also that
-`make style PYTHON=/bin/false` fails whether or not the guard is there, so
-the test asserting the guard checks the *message*, not the exit status.
+- **`tomllib` is 3.11+**, and an older interpreter used to warn once and
+  carry on with the defaults: `8 files conform`, exit 0, with `emerge` and
+  `debian/rules` outside the set.
+- **A config that is not a regular file** — a directory, or a symlink to
+  nothing — answered False to `is_file()` and read as "no config here".
+- **Invalid TOML, or a file that cannot be opened**, failed as a traceback,
+  which reads as a broken tool rather than a wrong config and sends the
+  wrong person looking.
+- **A value of the wrong type**, which is the quiet one: `indent_names =
+  "emerge"` — quotes where brackets belong — is valid TOML, and a `set()` of
+  a string is a set of its *characters*, so the name matched nothing. One
+  pair of quotes took a three-file list down to one, exit 0, no output but
+  the count.
+
+All four now exit 2 with a diagnosis naming the file and the problem; a
+genuinely absent config still falls back to the defaults, and 3.9 is refused
+only when there is a config it would have had to ignore. The interpreter
+guard that used to live in this project's `style` target is gone with them —
+the fix went upstream, where the other six projects get it too.
+
+Mutation-tested rather than assumed. On the rules: a 4-space-indented
+function appended to `emerge` is caught at the line (`indented 0 tab(s),
+structure says 1`), so is one in `test_emerge.py`, so is a space-indented
+line inside an existing block (as a `TabError`), so is trailing whitespace
+in `project.md`. On the config handling: each of the four refusals above was
+reverted in a scratch copy of the tool and the matching test fails, and so
+does the one asserting the provenance header sits *below* the shebang —
+above it the kernel does not see `#!`, and the file, which is mode 755, gets
+run by the shell instead, where it hangs on the first unbalanced quote
+rather than failing. All seven copies were shipped that way.
 
 ## Packaging
 

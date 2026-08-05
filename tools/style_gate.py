@@ -1,6 +1,6 @@
+#!/usr/bin/env python3
 # Copied from ~/.claude/tools/style_gate.py -- the source. Keep in sync;
 # fix drift the moment you notice it.
-#!/usr/bin/env python3
 """The indentation and whitespace gate for private projects.
 
 One tool, merged from three that had grown apart:
@@ -128,29 +128,96 @@ SKIP_DIR_NAMES = frozenset({"__pycache__", ".git"})
 
 # ---------------------------------------------------------------- config
 
+def reject_config(path: Path, problem: str, *consequence: str) -> None:
+	"""Report a config that cannot be applied as written, and stop.
+
+	Every caller is the same failure and it is worth naming once: the file
+	exists, so somebody wrote it to change what the gate looks at, and it did
+	not take effect. Continuing on the defaults would then check a DIFFERENT
+	file set and report that as success -- which is the one outcome a gate
+	must never produce, because it is indistinguishable from a clean tree.
+
+	So the rule is: a config that is present is read and applied exactly, or
+	the run fails. There is no middle setting where it half-applies.
+	"""
+	print(f"style-gate: {path} {problem}", file=sys.stderr)
+	for line in consequence:
+		print(f"style-gate:   {line}", file=sys.stderr)
+	raise SystemExit(2)
+
+
+def type_problems(loaded: dict) -> list[str]:
+	"""Keys whose value is the wrong shape, judged against the default's.
+
+	The dangerous case is a list written as a bare string, because it is not
+	an error anywhere: `indent_names = "emerge"` is valid TOML, and a set()
+	of a string is a set of its CHARACTERS, so the name matches nothing and
+	the gate quietly checks a smaller tree. Measured before this existed --
+	one pair of quotes instead of brackets took a three-file list down to
+	one, exit 0, no output but the count.
+
+	bool is checked before int deliberately: it is a subclass of int in
+	Python, so `ascii_only = 1` would otherwise pass the int test.
+	"""
+	problems = []
+	for key in sorted(loaded):
+		value = loaded[key]
+		default = DEFAULTS[key]
+		if isinstance(default, bool):
+			ok, want = isinstance(value, bool), "true or false"
+		elif isinstance(default, int):
+			ok = isinstance(value, int) and not isinstance(value, bool)
+			want = "a whole number"
+		elif isinstance(default, str):
+			ok, want = isinstance(value, str), "a string"
+		else:
+			ok = (isinstance(value, list)
+			      and all(isinstance(item, str) for item in value))
+			want = "a list of strings"
+		if not ok:
+			problems.append(f"{key}: want {want}, got {value!r}")
+	return problems
+
+
 def load_config(root: Path) -> dict:
 	cfg = dict(DEFAULTS)
 	path = root / ".style-gate.toml"
 	if not path.is_file():
+		# A directory, and a symlink pointing at nothing, both answer False
+		# here -- and both mean somebody intended there to be a config. Only
+		# genuine absence may fall back to the defaults.
+		if path.exists() or path.is_symlink():
+			reject_config(path, "exists but is not a readable file.",
+			              "a directory or a broken symlink here reads as "
+			              "'no config at all', which would pass.")
 		return cfg
 	if tomllib is None:
 		# Refuse rather than degrade. Ignoring the config means ignoring the
 		# scope it widens and the floor it raises, so the gate would run with
 		# defaults, check the wrong file set, and report a clean tree.
-		print(f"style-gate: {path} exists but this Python has no tomllib "
-		      f"(needs 3.11+).", file=sys.stderr)
-		print("style-gate:   running with defaults would check the wrong "
-		      "files and pass.", file=sys.stderr)
-		raise SystemExit(2)
-	with path.open("rb") as handle:
-		loaded = tomllib.load(handle)
+		reject_config(path, "exists but this Python has no tomllib "
+		                    "(needs 3.11+).",
+		              "running with defaults would check the wrong files "
+		              "and pass.")
+	try:
+		with path.open("rb") as handle:
+			loaded = tomllib.load(handle)
+	except OSError as exc:
+		# A traceback is a failure too, but it reads as a tool that broke
+		# rather than a config that is wrong, and the difference decides who
+		# goes looking.
+		reject_config(path, f"cannot be read: {exc.strerror}.")
+	except tomllib.TOMLDecodeError as exc:
+		reject_config(path, f"is not valid TOML: {exc}.")
 	unknown = set(loaded) - set(DEFAULTS)
 	if unknown:
 		# A misspelt key that is silently ignored is a gate that quietly
 		# stops enforcing whatever the key was meant to turn on.
-		print(f"style-gate: {path}: unknown key(s): {', '.join(sorted(unknown))}",
-		      file=sys.stderr)
-		raise SystemExit(2)
+		reject_config(path, f"has unknown key(s): "
+		                    f"{', '.join(sorted(unknown))}.")
+	wrong = type_problems(loaded)
+	if wrong:
+		reject_config(path, "has values of the wrong type.", *wrong)
 	cfg.update(loaded)
 	return cfg
 

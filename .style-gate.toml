@@ -1,34 +1,32 @@
 # Configuration for tools/style_gate.py -- see code-style.md.
 #
-# Nothing here changes the rules. It says which files in *this* tree the
-# rules apply to, and the answer is unusual enough to need saying: the only
-# file that ships has no suffix.
+# Nothing here changes the rules. It says which files in *this* tree they
+# apply to, and it is deliberately short: most of what this file used to say
+# has since been fixed in the tool itself, which is the better place for it.
 
-# The gate decides scope by suffix or by exact name, and `emerge` is
-# extensionless by design -- it is a command, not a module (hard rule 1: one
-# file you can scp and open in vi). Without this line the shipped program is
-# the one file the gate does not look at, and it reports the other six as a
-# clean tree. `debian/rules` is Makefile syntax under a name of dpkg's
-# choosing, so it needs naming for the same reason.
-indent_names = ["Makefile", "emerge", "rules"]
+# Only `Makefile` needs naming now, and it is the one name that cannot be
+# derived. `emerge` and `debian/rules` were listed here too, because the gate
+# selected files by suffix and both lack one -- it now recognises an
+# extensionless file that begins with `#!` as a program, which is exactly
+# what they are. That was this project's finding and it went upstream.
+#
+# A Makefile has neither a suffix nor a shebang, so without this line it is
+# not checked at all -- not merely exempted from the tab rule, but dropped
+# from the trailing-whitespace and final-newline checks with it. Naming it
+# does apply the tab rule, which the shipped default deliberately does not,
+# on the grounds that the body of an `ifeq` must be space-indented (a tab
+# there reads as a recipe line). This Makefile has no `ifeq`, so the rule
+# costs nothing today and buys the text checks. Add one and the right answer
+# changes: raise it rather than deleting the line to make the gate quiet.
+indent_names = ["Makefile"]
 
 # Below this the gate fails instead of passing, because "found nothing" in a
-# tree with sources means the file list collapsed, not that the tree is
-# clean. Ten files match today; eight is under the real count deliberately,
-# so adding a document does not require touching this, while losing `emerge`
-# or either test module does.
+# tree with sources means the file list collapsed, not that the tree came
+# back clean. Eleven files match today; eight is under the real count
+# deliberately, so adding a document does not require touching this.
 floor = 8
 
-# The defaults, restated because a table replaces rather than extends them,
-# plus the three this tree needs.
-#
-# They exist because the gate has two discovery paths and they must agree.
-# Git is preferred, and `--exclude-standard` drops all of these on its own;
-# but in a tree with no .git it falls back to a plain walk, which is exactly
-# how the container CI recipe runs (`rm -rf .git` after copying the source
-# in). Without these the walk checks twelve files rather than ten, two of
-# them nobody's business here: pytest's own cache README, and the local
-# Claude settings. They happen to conform, so the gate passed on luck --
-# and a generated file that did not would be a failure with no defect.
-exclude = ["attic", "third_party", "vendor", "build", "target",
-           "dist", ".pytest_cache", ".claude"]
+# `exclude` used to be set here, naming dist, .pytest_cache and .claude on
+# top of the defaults -- because the git and plain-walk discovery paths
+# disagreed about them. Those three are in the shipped defaults now, so
+# restating them would only be a copy to drift out of step.
