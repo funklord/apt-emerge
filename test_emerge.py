@@ -1470,6 +1470,65 @@ class TestAptActionSelection(unittest.TestCase):
 		                 ["install", "--reinstall", "nano"])
 
 
+class TestDpkgUnmergeGuard(unittest.TestCase):
+	"""The other half of the cascade story, and the backends really differ.
+
+    `apt-get remove` takes the dependents with it, so on the apt backend -a
+    genuinely cascades. dpkg does no such thing: it refuses to remove a
+    package another installed one needs. The guard here used to end "use -a
+    to override", which promised something dpkg does not allow -- the user
+    confirmed, and the unmerge then failed with a raw dpkg error. Verified
+    against real dpkg: `dpkg -r lib` with app installed exits 1 saying
+    "dependency problems prevent removal of lib"."""
+
+	def setUp(self):
+		self.mod = load()
+		self.be = self.mod.DpkgBackend()
+		self.mod.installed_state = lambda: {
+		    "lib": {"Package": "lib", "Version": "1.0",
+		            "Priority": "optional"},
+		    "app": {"Package": "app", "Version": "1.0",
+		            "Priority": "optional", "Depends": "lib"},
+		}
+		self.said = []
+		self.mod.ewarn = self.said.append
+		self.mod.eerror = self.said.append
+
+	def candidates(self, targets, ask=False, pretend=False):
+		with contextlib.redirect_stdout(io.StringIO()):
+			return self.be.unmerge_candidates(
+			    targets, {"ask": ask, "pretend": pretend})
+
+	def test_it_refuses_and_names_the_command_that_would_work(self):
+		with self.assertRaises(SystemExit):
+			self.candidates(["lib"])
+		self.assertTrue(any("emerge -C app lib" in s for s in self.said),
+		                f"no actionable suggestion in: {self.said}")
+
+	def test_it_does_not_claim_that_ask_overrides(self):
+		"""dpkg has nothing for -a to override, and saying so sent people
+        into a confirmed unmerge that could only fail."""
+		with self.assertRaises(SystemExit):
+			self.candidates(["lib"])
+		self.assertFalse(any("to override" in s for s in self.said),
+		                 f"still promising an override: {self.said}")
+
+	def test_ask_says_what_dpkg_will_do_before_the_prompt(self):
+		"""-a stops the refusal but not the consequence, so the warning has
+        to stand on its own -- it is the last thing shown before a prompt
+        that leads straight to dpkg."""
+		self.candidates(["lib"], ask=True)
+		self.assertTrue(any("dpkg will not remove" in s for s in self.said),
+		                f"nothing warned before the prompt: {self.said}")
+
+	def test_naming_the_dependents_too_is_clean(self):
+		"""The suggested command must actually be the quiet path, or the
+        advice sends people around the same loop."""
+		removals = self.candidates(["app", "lib"])
+		self.assertEqual(sorted(removals), [("app", "1.0"), ("lib", "1.0")])
+		self.assertEqual(self.said, [])
+
+
 class TestUnmergeShowsTheCascade(unittest.TestCase):
 	"""`apt-get remove` takes every dependent with it. Showing only the names
     the user typed and then running apt-get -y means confirming a removal

@@ -1183,6 +1183,43 @@ delegates ordering to apt, so the dpkg backend is the one that has to get
 symmetric: **whichever backend implements something itself is the one
 carrying the bug.**)
 
+### A later sweep, done by diffing the surface rather than reading it
+
+Listing both classes' methods and counting the guards and messages in each
+shared one is a cheap way to find the next instance: three of the nine
+differed, two of them for good reasons (`sync` is one line on apt and
+ninety on dpkg, because apt delegates to `apt-get update`).
+
+The third was real. **`emerge -C` means different things on the two
+backends, and the message denied it.** `apt-get remove` takes every
+dependent with it, so on apt `-a` genuinely cascades — that is the 868-
+package case above. dpkg does no such thing: it refuses to remove a package
+another installed one needs. The guard nevertheless ended *"use -a to
+override"*, so on the dpkg backend the user confirmed a removal that could
+not happen and got a raw dpkg error for it:
+
+```
+>>> Unmerging (1 of 1) lib-1.0...
+dpkg: dependency problems prevent removal of lib:
+ app depends on lib.
+!!! unmerge failed.
+```
+
+Verified against real dpkg, not argued from the manual. The guard now says
+what dpkg will do and names the command that works (`emerge -C app lib`,
+also verified — dpkg takes both in one call and orders them itself). `-a`
+survives as an escape hatch rather than an override, because
+`_reverse_deps` can over-report: it understands alternatives (`a | b` with
+`b` installed is not a break) but not `Provides`, so a dependency satisfied
+by a virtual package looks broken to it and not to dpkg.
+
+**What is left open is the divergence itself**, and it is not a wording
+question: on apt, `emerge -C libjpeg62-turbo` offers to remove 868
+packages; on dpkg the same command refuses until you name them. Real
+Portage does neither — it unmerges exactly what you name and warns that you
+have broken something. Which of the three this project should mean is the
+owner's call, so nothing here changed the behaviour.
+
 - `unmerge` listed only the names you typed while `apt-get remove` cascaded.
   `emerge -C libjpeg62-turbo` showed 1 package and would have removed 868.
 - No `is_protected` check at all on apt, though `--help` promises one.
