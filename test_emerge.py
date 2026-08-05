@@ -4735,6 +4735,40 @@ class TestAtomicIndexWrite(unittest.TestCase):
 		self.assertEqual(os.listdir(self.dir), ["repo_Packages"],
 		                 "a failed write left its temporary file in the tree")
 
+	def test_the_temporary_file_is_named_for_this_program(self):
+		"""`_write` installs into /etc, where a bare `.tmp` beside somebody's
+        config says nothing about whose it is. The suffix survived the three
+        writers being merged into one, which is exactly the sort of detail a
+        consolidation quietly drops."""
+		seen = []
+		original = os.replace
+		self.addCleanup(setattr, os, "replace", original)
+		os.replace = lambda src, dst: (seen.append(src), original(src, dst))[1]
+		em._write(self.path, ["x\n"])
+		self.assertTrue(seen[0].endswith(".emerge-tmp"), seen)
+
+	def test_a_failed_world_write_leaves_no_temporary_behind(self):
+		"""The bug the consolidation found. `_write_world` had its own copy
+        of the durability sequence and was the one missing the cleanup, so
+        an interrupted write left a world.tmp next to the world file --
+        invisible, because nothing looks there until the next crash."""
+		mod = load()
+		root = _scratch()
+		os.makedirs(root)
+		mod.LIB_DIR = root
+		mod.WORLD = os.path.join(root, "world")
+		original = os.fsync
+		self.addCleanup(setattr, os, "fsync", original)
+
+		def boom(fd):
+			raise OSError(28, "No space left on device")
+		os.fsync = boom
+
+		with self.assertRaises(OSError):
+			mod.DpkgBackend(pretend=True)._write_world({"bash", "tree"})
+		self.assertEqual(os.listdir(root), [],
+		                 "a failed world write left its temporary file")
+
 	def test_sync_writes_the_index_through_it(self):
 		"""The wiring, checked at the source, which is weak and deliberate.
 

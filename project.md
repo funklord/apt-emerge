@@ -647,7 +647,18 @@ truncated its fixture at a fixed 120 bytes, and this index compresses to 88
 - No persistent pins (see hard rule 3). Interrupted installs recover with the
   normal `dpkg --configure -a` / `apt-get -f install`.
 - World file, config **and index** writes are atomic (temp + fsync +
-  `os.replace`). The index was the exception until it was looked for: `sync()`
+  `os.replace`), and all three go through one `write_atomic()`. They did
+  not: there were three copies of that sequence, and consolidating them
+  found that the world file's copy was the one **missing the cleanup on
+  failure**, so an interrupted write left a `world.tmp` beside it — the sort
+  of thing nobody looks for until the next crash. Every step of the sequence
+  has to be right and a drifted copy looks identical from the outside, which
+  is the argument for having one. `_write` keeps what is genuinely its own
+  through a `prepare` hook (mode, owner and xattrs, which `os.replace` drops
+  with the old inode) and its own `.emerge-tmp` suffix, because a bare
+  `.tmp` beside somebody's config in `/etc` says nothing about whose it is.
+
+  The index was the exception until it was looked for: `sync()`
   opened the file and started filling it, so an interrupted `--sync` — the
   slow operation that talks to the network, and therefore the one people
   interrupt — left a **truncated** `Packages` behind. Truncated does not mean

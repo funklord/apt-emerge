@@ -1312,7 +1312,7 @@ def fetch(url, timeout=60, limit=None):
 		return data
 
 
-def write_atomic(path, data):
+def write_atomic(path, data, prepare=None, suffix=".tmp"):
 	"""Write bytes so a reader sees either the old file or the whole new one.
 
     The index was the one thing written straight over itself. Config files go
@@ -1329,13 +1329,27 @@ def write_atomic(path, data):
     third of the way through leaves 168 packages and no error anywhere.
 
     `--sync` is exactly the operation people interrupt, being the slow one
-    that talks to the network."""
-	tmp = path + ".tmp"
+    that talks to the network.
+
+    Written once and shared, because every step of it has to be right and a
+    copy that has drifted looks identical from the outside: flush and fsync
+    before the rename, or the rename can land while the content is still in
+    the page cache; fsync the directory after, or the rename itself may not
+    survive; unlink the temporary file on any failure, so a crash does not
+    leave litter in `/etc` or `/var/lib`. Three copies of this existed and
+    one was already missing that last part.
+
+    `prepare` runs against the temporary file just before the rename, for
+    callers that must carry mode, owner or xattrs across: `os.replace` swaps
+    in a new inode, so whatever is not copied over is gone."""
+	tmp = path + suffix
 	try:
 		with open(tmp, "wb") as f:
 			f.write(data)
 			f.flush()
 			os.fsync(f.fileno())
+		if prepare is not None:
+			prepare(tmp)
 		os.replace(tmp, path)
 	except BaseException:
 		try:
@@ -1707,17 +1721,12 @@ class DpkgBackend:
 			return {l.strip() for l in f if l.strip()}
 
 	def _write_world(self, names):
+		# Atomic, so a crash mid-write can never truncate the world file:
+		# only pins are transient, and this record should survive. It had
+		# its own copy of that sequence and was the one missing the cleanup
+		# on failure, so an interrupted write left a world.tmp behind.
 		os.makedirs(LIB_DIR, exist_ok=True)
-		# atomic: write a temp file then rename, so a crash mid-write can
-		# never truncate the world file (only pins are transient; this
-		# record should survive)
-		tmp = WORLD + ".tmp"
-		with open(tmp, "w") as f:
-			f.write("\n".join(sorted(names)) + "\n")
-			f.flush()
-			os.fsync(f.fileno())
-		os.replace(tmp, WORLD)
-		_fsync_dir(WORLD)
+		write_atomic(WORLD, ("\n".join(sorted(names)) + "\n").encode())
 
 	# -- sync ---------------------------------------------------------------
 
@@ -3476,30 +3485,26 @@ def _write(path, lines):
 	# trade for /etc than a broken hard link is.
 	path = os.path.realpath(path)
 	st = os.stat(path)
-	tmp = path + ".emerge-tmp"
-	try:
-		# Paired with read_lines: surrogateescape on both sides is what makes
-		# a byte that is not valid UTF-8 survive the round trip instead of
-		# being replaced by U+FFFD and written into /etc that way.
-		with open(tmp, "w", encoding="utf-8", errors="surrogateescape") as f:
-			f.writelines(lines)
-			f.flush()
-			os.fsync(f.fileno())
+	def carry_metadata(tmp):
+		"""What os.replace would otherwise drop on the floor."""
 		os.chmod(tmp, st.st_mode)
 		try:
 			os.chown(tmp, st.st_uid, st.st_gid)
 		except PermissionError:
 			pass
 		_copy_xattrs(path, tmp)
-		os.replace(tmp, path)
-	except BaseException:
-		# never leave a half-written .emerge-tmp lying about in /etc
-		try:
-			os.unlink(tmp)
-		except OSError:
-			pass
-		raise
-	_fsync_dir(path)
+
+	# Paired with read_lines: surrogateescape on both sides is what makes a
+	# byte that is not valid UTF-8 survive the round trip instead of being
+	# replaced by U+FFFD and written into /etc that way. Encoding here
+	# rather than opening in text mode, because the shared writer works in
+	# bytes -- the same codec and the same errors setting, so the round trip
+	# is unchanged.
+	#
+	# The temporary file keeps its own suffix. `.emerge-tmp` in /etc says
+	# whose it is, where a bare `.tmp` beside somebody's config does not.
+	write_atomic(path, "".join(lines).encode("utf-8", "surrogateescape"),
+	             prepare=carry_metadata, suffix=".emerge-tmp")
 
 def _retire(conf, target, pending):
 	"""The parked file is what the package now ships: it becomes the ancestor
