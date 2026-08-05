@@ -2371,6 +2371,12 @@ class DpkgBackend:
         except with a text editor."""
 		world = self._read_world()
 		drop = [n for n in names if n in world]
+		# Before announcing anything. Printing "Removing x" and then finding
+		# out we are not root tells the user the thing happened when it did
+		# not -- and stdout is block-buffered while the error is not, so the
+		# two even arrive in the wrong order.
+		if drop and not pretend:
+			need_root()
 		verb = "Would remove" if pretend else "Removing"
 		for name in names:
 			if name in world:
@@ -2378,10 +2384,9 @@ class DpkgBackend:
 				      f'"world" favorites file...')
 			else:
 				ewarn(f"{name} is not in @selected; skipping.")
-		if not drop or pretend:
-			return
-		need_root()
-		self._write_world(world - set(drop))
+		if drop and not pretend:
+			self._write_world(world - set(drop))
+		return drop
 
 	# -- search ---------------------------------------------------------------
 
@@ -2962,6 +2967,10 @@ class AptBackend:
         version, so nothing here can pin anything."""
 		manual = self._manual_set()
 		drop = [n for n in names if n in manual]
+		# See the dpkg backend's copy: the permission check comes before the
+		# announcement, or a non-root run claims to have done the work.
+		if drop and not pretend:
+			need_root()
 		verb = "Would remove" if pretend else "Removing"
 		for name in names:
 			if name in manual:
@@ -2969,14 +2978,13 @@ class AptBackend:
 				      f'"world" favorites file (apt manual-install marks)...')
 			else:
 				ewarn(f"{name} is not in @selected; skipping.")
-		if not drop or pretend:
-			return
-		need_root()
-		r = capture(["apt-mark", "auto"] + drop)
-		if r.returncode != 0:
-			print((r.stderr or r.stdout).strip(), file=sys.stderr)
-			eerror("could not clear the manual-install mark.")
-			sys.exit(1)
+		if drop and not pretend:
+			r = capture(["apt-mark", "auto"] + drop)
+			if r.returncode != 0:
+				print((r.stderr or r.stdout).strip(), file=sys.stderr)
+				eerror("could not clear the manual-install mark.")
+				sys.exit(1)
+		return drop
 
 	@staticmethod
 	def _policy_batch(names, chunk=500):
@@ -4141,7 +4149,13 @@ def main(argv):
 	if opts["deselect"]:
 		if not pkgs:
 			eerror("no targets given."); sys.exit(1)
-		be.deselect(pkgs, opts["pretend"]); return
+		# Nothing matched means nothing was done, and `emerge -C` already
+		# says so with a non-zero status when none of its targets were
+		# installed. Two verbs that both mean "you named things I could not
+		# act on" should not disagree about whether that is a failure.
+		if not be.deselect(pkgs, opts["pretend"]):
+			sys.exit(1)
+		return
 
 	if opts["unmerge"]:
 		if not pkgs:

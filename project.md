@@ -1343,6 +1343,20 @@ write surface ever needs testing.
     assertion that matters is that the package is **still installed**
     afterwards. That is the whole difference from `--unmerge`, and it is
     the one a wrong implementation would get wrong.
+
+    Two things an exit-code survey caught afterwards, both mine. It printed
+    `Removing x` and *then* called `need_root()`, so a non-root run claimed
+    to have done the work — and because stdout is block-buffered while the
+    error is not, the permission failure appeared *above* the line saying it
+    had already happened. And it exited 0 when nothing it named was in
+    `@selected`, while `emerge -C` exits 1 when none of its targets were
+    installed. Two verbs that both mean "you named things I could not act
+    on" should not disagree about whether that is a failure.
+
+    The survey itself needed redoing: the first pass read `$?` after a
+    pipeline, so it was reporting `tail`'s status and every command looked
+    like it exited 0 — including `--sync` without privileges, which would
+    have been a much worse bug than the ones actually there.
 ---
 
 ## Backend parity is the main source of bugs

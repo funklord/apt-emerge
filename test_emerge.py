@@ -2081,13 +2081,59 @@ class TestDeselect(unittest.TestCase):
 		self.deselect("never-chosen", "gone-from-the-archive")
 		self.assertEqual(self.world(), {"real"})
 
+	def test_it_asks_for_root_before_it_announces_anything(self):
+		"""It printed `Removing x` and then discovered it was not root, so a
+        non-root run claimed to have done the work. Worse in practice than
+        it sounds: stdout is block-buffered and the error is not, so the
+        permission failure appeared *above* the line saying it had already
+        happened."""
+		order = []
+		self.mod.need_root = lambda: order.append("need_root")
+		buf = io.StringIO()
+		with contextlib.redirect_stdout(buf):
+			self.mod.DpkgBackend().deselect(["real"], False)
+		self.assertEqual(order, ["need_root"], "need_root was never called")
+		self.assertIn("Removing", buf.getvalue())
+		# and nothing is announced when there is nothing to do
+		order.clear()
+		with contextlib.redirect_stdout(io.StringIO()):
+			self.mod.DpkgBackend().deselect(["never-chosen"], False)
+		self.assertEqual(order, [], "asked for root with nothing to remove")
+
+	def test_pretend_needs_no_privileges(self):
+		def refuse():
+			raise AssertionError("--pretend asked for root")
+		self.mod.need_root = refuse
+		with contextlib.redirect_stdout(io.StringIO()):
+			self.mod.DpkgBackend().deselect(["real"], True)
+
+	def test_it_reports_what_it_dropped(self):
+		"""main turns an empty result into a non-zero exit, because `emerge
+        -C` already does that when none of its targets were installed, and
+        two verbs meaning "you named things I could not act on" should not
+        disagree about whether that is a failure."""
+		with contextlib.redirect_stdout(io.StringIO()):
+			dropped = self.mod.DpkgBackend().deselect(
+			    ["real", "never-chosen"], False)
+			nothing = self.mod.DpkgBackend().deselect(["never-chosen"], False)
+		self.assertEqual(dropped, ["real"])
+		self.assertEqual(nothing, [])
+
+	def test_naming_nothing_that_is_selected_exits_non_zero(self):
+		with self.assertRaises(SystemExit) as exit:
+			with contextlib.redirect_stdout(io.StringIO()):
+				self.mod.main(["--backend=dpkg", "--deselect", "never-chosen"])
+		self.assertEqual(exit.exception.code, 1)
+
 	def test_the_option_reaches_the_backend(self):
 		"""Wiring: the flag is parsed, and --deselect with no targets is an
         error rather than a silent no-op."""
 		seen = {}
-		self.mod.DpkgBackend.deselect = \
-		    lambda self_, names, pretend: seen.update(names=names,
-		                                              pretend=pretend)
+
+		def stub(self_, names, pretend):
+			seen.update(names=names, pretend=pretend)
+			return list(names)     # what it dropped; empty means nothing did
+		self.mod.DpkgBackend.deselect = stub
 		with contextlib.redirect_stdout(io.StringIO()):
 			self.mod.main(["--backend=dpkg", "--deselect", "-p", "foo"])
 		self.assertEqual(seen, {"names": ["foo"], "pretend": True})
