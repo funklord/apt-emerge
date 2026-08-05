@@ -3000,6 +3000,67 @@ class TestPortability(unittest.TestCase):
 		self.assertEqual(sorted(mods - set(sys.stdlib_module_names)), [])
 
 
+class TestInfo(unittest.TestCase):
+	"""`--info` is what a bug report should open with, so every line has to
+    be a fact rather than a hope.
+
+    The rows were chosen from this program's own failures rather than from
+    Portage's list, which is mostly compilers and USE flags: a foreign
+    architecture the dpkg backend cannot represent, a missing `lzma` that
+    changes which index `--sync` fetches, an absent `gpgv` so nothing
+    verifies the archive, and a locale that used to stop every parser in the
+    file from matching."""
+
+	def setUp(self):
+		self.mod = load()
+		self.mod._find_session_leaders = lambda: []
+
+	def info(self, *argv):
+		buf = io.StringIO()
+		with contextlib.redirect_stdout(buf):
+			self.mod.main(list(argv))
+		return buf.getvalue()
+
+	def test_it_reports_the_things_that_have_caused_misdiagnoses(self):
+		out = self.info("--info")
+		for row in ("Architecture", "Locale", "gpgv", "lzma", "Sources",
+		            "Distribution", "Graphical session"):
+			with self.subTest(row=row):
+				self.assertIn(row, out)
+
+	def test_it_names_the_backend_whichever_order_the_flags_come_in(self):
+		"""--info answers and returns from inside the argument loop, so a
+        --backend= after it was not seen: the same command reported two
+        different backends depending on which word came first."""
+		self.assertIn("dpkg backend", self.info("--info", "--backend=dpkg"))
+		self.assertIn("dpkg backend", self.info("--backend=dpkg", "--info"))
+		self.assertIn("apt backend", self.info("--info", "--backend=apt"))
+
+	def test_it_says_when_lzma_is_missing_rather_than_staying_quiet(self):
+		"""A minimal Python without lzma silently changes which index
+        --sync fetches, which is exactly the sort of thing a bug report
+        needs to carry."""
+		self.mod.lzma = None
+		self.assertIn("absent", self.info("--info"))
+
+	def test_the_multiarch_row_is_not_dead_code(self):
+		"""It reads state that only installed_state() fills in, and --info
+        had no reason to call it -- so the row could never appear. Written
+        that way first."""
+		self.mod.installed_state = lambda: self.mod.MULTIARCH_INSTANCES.update(
+		    {"libfoo": ["amd64", "i386"]}) or {}
+		self.assertIn("Multiarch", self.info("--info"))
+
+	def test_it_changes_nothing(self):
+		"""Like --version and --help. It runs as any user, and constructing
+        a backend is what once created /var/lib/emerge-dpkg on a query."""
+		def refuse(*a, **k):
+			raise AssertionError("--info constructed a backend")
+		self.mod.pick_backend = refuse
+		self.mod.need_root = refuse
+		self.info("--info")
+
+
 class TestPortageAtoms(unittest.TestCase):
 	"""The premise is that emerge's command line works here, so the spellings
     a Portage user's fingers produce should not fall through to apt and come

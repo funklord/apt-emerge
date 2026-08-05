@@ -55,6 +55,7 @@ Ordinary operations map onto the Portage verbs you already know:
 | `emerge -C <pkg>` | unmerge |
 | `emerge --deselect <pkg>` | stop counting it as one you asked for, without unmerging |
 | `emerge --depclean` | remove packages nothing depends on |
+| `emerge --info` | the versions and settings to put in a bug report |
 | `emerge -s <regex>` | search |
 | `emerge --sync` | refresh the package indexes |
 | `emerge -b <pkg>` | build from the Debian source package and install it |

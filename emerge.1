@@ -63,6 +63,24 @@ file. Combine with
 .B --pretend
 to see what would change.
 .TP
+.B --info
+Print the versions, paths and settings worth putting in a bug report: the
+backend in use, the
+.BR dpkg " and " apt-get
+versions, the architecture and any foreign ones, the locale, whether
+.BR gpgv " and " lzma
+are available, how many source entries are enabled, and what the graphical
+session looks like from here. Every line is something that has caused a real
+misdiagnosis \(em a foreign architecture the dpkg backend cannot represent, a
+missing
+.B lzma
+that changes which index
+.B --sync
+fetches, an absent
+.B gpgv
+so nothing verifies the archive, or a locale that stops apt's output being
+understood. Answers and exits without touching anything.
+.TP
 .B --dispatch-conf
 Review and merge config files left pending by a merge. See
 .B CONFIG FILE MERGING

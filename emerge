@@ -3782,6 +3782,16 @@ Actions:
                  auto-installed; on the dpkg backend it edits the world
                  file. Combine with --pretend to see what would change.
 
+   --info
+                 Prints the versions, paths and settings worth having in a
+                 bug report: the backend in use, dpkg and apt versions, the
+                 architecture and any foreign ones, the locale, whether
+                 gpgv and lzma are present, how many source entries are
+                 enabled, and what the graphical session looks like from
+                 here. Each line is something that has caused a real
+                 misdiagnosis. Like --version and --help, it answers and
+                 exits without touching anything.
+
    --dispatch-conf
                  Reviews and merges config files left pending by a merge.
                  Debian parks updated config files beside the originals
@@ -4032,6 +4042,101 @@ def translate_atom(atom):
 	return atom, None
 
 
+def show_info(backend_flag):
+	"""Portage's `--info`: the block you paste into a bug report.
+
+    Chosen by asking what went wrong in this program's own history rather
+    than by copying Portage's list, which is mostly about compilers and USE
+    flags and has no Debian meaning. Every line here has cost somebody time:
+    a foreign architecture the dpkg backend cannot represent, a missing
+    `lzma` that quietly changes which index `--sync` fetches, a `gpgv` that
+    is absent so nothing verifies the archive, and a locale that used to
+    stop every parser in the file from matching."""
+	uname = os.uname()
+	print(f"Portage {VERSION} (python {sys.version.split()[0]}, "
+	      f"{backend_name(backend_flag)} backend)")
+	print("=" * 65)
+
+	def row(label, value):
+		print(f"{label + ':':<22}{value}")
+
+	row("System uname", f"{uname.sysname}-{uname.release}-{uname.machine}")
+	release = "unknown"
+	for path in ("/etc/os-release", "/usr/lib/os-release"):
+		try:
+			with open(path, encoding="utf-8", errors="replace") as f:
+				fields = dict(
+				    l.rstrip("\n").split("=", 1) for l in f
+				    if "=" in l and not l.startswith("#"))
+			release = fields.get("PRETTY_NAME", "").strip('"') or release
+			break
+		except OSError:
+			continue
+	row("Distribution", release)
+
+	def version_of(program, *args):
+		"""The version number, not the sentence it arrives in. dpkg answers
+        "Debian 'dpkg' package management program version 1.22.22 (amd64)."
+        and only the number is worth a column."""
+		if not shutil.which(program):
+			return "not installed"
+		r = capture([program, *args], env=parse_env())
+		first = ((r.stdout or r.stderr).splitlines() or [""])[0].strip()
+		m = re.search(r"\b(\d[\w.+~:-]*)", first)
+		return m.group(1) if m else (first or "unknown")
+
+	row("dpkg", version_of("dpkg", "--version"))
+	row("apt-get", version_of("apt-get", "--version"))
+	arch = capture(["dpkg", "--print-architecture"],
+	               env=parse_env()).stdout.strip() if shutil.which("dpkg") \
+	    else "unknown"
+	foreign = capture(["dpkg", "--print-foreign-architectures"],
+	                  env=parse_env()).stdout.split() \
+	    if shutil.which("dpkg") else []
+	row("Architecture", arch + (f" (foreign: {', '.join(foreign)})"
+	                            if foreign else ""))
+	# Multiarch is why the foreign list is here: the dpkg backend keys
+	# packages by name, so a package installed for two architectures is one
+	# it can only half see. MULTIARCH_INSTANCES is filled in as the status
+	# file is parsed, so it has to be parsed first -- the row was dead
+	# without this, which is what an unused diagnostic looks like.
+	try:
+		installed_state()
+	except OSError:
+		pass
+	if MULTIARCH_INSTANCES:
+		row("Multiarch", f"{len(MULTIARCH_INSTANCES)} package(s) installed "
+		                 f"for more than one architecture")
+
+	# The locale reaches every parser in this file, and used to break them.
+	row("Locale", ", ".join(
+	    f"{v}={os.environ[v]}" for v in ("LANG", "LANGUAGE", "LC_ALL")
+	    if os.environ.get(v)) or "unset")
+	row("gpgv", shutil.which("gpgv") or "not installed (archive signatures "
+	                                    "cannot be checked)")
+	row("lzma", "available" if lzma else "absent (--sync falls back to .gz)")
+
+	try:
+		sources = read_sources()
+		row("Sources", f"{len(sources)} enabled entr"
+		               f"{'y' if len(sources) == 1 else 'ies'}")
+	except OSError as e:
+		row("Sources", f"unreadable: {e.strerror}")
+
+	if backend_name(backend_flag) == "dpkg":
+		row("World file", WORLD if os.path.exists(WORLD)
+		    else f"{WORLD} (not created yet)")
+		row("Package tree", TREE_DIR if os.path.isdir(TREE_DIR)
+		    else f"{TREE_DIR} (run --sync)")
+
+	leaders = _find_session_leaders()
+	row("Graphical session",
+	    "cannot tell (not permitted to read /proc)" if leaders is None
+	    else f"{len(leaders)} leader(s): "
+	         f"{', '.join(sorted({c for _, c in leaders}))}" if leaders
+	    else "none detected")
+
+
 def backend_name(forced):
 	"""Which backend would be used, without constructing it.
 
@@ -4063,6 +4168,14 @@ def main(argv):
 	                           "buildpkg", "buildpkgonly", "dispatch",
 	                           "no_dep_upgrade", "no_verify")}
 	pkgs, backend_flag = [], None
+	# Read --backend= before the loop, not during it. `--info` and `-V`
+	# answer and return from inside the loop, so with the flag read in
+	# argv order `emerge --info --backend=dpkg` reported the apt backend
+	# and `emerge --backend=dpkg --info` reported the dpkg one -- the same
+	# command, two answers, depending on which word came first.
+	for arg in argv:
+		if arg.startswith("--backend="):
+			backend_flag = arg.split("=", 1)[1]
 	if not argv:
 		print(HELP); return
 	for arg in argv:
@@ -4117,6 +4230,8 @@ def main(argv):
 			continue
 		if arg in ("--help", "-h"):
 			print(HELP); return
+		if arg == "--info":
+			show_info(backend_flag); return
 		if arg in ("--version", "-V"):
 			print(f"Portage {VERSION} (python {sys.version.split()[0]}, "
 			      f"{backend_name(backend_flag)} backend)")

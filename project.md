@@ -247,6 +247,19 @@ Whether to implement multiarch properly is open, and is the owner's call.
 - `-C`/`--unmerge`, `--depclean`/`-c` (apt: `autoremove`; dpkg: world-closure).
 - `--deselect` — drop packages from `@selected` without unmerging them.
   apt: `apt-mark auto`; dpkg: edit the world file. Honours `-p`.
+- `--info` — the block to paste into a bug report. Its rows were chosen from
+  this program's own failures rather than from Portage's list, which is
+  mostly compilers and USE flags: the backend in use, dpkg and apt versions,
+  the architecture **and any foreign ones**, the locale, whether `gpgv` and
+  `lzma` are present, how many source entries are enabled, and what the
+  graphical session looks like from here. Every one of those has cost
+  somebody a misdiagnosis in the notes above. Like `--version` and `--help`
+  it answers and exits, constructing no backend and writing nothing.
+
+  Reading `--backend=` in argv order was a wart the two of them shared:
+  `emerge --info --backend=dpkg` reported the apt backend and
+  `emerge --backend=dpkg --info` reported the dpkg one. The flag is scanned
+  before the loop now, so the same command gives the same answer.
 - `-b`/`--buildpkg`, `-B`/`--buildpkgonly` (apt only).
 - `--dispatch-conf` / `--etc-update` (config merging).
 - `--no-dep-upgrade`, `--with pkg,pkg` (see below).
