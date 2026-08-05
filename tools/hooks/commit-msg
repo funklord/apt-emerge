@@ -16,6 +16,45 @@
 
 msg="$1"
 
+TOOLING='generated with|claude|anthropic|copilot|chatgpt|noreply@anthropic'
+
+# What the prose check reads, and it is deliberately not the whole file.
+#
+# Two things are removed, for two different reasons.
+#
+# First, everything git is going to throw away: comment lines, and the diff
+# below the scissors line that `git commit -v` appends. Checking those
+# refuses a commit over text that will never be in it, and the case is not
+# hypothetical -- a change to THIS FILE shows its own vendor list in the
+# diff, so the hook refused every commit that edited it. (A message kept
+# with --cleanup=verbatim would retain comment lines; that is the one shape
+# where this is more lenient than the stored message.)
+#
+# Second, the directory name of the shared tooling tree, which is `.claude`.
+# Without this no commit could say where these files come from: this hook
+# lives at ~/.claude/tools/commit-msg, the style gate beside it, and the
+# guidelines under ~/.claude/guidelines/. Naming one read as a "tooling
+# reference" -- the rule firing on the one use it was never meant to cover,
+# where the workaround is to describe a path instead of writing it, making
+# the log vaguer exactly where it is trying to be exact.
+#
+# What is spared is exactly two NAMES: the directory `.claude`, written
+# with its leading dot, and the file `CLAUDE.md`. Neither is a plausible
+# spelling of attribution -- nobody credits a tool as ".claude" -- while
+# both are unavoidable when writing about these files. The bare vendor word
+# on its own is untouched and still refused.
+#
+# Only those names are neutralised, never the token around them. Stripping
+# whole path-shaped tokens instead would forgive anything hidden inside one,
+# and a trailer naming a vendor as the last element of a path under the tree
+# then passed; that was measured, and is why this is narrow.
+#
+# The trailer check below is deliberately left reading the raw message: it
+# keys on the trailer NAME rather than on any vendor, so a generated-by
+# trailer with any path at all is still refused.
+prose=$(sed -e '/^#.*>8/,$d' -e '/^#/d' "$msg" \
+	| sed -E 's#\.claude#.tooling#g; s#CLAUDE\.md#guidelines.md#g')
+
 # 1. No AI or tooling attribution. The single deviation from kernel practice,
 #    and it is absolute. Human co-authors and reviewers are fine; a generator
 #    is not an author and does not sign anything.
@@ -26,9 +65,12 @@ if grep -qiE '^[[:space:]]*(assisted-by|generated-by|co-developed-by)[[:space:]]
 	exit 1
 fi
 
-if grep -qiE 'generated with|claude|anthropic|copilot|chatgpt|noreply@anthropic' "$msg"; then
+if printf '%s\n' "$prose" | grep -qiE "$TOOLING"; then
 	echo "commit-msg: tooling reference in the message." >&2
-	grep -inE 'generated with|claude|anthropic|copilot|chatgpt|noreply@anthropic' "$msg" >&2
+	# Reported from the scrubbed text on purpose: the line is shown as the
+	# check read it, so what is left highlighted is the actual reason, not a
+	# path that was already forgiven.
+	printf '%s\n' "$prose" | grep -inE "$TOOLING" >&2
 	exit 1
 fi
 
