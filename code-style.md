@@ -170,9 +170,10 @@ Two things it deliberately does not reject. The directory `.claude` and the
 file `CLAUDE.md` are names, so a message may say where the shared tooling
 comes from -- the ban is on crediting a generator, and neither spelling is
 one. And it ignores what git is about to discard: comment lines, and the
-diff `git commit -v` puts below the scissors line. Reading those refused
-commits over text that never reaches the message, which this file provoked
-itself -- its own diff contains its own pattern list.
+diff that `git commit -v` puts below the scissors line. Reading those
+refused commits over text that never reaches the message -- the hook's own
+diff contains its own pattern list, so it rejected every commit that
+edited it.
 
 ## See also
 
