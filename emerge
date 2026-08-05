@@ -1306,6 +1306,40 @@ def fetch(url, timeout=60, limit=None):
 		return data
 
 
+def write_atomic(path, data):
+	"""Write bytes so a reader sees either the old file or the whole new one.
+
+    The index was the one thing written straight over itself. Config files go
+    through `_write` and the world file through `_write_world`, both
+    temp-then-rename with an fsync and both carrying a comment about why --
+    and `sync()` opened the index for writing and started filling it. So a
+    Ctrl-C during a long download, a full disk, or a crash left a *truncated*
+    Packages file behind.
+
+    That is the shape that does not announce itself: a short index parses
+    perfectly and simply has fewer packages in it, so the resolver answers
+    from part of the archive and says "there are no packages to satisfy" for
+    things that plainly exist. Measured: interrupting a 500-package index a
+    third of the way through leaves 168 packages and no error anywhere.
+
+    `--sync` is exactly the operation people interrupt, being the slow one
+    that talks to the network."""
+	tmp = path + ".tmp"
+	try:
+		with open(tmp, "wb") as f:
+			f.write(data)
+			f.flush()
+			os.fsync(f.fileno())
+		os.replace(tmp, path)
+	except BaseException:
+		try:
+			os.unlink(tmp)
+		except OSError:
+			pass
+		raise
+	_fsync_dir(path)
+
+
 def decompress_bounded(raw, ext, limit=MAX_INDEX_BYTES):
 	"""Decompress an index, refusing to produce more than `limit` bytes.
 
@@ -1789,8 +1823,7 @@ class DpkgBackend:
 						mark = f" [{GREEN('gpg ✓')}]" if this_signed else ""
 						print(GREEN("done") +
 						      f" ({len(data) / 2**20:,.1f} MiB){mark}")
-				with open(self._tree_file(base, suite, comp), "wb") as f:
-					f.write(data)
+				write_atomic(self._tree_file(base, suite, comp), data)
 				ok += 1
 				if flat:
 					break

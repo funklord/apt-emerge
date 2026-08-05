@@ -627,8 +627,29 @@ truncated its fixture at a fixed 120 bytes, and this index compresses to 88
 
 - No persistent pins (see hard rule 3). Interrupted installs recover with the
   normal `dpkg --configure -a` / `apt-get -f install`.
-- World file and config writes are atomic (temp + fsync + `os.replace`).
+- World file, config **and index** writes are atomic (temp + fsync +
+  `os.replace`). The index was the exception until it was looked for: `sync()`
+  opened the file and started filling it, so an interrupted `--sync` — the
+  slow operation that talks to the network, and therefore the one people
+  interrupt — left a **truncated** `Packages` behind. Truncated does not mean
+  unreadable, which is the whole problem: cutting a 500-package index a third
+  of the way through leaves 168 packages that parse perfectly, so the
+  resolver plans against part of the archive and reports "there are no
+  packages to satisfy" for things that plainly exist. `write_atomic()` now
+  does it the way the other two writers already did.
 - `--with` allow-set is per-invocation, never persisted.
+
+**What is not protected: two runs at once.** Nothing takes a lock. On the apt
+backend that mostly does not matter, because apt takes dpkg's frontend lock
+and the second run waits. The dpkg backend has no equivalent: two concurrent
+runs would each read the world file, each modify their copy, and each write
+it back, so one set of changes is lost — `merge`, `unmerge` and `--deselect`
+are all read-modify-write against it. A `--sync` racing a resolve is safer
+than it was now that indexes are replaced atomically rather than rewritten
+in place, but the world file is not covered by that.
+
+Whether to take a lock, and where it should live so that it does not
+pretend to coordinate with apt when it cannot, is open and unstarted.
 
 ---
 

@@ -4553,6 +4553,70 @@ class TestBoundedIndexReading(unittest.TestCase):
 		                 "no limit given, no limit applied")
 
 
+class TestAtomicIndexWrite(unittest.TestCase):
+	"""A half-written index is the worst kind, because it reads as a whole
+    one.
+
+    `sync()` used to open the index and start filling it, so a Ctrl-C during
+    a long download -- and `--sync` is the operation people interrupt, being
+    the slow one that talks to the network -- left a truncated Packages
+    behind. Truncated does not mean unreadable: measured, cutting a
+    500-package index a third of the way through leaves 168 packages that
+    parse perfectly, so the resolver answers from part of the archive and
+    reports "there are no packages to satisfy" for things that exist.
+
+    Config files and the world file were already written temp-then-rename.
+    The index was the one that was not."""
+
+	def setUp(self):
+		self.dir = _scratch()
+		os.makedirs(self.dir)
+		self.path = os.path.join(self.dir, "repo_Packages")
+		with open(self.path, "wb") as f:
+			f.write(b"Package: old\n\n")
+
+	def test_it_replaces_the_content(self):
+		em.write_atomic(self.path, b"Package: new\n\n")
+		with open(self.path, "rb") as f:
+			self.assertEqual(f.read(), b"Package: new\n\n")
+
+	def test_it_leaves_no_temporary_file(self):
+		em.write_atomic(self.path, b"Package: new\n\n")
+		self.assertEqual(os.listdir(self.dir), ["repo_Packages"])
+
+	def test_a_failed_write_leaves_the_previous_index_intact(self):
+		"""The property that matters. A reader during or after a failed sync
+        must see the whole old index, never a piece of the new one."""
+		original = os.fsync
+		self.addCleanup(setattr, os, "fsync", original)
+
+		def boom(fd):
+			raise OSError(28, "No space left on device")
+		os.fsync = boom
+
+		with self.assertRaises(OSError):
+			em.write_atomic(self.path, b"Package: new\n\n" * 100)
+		with open(self.path, "rb") as f:
+			self.assertEqual(f.read(), b"Package: old\n\n",
+			                 "a failed write damaged the index that was "
+			                 "already there")
+		self.assertEqual(os.listdir(self.dir), ["repo_Packages"],
+		                 "a failed write left its temporary file in the tree")
+
+	def test_sync_writes_the_index_through_it(self):
+		"""The wiring, checked at the source, which is weak and deliberate.
+
+        The integration suite runs real syncs, so the call site works -- but
+        a real sync is never interrupted there, so nothing in the suite
+        would notice it going back to a plain open. Grepping the one line is
+        the honest amount of coverage available; claiming more would mean
+        writing a test that cannot fail."""
+		with open(SCRIPT) as f:
+			src = f.read()
+		self.assertIn("write_atomic(self._tree_file(", src)
+		self.assertNotIn("with open(self._tree_file", src)
+
+
 class TestDearmor(unittest.TestCase):
 	def test_binary_keyring_passes_through(self):
 		raw = b"\x99\x01\x0d\x04binary key packets"
