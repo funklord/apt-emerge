@@ -3412,6 +3412,34 @@ class TestArchiveSettled(unittest.TestCase):
 	def has_archive(self, path):
 		return os.path.exists(self.mod.archive_path(self.conf, path))
 
+	def test_one_unarchivable_file_does_not_abandon_the_rest(self):
+		"""This runs after a successful install, and again from the failure
+        path where its whole job is to record what landed and announce
+        parked files before bailing out. An exception here replaced the
+        error the user needed with a traceback and abandoned every conffile
+        after the failing one -- each of which then has no ancestor, so the
+        next upgrade reviews it by hand instead of merging it.
+
+        A full /var during an install is the ordinary way in. Permissions
+        stand in for it here, being the failure a test can arrange."""
+		first = self.conffile("a.conf", "one\n")
+		bad = self.conffile("unreadable.conf", "two\n")
+		last = self.conffile("c.conf", "three\n")
+		os.chmod(bad, 0o000)
+		self.addCleanup(os.chmod, bad, 0o644)
+		said = []
+		self.mod.ewarn = said.append
+
+		n = self.mod.archive_settled(self.conf, ["pkg"])
+
+		self.assertEqual(n, 2, "the count should exclude what it could not do")
+		self.assertTrue(self.has_archive(first))
+		self.assertTrue(self.has_archive(last),
+		                "the file after the failing one was never archived")
+		self.assertFalse(self.has_archive(bad))
+		self.assertTrue(any("unreadable.conf" in s for s in said),
+		                f"the failure was swallowed silently: {said}")
+
 	def test_an_unmodified_conffile_becomes_the_ancestor(self):
 		"""dpkg installed it without parking, so what is on disk is exactly
         what the package ships -- the right thing to remember."""

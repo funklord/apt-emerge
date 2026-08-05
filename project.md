@@ -487,6 +487,17 @@ Debian already parks updated conffiles as `.dpkg-dist`/`.ucf-dist` (== Portage's
   `_retire()` promotes the parked copy to ancestor once resolved.
   **Timing is load-bearing** — a past bug archived the *incoming* .deb before
   install, making new==ancestor and silently discarding every update.
+  One copy per file, overwritten, so the archive is bounded by the number of
+  conffiles on the system (1,148 here) rather than growing per upgrade.
+- **A file it cannot copy is skipped, not fatal.** The copy was unguarded, so
+  one unreadable or unwritable conffile raised out of the whole pass — which
+  runs after a *successful* install, and again from the failure path where
+  its entire job is to record what landed and announce parked files before
+  bailing out. An exception there replaces the error the user needed with a
+  traceback and abandons every conffile after the failing one, each of which
+  then has no ancestor. A full `/var` during an install is the ordinary way
+  in. Losing one ancestor is cheap by comparison: dispatch-conf reviews that
+  file 2-way and says so.
 - `merge3()` — pure-Python diff3 (`difflib`), conflict markers
   current/as-shipped/new. `_significant()` strips comments+whitespace for the
   "wscomments-only" auto-apply.

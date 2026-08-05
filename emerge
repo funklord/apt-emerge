@@ -3330,13 +3330,35 @@ def archive_settled(conf, packages):
     precisely the ancestor dispatch-conf needs -- and are re-archived from
     the parked copy once resolved."""
 	n = 0
+	failed = []
 	for paths in conffiles_of(packages).values():
 		for path in paths:
 			if any(os.path.exists(path + s) for s in PENDING_SUFFIXES):
 				continue
 			if os.path.isfile(path):
-				_store_ancestor(conf, path, path)
+				# One file that cannot be copied must not take the rest with
+				# it. This runs *after* a successful install and again from
+				# the failure path, where its whole job is to record what
+				# landed and announce parked files before bailing out -- so
+				# an exception here replaces the error the user needed with
+				# a traceback, and abandons every conffile after the failing
+				# one. A full /var during an install is the ordinary way in.
+				#
+				# Losing one ancestor is cheap by comparison: dispatch-conf
+				# falls back to a 2-way review for that file and says so.
+				try:
+					_store_ancestor(conf, path, path)
+				except OSError as e:
+					failed.append((path, e.strerror or str(e)))
+					continue
 				n += 1
+	if failed:
+		ewarn(f"could not archive {len(failed)} config file(s); "
+		      f"dispatch-conf will review those without an ancestor:")
+		for path, why in failed[:5]:
+			ewarn(f"  {path}: {why}")
+		if len(failed) > 5:
+			ewarn(f"  ... and {len(failed) - 5} more")
 	return n
 
 def ancestor_for(conf, path):
