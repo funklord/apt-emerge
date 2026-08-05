@@ -1391,6 +1391,31 @@ write surface ever needs testing.
    - **`fpm`, named above as the generic fallback, is not packaged for
      Debian at all** — neither `fpm` nor `ruby-fpm` is in trixie.
 
+   **`dh-python` was then evaluated as the replacement, and it works.**
+   Proven end to end on 2026-08-05 against `tomli` 2.4.1 from PyPI — a real
+   sdist with `pyproject.toml` and no `setup.py`, the exact case `stdeb`
+   cannot read. A hand-written `debian/` of four files (`control`,
+   `changelog`, a three-line `rules` calling
+   `dh $@ --buildsystem=pybuild`, and `source/format`) built
+   `python3-tomli_2.4.1-1_all.deb`, which installs and imports, landing in
+   `/usr/lib/python3.13/dist-packages/tomli/`.
+
+   So the shape is: emerge generates that `debian/` directory and drives the
+   `dpkg-buildpackage` machinery `-b`/`-B` already has. Nothing new is
+   needed to build.
+
+   **It moves the difficulty rather than removing it, and the new one is a
+   second name mapping.** `Build-Depends` has to name the package providing
+   the build backend, which is read from `build-system.requires` in
+   `pyproject.toml` — `tomli` declares `flit_core.buildapi`, so `flit` had
+   to be installed or the build does not start. Checked across the common
+   backends: `setuptools`, `hatchling`, `poetry_core`, `pdm_backend`,
+   `maturin` and `scikit_build_core` are all `python3-<name>` with
+   underscores turned to hyphens — and `flit_core` is not. There is no
+   `python3-flit-core` in trixie; the package is `flit`. Seven of eight
+   mechanical and one exception, among the eight most common, means a table
+   of exceptions is unavoidable here too.
+
    What this changes: the converter was supposed to be the part we did not
    write. Two of the three hard parts below — version translation and name
    mapping — have to be ours whichever tool is driven, and the tool that was
