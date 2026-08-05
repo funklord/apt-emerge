@@ -3053,6 +3053,54 @@ class TestArgParsing(unittest.TestCase):
 		with self.assertRaises(SystemExit, msg=f"{argv} was accepted"):
 			self.parse(argv)
 
+	# -- one action per run --------------------------------------------------
+	#
+	# main() dispatches in a fixed order and returns, so a second action was
+	# not rejected but silently skipped, and which one survived depended on
+	# the order of the branches rather than on anything visible. The worst
+	# shape was `emerge -C --depclean foo`: it ran depclean, dropped the
+	# removal, and exited 0 -- a destructive action nobody asked to run on
+	# its own, standing in for the one they did ask for.
+
+	def test_two_actions_are_refused(self):
+		for argv in (["--depclean", "-C", "bash"],
+		             ["--deselect", "-C", "bash"],
+		             ["-s", "tree", "--depclean"],
+		             ["--sync", "--depclean"],
+		             ["--dispatch-conf", "--depclean"],
+		             ["--depclean", "-b", "bash"]):
+			with self.subTest(argv=argv):
+				self.assertRejected(argv)
+
+	def test_the_refusal_names_both_of_them(self):
+		"""Naming one, or neither, leaves the user to guess which pair of
+        flags it objected to.
+
+        eerror writes to stderr, which `parse` does not capture -- the
+        first version of this test read an empty string and asserted
+        against it."""
+		said = []
+		self.mod.eerror = said.append
+		self.assertRejected(["--depclean", "-C", "bash"])
+		joined = " ".join(said)
+		self.assertIn("--depclean", joined)
+		self.assertIn("--unmerge", joined)
+
+	def test_flags_naming_the_same_action_do_not_conflict(self):
+		"""-s and -S are both search; -b and -B are both the source-build
+        form of an install. Grouping them is the difference between this
+        check and one that refuses ordinary commands."""
+		self.assertAccepted(["-s", "-S", "tree"])
+		self.assertAccepted(["-b", "-B", "bash"])
+
+	def test_a_single_action_is_still_accepted(self):
+		"""The regression this guard could easily cause."""
+		for argv in (["--depclean"], ["-C", "bash"], ["--deselect", "bash"],
+		             ["-s", "tree"], ["--sync"], ["-b", "bash"],
+		             ["bash"], ["-uD", "@world"]):
+			with self.subTest(argv=argv):
+				self.assertAccepted(argv)
+
 	# -- unknown options -----------------------------------------------------
 
 	def test_unknown_long_option_is_rejected(self):

@@ -4131,6 +4131,31 @@ def main(argv):
 	if opts.get("_with_pending"):
 		eerror("--with requires a comma-separated package list."); sys.exit(1)
 
+	# One action per run. main() dispatches in a fixed order and returns, so
+	# a second action was not rejected -- it was silently skipped, and which
+	# one survived depended on the order of the branches below rather than
+	# on anything the user could see. `emerge -C --depclean foo` ran depclean
+	# and dropped the removal, exit 0: a destructive action nobody asked to
+	# run alone, standing in for the one they did ask for. Portage answers
+	# "Multiple actions requested" and stops, which is the right answer and
+	# already the dialect this speaks.
+	#
+	# Grouped, because a few flags name the same action: -s and -S are both
+	# search, and -b and -B are both the source-build form of an install.
+	actions = [name for name, on in (
+	    ("--sync", opts["sync"]),
+	    ("--search", opts["search"] or opts["searchdesc"]),
+	    ("--depclean", opts["depclean"]),
+	    ("--deselect", opts["deselect"]),
+	    ("--unmerge", opts["unmerge"]),
+	    ("--dispatch-conf", opts["dispatch"]),
+	    ("--buildpkg", opts["buildpkg"] or opts["buildpkgonly"]),
+	) if on]
+	if len(actions) > 1:
+		eerror(f"Multiple actions requested: {', '.join(actions)}.")
+		eerror("Please choose one only.")
+		sys.exit(1)
+
 	# Portage spellings, before anything hands them to apt in its own words.
 	translated, complaints = [], []
 	for pkg in pkgs:

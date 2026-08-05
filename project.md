@@ -1557,6 +1557,15 @@ to be true for it to fail, and go and make that true.
   depth is nowhere near that (plasma-desktop's 1,484 packages are breadth),
   so this is a documented bound rather than a bug to fix — `ndu_solve` was
   made iterative because `@world` genuinely is deep, and this is not.
+- **Two actions in one run used to mean the second was silently skipped.**
+  `main()` dispatches in a fixed order and returns, so which one survived
+  depended on the order of the branches rather than on anything visible:
+  `emerge -C --depclean foo` ran depclean, dropped the removal, and exited 0
+  — a destructive action nobody asked to run on its own, standing in for the
+  one they did ask for. Portage answers *"Multiple actions requested"* and
+  stops, which is both right and already this program's dialect. Grouped, so
+  that `-s`/`-S` and `-b`/`-B` still name one action each rather than
+  colliding with themselves.
 - An unrecognised **long** option used to match nothing and fall through both
   arms of the final branch, so it was silently discarded. Harmless for a typo
   like `--nonsense`; dangerous for `--no-dep-upgrades`, one letter off, which
