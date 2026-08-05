@@ -50,6 +50,19 @@ first. On the apt backend this delegates to
 whose auto/manual-install marks are the source of truth; on the dpkg backend
 the world file is.
 .TP
+.B --deselect
+Remove the given packages from the
+.B @selected
+set without unmerging anything. Use it when a package should stay installed
+but no longer count as something you asked for, and to clear an entry naming
+a package that has gone from the archive \(em
+.B --unmerge
+cannot, because it skips whatever is not installed. On the apt backend this
+marks the package auto-installed; on the dpkg backend it edits the world
+file. Combine with
+.B --pretend
+to see what would change.
+.TP
 .B --dispatch-conf
 Review and merge config files left pending by a merge. See
 .B CONFIG FILE MERGING

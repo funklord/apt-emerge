@@ -1869,6 +1869,92 @@ class TestStaleWorldEntries(unittest.TestCase):
 		                 "expansion would bury the plan")
 
 
+class TestDeselect(unittest.TestCase):
+	"""--deselect drops a package from @selected without unmerging it.
+
+    It exists because nothing else could. `emerge -C` removes a world entry,
+    but only as a side effect of unmerging, and it skips a package that is
+    not installed -- which is precisely the entry worth removing when the
+    archive has dropped a package. Until this, the resolver would report a
+    stale entry on every run and offer no way to clear it but a text
+    editor."""
+
+	def setUp(self):
+		self.mod = load()
+		root = _scratch()
+		lib = os.path.join(root, "lib")
+		os.makedirs(os.path.join(lib, "tree"))
+		self.mod.LIB_DIR = lib
+		self.mod.TREE_DIR = os.path.join(lib, "tree")
+		self.mod.WORLD = os.path.join(lib, "world")
+		self.mod.STATUS = os.path.join(root, "status")
+		self.mod.USE_COLOR = False
+		self.mod.need_root = lambda: None
+		with open(self.mod.STATUS, "w") as f:
+			f.write("Package: real\nStatus: install ok installed\n"
+			        "Version: 1.0\nArchitecture: all\nPriority: optional\n\n")
+		self.set_world("real", "gone-from-the-archive")
+
+	def set_world(self, *names):
+		with open(self.mod.WORLD, "w") as f:
+			f.write("".join(n + "\n" for n in names))
+
+	def world(self):
+		with open(self.mod.WORLD) as f:
+			return {l.strip() for l in f if l.strip()}
+
+	def deselect(self, *names, pretend=False):
+		buf = io.StringIO()
+		with contextlib.redirect_stdout(buf):
+			self.mod.DpkgBackend().deselect(list(names), pretend)
+		return buf.getvalue()
+
+	def test_it_removes_an_entry_whose_package_is_gone(self):
+		"""The case --unmerge cannot reach: not installed, so it is skipped
+        there, and the world file keeps naming it forever."""
+		self.deselect("gone-from-the-archive")
+		self.assertEqual(self.world(), {"real"})
+
+	def test_it_does_not_unmerge_what_it_deselects(self):
+		"""The whole distinction from --unmerge. `real` is installed; after
+        deselecting it, it must still be installed and merely unchosen."""
+		self.deselect("real")
+		self.assertEqual(self.world(), {"gone-from-the-archive"})
+		self.assertIn("real", self.mod.installed_state())
+
+	def test_pretend_changes_nothing(self):
+		out = self.deselect("gone-from-the-archive", pretend=True)
+		self.assertEqual(self.world(), {"real", "gone-from-the-archive"})
+		self.assertIn("Would remove", out,
+		              "a pretend run should not claim to have removed it")
+
+	def test_a_name_that_is_not_selected_is_reported_and_skipped(self):
+		said = []
+		self.mod.ewarn = said.append
+		self.deselect("never-chosen")
+		self.assertEqual(self.world(), {"real", "gone-from-the-archive"})
+		self.assertTrue(any("never-chosen" in s for s in said))
+
+	def test_one_bad_name_does_not_stop_the_others(self):
+		self.deselect("never-chosen", "gone-from-the-archive")
+		self.assertEqual(self.world(), {"real"})
+
+	def test_the_option_reaches_the_backend(self):
+		"""Wiring: the flag is parsed, and --deselect with no targets is an
+        error rather than a silent no-op."""
+		seen = {}
+		self.mod.DpkgBackend.deselect = \
+		    lambda self_, names, pretend: seen.update(names=names,
+		                                              pretend=pretend)
+		with contextlib.redirect_stdout(io.StringIO()):
+			self.mod.main(["--backend=dpkg", "--deselect", "-p", "foo"])
+		self.assertEqual(seen, {"names": ["foo"], "pretend": True})
+		with self.assertRaises(SystemExit) as caught:
+			with contextlib.redirect_stdout(io.StringIO()):
+				self.mod.main(["--backend=dpkg", "--deselect"])
+		self.assertEqual(caught.exception.code, 1)
+
+
 class TestPrintUnmergeList(unittest.TestCase):
 	def render(self, removals, requested=None):
 		buf = io.StringIO()

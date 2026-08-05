@@ -637,6 +637,21 @@ class AptBackendEndToEnd(unittest.TestCase):
 		with self.subTest("--oneshot never removes an existing world entry"):
 			self.assertIn("emtest-app", self.manual())
 
+		# -- --deselect ----------------------------------------------------
+		# @selected on this backend *is* `apt-mark showmanual`, so this is a
+		# real apt-mark auto against a real apt. The assertion that matters
+		# is the last one: deselecting must not remove anything, which is the
+		# whole difference between it and --unmerge.
+		be = self.m.AptBackend()
+		be.deselect(["emtest-app"], pretend=True)
+		with self.subTest("--deselect --pretend changes nothing"):
+			self.assertIn("emtest-app", self.manual())
+		be.deselect(["emtest-app"], pretend=False)
+		with self.subTest("--deselect drops it from @selected"):
+			self.assertNotIn("emtest-app", self.manual())
+		with self.subTest("--deselect leaves the package installed"):
+			self.assertEqual(self.installed().get("emtest-app"), "1.0")
+
 	def test_no_dep_upgrade_does_not_drag_dependencies_into_world(self):
 		"""The @world leak, against a real apt and a real apt-mark.
 

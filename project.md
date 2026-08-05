@@ -195,6 +195,8 @@ its own everything-else.
   file **intersected with what is installed** — see the open question in the
   backlog; an entry that is not installed is skipped, and now says so.
 - `-C`/`--unmerge`, `--depclean`/`-c` (apt: `autoremove`; dpkg: world-closure).
+- `--deselect` — drop packages from `@selected` without unmerging them.
+  apt: `apt-mark auto`; dpkg: edit the world file. Honours `-p`.
 - `-b`/`--buildpkg`, `-B`/`--buildpkgonly` (apt only).
 - `--dispatch-conf` / `--etc-update` (config merging).
 - `--no-dep-upgrade`, `--with pkg,pkg` (see below).
@@ -1144,6 +1146,27 @@ write surface ever needs testing.
     package leaving the archive between releases is ordinary, and refusing
     to compute `@world` until the file is tidied would block the upgrade
     that resolves it.
+
+    Reporting it raised the obvious next question — and nothing could act
+    on the report. `--deselect` closes that: see below. The semantic
+    question above is untouched by it.
+
+11. ~~No way to clear a world entry~~ — **done**, `--deselect`, Portage's
+    own verb for it. `emerge -C` removes an entry only as a side effect of
+    unmerging, and it *skips* a package that is not installed, which is
+    exactly the entry worth clearing; the only remedy was a text editor,
+    which is a poor answer for a file the program tells you is wrong.
+
+    Both backends implement it, because `@selected` is a different thing on
+    each: apt marks the package auto-installed, the dpkg backend edits the
+    world file. Hard rule 3 is untouched — `apt-mark auto` records set
+    membership, never a version, which is the distinction that let
+    `--oneshot` use it too.
+
+    Verified against a real `apt-mark` in `AptBackendEndToEnd`, where the
+    assertion that matters is that the package is **still installed**
+    afterwards. That is the whole difference from `--unmerge`, and it is
+    the one a wrong implementation would get wrong.
 ---
 
 ## Backend parity is the main source of bugs

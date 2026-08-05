@@ -2127,6 +2127,30 @@ class DpkgBackend:
 		print(f"\n{ARROW} {BGREEN('Auto-cleaning packages...')}")
 		einfo("GNU info directory index is up-to-date.")
 
+	def deselect(self, names, pretend):
+		"""Drop names from @selected without unmerging anything.
+
+        The world file is the only part of @selected that is ours to edit,
+        and until now nothing could edit it: `emerge -C` removes an entry,
+        but only as a side effect of unmerging, and it skips a package that
+        is not installed -- which is exactly the entry worth removing. A
+        world file naming something the archive no longer carries could
+        therefore be reported (it is, on every resolve) and not fixed,
+        except with a text editor."""
+		world = self._read_world()
+		drop = [n for n in names if n in world]
+		verb = "Would remove" if pretend else "Removing"
+		for name in names:
+			if name in world:
+				print(f"{ARROW} {verb} {BGREEN(name)} from "
+				      f'"world" favorites file...')
+			else:
+				ewarn(f"{name} is not in @selected; skipping.")
+		if not drop or pretend:
+			return
+		need_root()
+		self._write_world(world - set(drop))
+
 	# -- search ---------------------------------------------------------------
 
 	def search(self, terms, desc):
@@ -2695,6 +2719,32 @@ class AptBackend:
 		else:
 			print(f"{ARROW} Not recording targets in \"world\" "
 			      f"favorites file (--oneshot)")
+
+	def deselect(self, names, pretend):
+		"""Drop names from @selected without removing anything.
+
+        @selected on this backend *is* `apt-mark showmanual`, so dropping a
+        name means marking it auto -- the same call `--oneshot` already makes
+        to undo the mark apt writes for every package on its command line.
+        Hard rule 3 is untouched: a set membership is recorded, never a
+        version, so nothing here can pin anything."""
+		manual = self._manual_set()
+		drop = [n for n in names if n in manual]
+		verb = "Would remove" if pretend else "Removing"
+		for name in names:
+			if name in manual:
+				print(f"{ARROW} {verb} {BGREEN(name)} from "
+				      f'"world" favorites file (apt manual-install marks)...')
+			else:
+				ewarn(f"{name} is not in @selected; skipping.")
+		if not drop or pretend:
+			return
+		need_root()
+		r = capture(["apt-mark", "auto"] + drop)
+		if r.returncode != 0:
+			print((r.stderr or r.stdout).strip(), file=sys.stderr)
+			eerror("could not clear the manual-install mark.")
+			sys.exit(1)
 
 	@staticmethod
 	def _policy_batch(names, chunk=500):
@@ -3415,6 +3465,16 @@ Actions:
                  auto/manual-install marks are the source of truth; on the
                  dpkg backend the world file is.
 
+   --deselect
+                 Removes the given packages from the @selected set without
+                 unmerging anything. Use it when a package should stay
+                 installed but no longer count as something you asked for,
+                 and to clear an entry naming a package that is gone from
+                 the archive -- --unmerge cannot, since it skips whatever is
+                 not installed. On the apt backend this marks the package
+                 auto-installed; on the dpkg backend it edits the world
+                 file. Combine with --pretend to see what would change.
+
    --dispatch-conf
                  Reviews and merges config files left pending by a merge.
                  Debian parks updated config files beside the originals
@@ -3643,7 +3703,7 @@ def pick_backend(forced):
 def main(argv):
 	opts = {k: False for k in ("ask", "verbose", "pretend", "update", "deep",
 	                           "fetchonly", "oneshot", "search", "searchdesc",
-	                           "unmerge", "depclean", "sync",
+	                           "unmerge", "depclean", "deselect", "sync",
 	                           "buildpkg", "buildpkgonly", "dispatch",
 	                           "no_dep_upgrade", "no_verify")}
 	pkgs, backend_flag = [], None
@@ -3670,6 +3730,8 @@ def main(argv):
 			opts["sync"] = True; continue
 		if arg == "--depclean":
 			opts["depclean"] = True; continue
+		if arg == "--deselect":
+			opts["deselect"] = True; continue
 		if arg in ("--dispatch-conf", "--etc-update", "--config-update"):
 			opts["dispatch"] = True; continue
 		if arg == "--no-dep-upgrade":
@@ -3781,6 +3843,11 @@ def main(argv):
 		if opts["ask"] and not ask_continue("unmerge"):
 			print("\nQuitting."); sys.exit(1)
 		be.unmerge(removals); return
+
+	if opts["deselect"]:
+		if not pkgs:
+			eerror("no targets given."); sys.exit(1)
+		be.deselect(pkgs, opts["pretend"]); return
 
 	if opts["unmerge"]:
 		if not pkgs:
