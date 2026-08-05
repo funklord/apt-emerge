@@ -158,11 +158,23 @@ def einfo(m):  print(f"{BGREEN(' * ')}{m}")
 def ewarn(m):  print(f"{YELLOW(' * ')}{m}")
 def eerror(m): print(f"{RED(' * ')}{m}", file=sys.stderr)
 
+def efail(msg):
+	"""A hard failure, in emerge's `!!!` voice.
+
+    On stderr, where `eerror` above already puts errors and where the shell
+    expects them. They went to stdout, which is wrong in the case `-p`
+    exists for: `emerge -p foo > plan.txt` wrote "Unable to locate package"
+    into the plan file and left the terminal showing nothing at all. It also
+    fed them into `emerge -pv @world | head`, which is the documented way to
+    read a long list."""
+	print(f"{RED('!!!')} {msg}", file=sys.stderr)
+
+
 def eblock(msg):
 	"""Print a (possibly multi-line) error with !!! on every line, so a
     wrapped list stays readable and no line looks unmarked."""
 	for line in str(msg).split("\n"):
-		print(f"{RED('!!!')} {line}")
+		efail(line)
 
 def need_root():
 	if os.geteuid() != 0:
@@ -2263,7 +2275,7 @@ class DpkgBackend:
 		try:
 			debs = self._download()
 		except RuntimeError as e:
-			print(f"{RED('!!!')} {BOLD(str(e))}"); sys.exit(1)
+			efail(BOLD(str(e))); sys.exit(1)
 		if opts["fetchonly"]:
 			einfo("Fetch complete."); return
 		conf = load_conf()
@@ -2274,7 +2286,7 @@ class DpkgBackend:
 			"""Bail out, but not before recording the state of whatever did
             get installed and announcing any config files dpkg parked."""
 			archive_settled(conf, [st["Package"] for st in self._plan])
-			print(f"{RED('!!!')} {msg}")
+			efail(msg)
 			pending_notice(conf)
 			sys.exit(1)
 
@@ -2420,7 +2432,7 @@ class DpkgBackend:
 		            env=dpkg_env())
 		if r.returncode != 0:
 			print(r.stderr, file=sys.stderr)
-			print(f"{RED('!!!')} unmerge failed."); sys.exit(1)
+			efail("unmerge failed."); sys.exit(1)
 		self._write_world(self._read_world() - {p for p, _ in removals})
 		print(f"\n{ARROW} {BGREEN('Auto-cleaning packages...')}")
 		einfo("GNU info directory index is up-to-date.")
@@ -2716,7 +2728,7 @@ class AptBackend:
 		archive_settled(conf, [m[0] for m in merges])
 		pending_notice(conf)
 		if rc != 0:
-			print(f"{RED('!!!')} {BOLD('emerge failed; see output above.')}")
+			efail(BOLD("emerge failed; see output above."))
 			sys.exit(rc)
 
 	def unmerge_candidates(self, targets, opts):
@@ -2794,7 +2806,7 @@ class AptBackend:
 
 		rc = stream_apt(proc, translate)
 		if rc != 0:
-			print(f"{RED('!!!')} unmerge failed."); sys.exit(rc)
+			efail("unmerge failed."); sys.exit(rc)
 		print(f"\n{ARROW} {BGREEN('Auto-cleaning packages...')}")
 		einfo("GNU info directory index is up-to-date.")
 
@@ -2888,7 +2900,7 @@ class AptBackend:
 			r = capture(["apt-get", "-y", "build-dep", atom])
 			if r.returncode != 0:
 				print(r.stderr, file=sys.stderr)
-				print(f"{RED('!!!')} build-dep failed for {atom}")
+				efail(f"build-dep failed for {atom}")
 				sys.exit(1)
 			portage_dir = os.path.join(PORTAGE_TMPDIR, f"{atom}-{srcver}")
 			workdir = os.path.join(portage_dir, "work")
@@ -2899,20 +2911,20 @@ class AptBackend:
 			        capture_output=True)
 			if r.returncode != 0:
 				print(r.stderr, file=sys.stderr)
-				print(f"{RED('!!!')} fetching source failed for {atom}")
+				efail(f"fetching source failed for {atom}")
 				sys.exit(1)
 			srcdir = next((os.path.join(workdir, d)
 			               for d in sorted(os.listdir(workdir))
 			               if os.path.isdir(os.path.join(workdir, d))), None)
 			if srcdir is None:
-				print(f"{RED('!!!')} apt-get source produced no source "
-				      f"directory for {atom}")
+				efail(f"apt-get source produced no source directory "
+				      f"for {atom}")
 				sys.exit(1)
 			print(f"{ARROW} Source unpacked in {srcdir}")
 			try:
 				self._bump_changelog(srcdir, newver)
 			except (RuntimeError, OSError) as e:
-				print(f"{RED('!!!')} {e}")
+				efail(e)
 				sys.exit(1)
 			print(f"{ARROW} Compiling source in {BOLD(srcdir)} ...")
 			proc = subprocess.Popen(
@@ -2948,13 +2960,13 @@ class AptBackend:
 			target = next((d for d in debs
 			               if d.startswith(f"{atom}_{noepoch}_")), None)
 			if target is None:
-				print(f"{RED('!!!')} no .deb named {atom} among the products")
+				efail(f"no .deb named {atom} among the products")
 				sys.exit(1)
 			r = capture(["apt-get", "-y", "install",
 			             os.path.join(BINPKGS, target)])
 			if r.returncode != 0:
 				print(r.stderr, file=sys.stderr)
-				print(f"{RED('!!!')} install failed for {atom}")
+				efail(f"install failed for {atom}")
 				sys.exit(1)
 			installed.append(atom)
 			print(f"{ARROW} Installing ({i} of {total}) {BGREEN(pv)}")
@@ -4550,4 +4562,6 @@ if __name__ == "__main__":
 			_args = ["--dispatch-conf"] + _args
 		main(_args)
 	except KeyboardInterrupt:
-		print(f"\n\n{RED('!!!')} Interrupted."); sys.exit(130)
+		print(file=sys.stderr)
+		efail("Interrupted.")
+		sys.exit(130)

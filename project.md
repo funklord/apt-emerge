@@ -1739,6 +1739,14 @@ to be true for it to fail, and go and make that true.
 - Anything beginning with `@` that is not a known set is an error. Letting it
   fall through to the resolver produced "no packages to satisfy @nosuchset",
   which answers a question nobody asked.
+- **Errors belong on stderr, and half of them were not.** `eerror` has
+  always written there; the `!!!` messages — `eblock` and eleven inline
+  `print` calls — went to stdout. That is wrong in the case `--pretend`
+  exists for: `emerge -p foo > plan.txt` wrote "Unable to locate package"
+  into the plan file and left the terminal showing nothing at all, and it
+  fed errors into `emerge -pv @world | head`, which is named below as the
+  normal way to read a long list. They all go through `efail()` now, which
+  is one place rather than twelve.
 - **Python ignores SIGPIPE**, so a closed pipe becomes a `BrokenPipeError`
   at interpreter shutdown — "Exception ignored on flushing sys.stdout" and
   exit status 120. `emerge -pv @world | head` is the normal way to read a

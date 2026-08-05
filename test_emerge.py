@@ -4561,14 +4561,28 @@ class TestMergeAftermath(unittest.TestCase):
 		self.addCleanup(setattr, self.mod.subprocess, "Popen", original)
 		merges = [("foo", "1.0", None, 0, "ebuild", "")]
 		opts = opts or {"fetchonly": False, "oneshot": False}
-		buf = io.StringIO()
-		with contextlib.redirect_stdout(buf):
+		# Both streams: failures go to stderr, progress to stdout, and a
+		# caller that wants to assert on either needs to see both. The
+		# separate copies are kept for the test that checks which is which.
+		self.out, self.err = io.StringIO(), io.StringIO()
+		with contextlib.redirect_stdout(self.out), \
+		     contextlib.redirect_stderr(self.err):
 			if rc:
 				with self.assertRaises(SystemExit):
 					self.be.merge(merges, ["foo"], opts)
 			else:
 				self.be.merge(merges, ["foo"], opts)
-		return buf.getvalue()
+		return self.out.getvalue() + self.err.getvalue()
+
+	def test_a_failure_goes_to_stderr_not_into_the_plan(self):
+		"""`!!!` messages went to stdout. That is wrong in the case
+        `--pretend` exists for: `emerge -p foo > plan.txt` wrote "Unable to
+        locate package" into the plan file and left the terminal empty, and
+        it fed errors into `emerge -pv @world | head`, which project.md
+        names as the normal way to read a long list."""
+		self.run_merge(1)
+		self.assertIn("emerge failed", self.err.getvalue())
+		self.assertNotIn("emerge failed", self.out.getvalue())
 
 	def test_successful_merge_archives_and_notifies(self):
 		self.run_merge(0)
