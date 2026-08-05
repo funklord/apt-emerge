@@ -1134,6 +1134,24 @@ That covers everything CI does except the `debian:trixie` container, which
 runs as **root** — the one condition not reproducible here, and the one that
 caught a test reading real `/proc`.
 
+**Read the skip counts, not just the OK.** Run over this session's work the
+matrix came back clean on every interpreter — and the unit suite reported
+`OK (skipped=5)` on 3.9, `skipped=1` on 3.11 and nothing on 3.13. That
+spread is the shape to expect, and it is worth knowing which five, because
+the oldest supported interpreter is exactly where lost coverage would hide:
+
+- three need `tomllib` (3.11+), and they test the **style gate**, which
+  refuses to run without it anyway;
+- one inspects f-string tokens, which only 3.12 tokenises that way;
+- one needs `sys.stdlib_module_names` (3.10+), and it is the stdlib-only
+  guard — covered in CI by the `stdlib-only` job, which runs on a current
+  Python.
+
+Every one is a check whose *own implementation* needs a newer interpreter,
+not a behaviour a 3.9 user depends on. No product coverage is lost there. If
+that count ever grows, something new is being skipped and the same question
+has to be asked again.
+
 **Tests must not depend on the machine they run on.** Two escaped review
 and were caught only by CI, both passing here for reasons that had nothing
 to do with what they claimed to check:
