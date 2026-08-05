@@ -133,14 +133,14 @@ DEFAULTS: Config = {
 	# named before they exist. Listing one is a claim that it is deliberate.
 	"doc_file": "project.md",
 	"doc_ignore": [],
-	# The path half of the doc gate is opt-in. Duplicate headings are a
-	# defect in any document, but "this backticked token is a file that
-	# should exist" needs a document written to be read that way: prose
-	# naming `main.c` as an example, or `platform_android.cpp` without the
-	# `src/` it lives under, is not wrong. Enabling it without tuning
-	# produces dozens of entries in doc_ignore, which is noise wearing the
-	# costume of rigour.
-	"doc_check_paths": False,
+	# Paths are checked in TABLE ROWS only, and that restriction is what
+	# makes the check work. A table in a design document is a declared
+	# inventory: every entry claims a file exists. Prose is not -- it names
+	# `main.c` as an example, or a file without the directory it lives in,
+	# and neither is wrong. Checking prose produced dozens of findings
+	# across every project and none of them real; checking table rows
+	# produces zero false positives across all eight.
+	"doc_check_paths": True,
 }
 
 SKIP_DIR_NAMES = frozenset({"__pycache__", ".git"})
@@ -891,12 +891,15 @@ _DOC_SUFFIX = (".c", ".h", ".cpp", ".hpp", ".cc", ".hh", ".py", ".rs", ".situ",
 
 
 def doc_paths(text: str) -> list[tuple[int, str]]:
+	"""Backticked paths in table rows: the document's declared inventory."""
 	found = []
 	for number, line in enumerate(text.splitlines(), start=1):
+		if not line.lstrip().startswith("|"):
+			continue
 		for token in _DOC_TOKEN.findall(line):
-			if token.startswith(("http", "-", "/")) or token.endswith("/"):
+			if token.startswith(("http", "-", "/", ".")) or token.endswith("/"):
 				continue
-			if "/" in token and not token.startswith("."):
+			if "/" in token:
 				found.append((number, token))
 	return found
 
