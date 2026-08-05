@@ -50,13 +50,33 @@ import subprocess
 import sys
 import tokenize
 from pathlib import Path
+from types import ModuleType
+from typing import Any, NoReturn
 
 try:
-	import tomllib
+	import tomllib as _tomllib
 except ModuleNotFoundError:		# pragma: no cover - 3.10 and older
-	tomllib = None
+	_tomllib = None			# type: ignore[assignment]
 
-DEFAULTS = {
+#: Bound through a name of its own so the optional import has a type that
+#: admits absence. Annotating the `import` itself is not possible, and
+#: without this a checker decides the module is always present and calls the
+#: "no tomllib" branch -- which is the branch that refuses to run with the
+#: wrong file set -- unreachable.
+tomllib: ModuleType | None = _tomllib
+
+#: A loaded configuration: string keys, and values of whatever shape the
+#: matching default has -- an int, a string, or a list of strings.
+#:
+#: `Any` rather than a union, deliberately. The values are read back in a
+#: dozen places as the shape their default implies, and what makes that safe
+#: is `type_problems`, which compares every loaded value against its
+#: default's type at load time and refuses the file otherwise. The guarantee
+#: is the check, not the annotation; a union here would only move the same
+#: assertion to a dozen call sites.
+Config = dict[str, Any]
+
+DEFAULTS: Config = {
 	# A MIGRATION parameter, not a style setting. It is how many columns a
 	# level occupied in a space-indented file that is being converted, and it
 	# is read only while converting one. Once a file is tab-indented no width
@@ -128,7 +148,7 @@ SKIP_DIR_NAMES = frozenset({"__pycache__", ".git"})
 
 # ---------------------------------------------------------------- config
 
-def reject_config(path: Path, problem: str, *consequence: str) -> None:
+def reject_config(path: Path, problem: str, *consequence: str) -> NoReturn:
 	"""Report a config that cannot be applied as written, and stop.
 
 	Every caller is the same failure and it is worth naming once: the file
@@ -146,7 +166,7 @@ def reject_config(path: Path, problem: str, *consequence: str) -> None:
 	raise SystemExit(2)
 
 
-def type_problems(loaded: dict) -> list[str]:
+def type_problems(loaded: Config) -> list[str]:
 	"""Keys whose value is the wrong shape, judged against the default's.
 
 	The dangerous case is a list written as a bare string, because it is not
@@ -179,7 +199,7 @@ def type_problems(loaded: dict) -> list[str]:
 	return problems
 
 
-def load_config(root: Path) -> dict:
+def load_config(root: Path) -> Config:
 	cfg = dict(DEFAULTS)
 	path = root / ".style-gate.toml"
 	if not path.is_file():
@@ -234,7 +254,7 @@ def in_git_repo(root: Path) -> bool:
 		return False
 
 
-def discover(root: Path, cfg: dict) -> list[Path]:
+def discover(root: Path, cfg: Config) -> list[Path]:
 	"""Every file this project owns, git-preferred with a plain-walk fallback.
 
 	git is preferred because `--cached --others --exclude-standard` gets two
@@ -276,7 +296,7 @@ def discover(root: Path, cfg: dict) -> list[Path]:
 	return sorted(set(kept))
 
 
-def wants_indent(path: Path, cfg: dict) -> bool:
+def wants_indent(path: Path, cfg: Config) -> bool:
 	if path.suffix in set(cfg["indent_suffixes"]) or path.name in set(cfg["indent_names"]):
 		return True
 	# A program with no suffix is still ours. Deciding scope on suffix alone
@@ -296,11 +316,11 @@ def has_shebang(path: Path) -> bool:
 		return False
 
 
-def wants_text(path: Path, cfg: dict) -> bool:
+def wants_text(path: Path, cfg: Config) -> bool:
 	return wants_indent(path, cfg) or path.suffix in set(cfg["text_suffixes"])
 
 
-def collapse(count: int, cfg: dict) -> bool:
+def collapse(count: int, cfg: Config) -> bool:
 	"""True if the file list has plausibly collapsed rather than come back clean.
 
 	"Found nothing" cannot mean "there is nothing to check" in a tree with
@@ -415,7 +435,8 @@ def python_literal_lines(text: str) -> frozenset[int]:
 # --------------------------------------------------------------- checks
 
 class Problem:
-	def __init__(self, path, line: int, col: int, message: str) -> None:
+	def __init__(self, path: Path, line: int, col: int,
+			message: str) -> None:
 		self.path    = path
 		self.line    = line
 		self.col     = col
@@ -425,7 +446,7 @@ class Problem:
 		return f"{self.path}:{self.line}:{self.col}: {self.message}"
 
 
-def check_text(text: str, where, indent: bool = True,
+def check_text(text: str, where: Path, indent: bool = True,
                skip: frozenset[int] = frozenset(),
                heuristic: bool = True) -> list[Problem]:
 	"""The line rules, against text that need not be a file on disk.
@@ -473,7 +494,7 @@ def check_text(text: str, where, indent: bool = True,
 	return problems
 
 
-def check_file(path: Path, root: Path, cfg: dict) -> list[Problem]:
+def check_file(path: Path, root: Path, cfg: Config) -> list[Problem]:
 	rel      = path.relative_to(root)
 	problems = []
 	raw      = path.read_bytes()
@@ -552,7 +573,8 @@ def convert_c(text: str, width: int) -> str:
 	"""
 	lines = text.split("\n")
 	out = []
-	stack = []			# one [is_switch, in_case] per open brace
+	# one [is_switch, in_case, paren_depth] per open brace
+	stack: list[list[int]] = []
 	state = "normal"		# normal | block_comment | string | char | raw
 	pp_cont = False			# inside a backslash-continued directive
 	pending_switch = False		# saw `switch`, awaiting its `{`
@@ -564,7 +586,7 @@ def convert_c(text: str, width: int) -> str:
 	await_body = False		# an `else`/`do` whose body shape is not yet known
 	stmt_level = 0			# level of the line the current statement began on
 
-	def case_extra(frames):
+	def case_extra(frames: list[list[int]]) -> int:
 		return sum(1 for f in frames if f[0] and f[1])
 
 	for line in lines:
@@ -819,7 +841,7 @@ def expand(text: str, width: int) -> str:
 	return "\n".join(out)
 
 
-def fixed_text(path: Path, src: str, cfg: dict) -> tuple[str, str | None]:
+def fixed_text(path: Path, src: str, cfg: Config) -> tuple[str, str | None]:
 	"""What the fixer would produce, with its proof checked. -> (text, error)."""
 	width = int(cfg["indent_width"])
 	if is_python(path):
@@ -841,7 +863,7 @@ def fixed_text(path: Path, src: str, cfg: dict) -> tuple[str, str | None]:
 	return src, None
 
 
-def fix_file(path: Path, cfg: dict, write: bool) -> tuple[bool, str | None]:
+def fix_file(path: Path, cfg: Config, write: bool) -> tuple[bool, str | None]:
 	"""-> (changed, error). Refuses to write an edit it cannot prove."""
 	src = path.read_text(encoding="utf-8", errors="surrogateescape")
 	if not has_fixer(path):
@@ -879,7 +901,7 @@ def doc_paths(text: str) -> list[tuple[int, str]]:
 	return found
 
 
-def check_docs(root: Path, cfg: dict) -> list[Problem]:
+def check_docs(root: Path, cfg: Config) -> list[Problem]:
 	"""Hold the design document to the tree it describes.
 
 	A map with a module missing from it is worse than no map: a reader looking
