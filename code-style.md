@@ -71,8 +71,15 @@ not listed is not yet settled: raise it rather than deciding in passing.
 - **Makefile recipe lines** -- `make` requires a literal tab, so `Makefile`
   and `debian/rules` are compliant by construction. Their variable
   continuations still align with spaces.
-- **`debian/` control files** -- deb822 is a space-continuation format:
-  `control`, `copyright` and `changelog` follow what dpkg parses.
+- **Debian packaging files** -- `debian/changelog` and the deb822 files
+  (`control`, `copyright`), for opposite reasons. The changelog's layout is
+  fixed and a tab is not part of it: `dpkg-parsechangelog` calls a
+  tab-indented change line "unrecognized" and loses the `--` trailer
+  outright if a tab precedes it. A deb822 continuation *does* accept a
+  leading tab -- `deb822(5)` allows SPACE or TAB and dpkg round-trips
+  either -- but that leading whitespace is field syntax rather than
+  indentation, so the rule does not reach it and what follows is alignment.
+  Both measured against dpkg here.
 
 ### The conversion from 4-space indentation
 
