@@ -1229,6 +1229,15 @@ to do with what they claimed to check:
   `TestTheHarness` pins both. Mutation-checked the way the bug was found:
   reverted, it fails under a pty and passes through a pipe.
 
+  **`make check-tty` is the backstop**, and a CI step in the `debian` job
+  runs it — the only place anything here runs under a terminal. It uses
+  `pty.spawn` rather than util-linux `script`: stdlib, and verified to work
+  with stdin closed and inside a container, which is what CI has. Its worth
+  is measurable rather than theoretical: with `load()`'s fix reverted it
+  reports six failures where `check-unit` on the same tree reports `OK`.
+  Four of those six are tests that used to set the flag themselves, so
+  consolidating the writers is what put them behind one guard.
+
 For portability, run a real old interpreter rather than reasoning about one:
 `uv python install 3.9` takes seconds. `ast.parse(feature_version=...)` is
 *not* a substitute — it does not reject PEP 701 syntax, which is how a

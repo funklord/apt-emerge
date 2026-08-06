@@ -35,8 +35,9 @@ INSTALL_DATA    = $(INSTALL) -m 644
 # symlink is the whole implementation (see the __main__ block in `emerge`).
 ALIASES = dispatch-conf etc-update
 
-.PHONY: all check check-unit check-integration check-isolation style install \
-        uninstall deb clean version-check help test veryclean distclean hooks
+.PHONY: all check check-unit check-integration check-isolation check-tty \
+        style install uninstall deb clean version-check help test veryclean \
+        distclean hooks
 
 all:
 	@:
@@ -50,6 +51,8 @@ help:
 	@echo '  check-isolation'
 	@echo '              both modules in one interpreter, for leaks the'
 	@echo '              per-module sentinel cannot see'
+	@echo '  check-tty   the unit suite under a pty, where the script'
+	@echo '              colours its output and every other run does not'
 	@echo '  style       the indentation and whitespace gate'
 	@echo '  install     install into $$(DESTDIR)$$(prefix)'
 	@echo '  deb         build a binary package into dist/'
@@ -57,10 +60,30 @@ help:
 
 # -- tests -------------------------------------------------------------------
 
-check: style version-check check-unit check-integration check-isolation
+check: style version-check check-unit check-integration check-isolation \
+       check-tty
 
 check-unit:
 	$(PYTHON) -m unittest test_emerge
+
+# The same suite with stdout attached to a terminal, which is the one
+# condition every other way of running it destroys.
+#
+# `emerge` decides USE_COLOR once, from sys.stdout.isatty(), so a copy
+# loaded under a pty paints its output and one loaded under a pipe does not.
+# CI pipes, make pipes, an editor pipes -- so a test asserting on output
+# could pass everywhere here and fail for the person who typed the command,
+# which is exactly what happened: one test looked for `Emerging (1 of 2)
+# libb` in text that read `Emerging (1 of 2) \033[1;32mlibb-1\033[0m`, and
+# took `make deb` down with it through dh_auto_test.
+#
+# load() normalises the flag now and TestTheHarness pins it, so this target
+# is the backstop rather than the fix. pty.spawn is stdlib, needs no
+# util-linux `script`, and works with stdin closed and inside a container --
+# both checked, because CI has neither a terminal on stdin nor a desktop.
+check-tty:
+	$(PYTHON) -c 'import pty, sys; raise SystemExit(pty.spawn(\
+	    [sys.executable, "-m", "unittest", "test_emerge"]) >> 8)'
 
 # Both modules in one interpreter, which is the only way to see one module's
 # leftovers break another.

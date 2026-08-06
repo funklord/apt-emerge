@@ -92,6 +92,14 @@ jobs:
       - name: Tests must not leak state between modules
         run: python3 -m unittest test_emerge test_integration
 
+      # Every other step here pipes stdout, and the script decides whether
+      # to colour its output from sys.stdout.isatty() once, at import. So a
+      # test asserting on output can pass in all of them and fail for the
+      # person who typed the command -- which happened, and took `make deb`
+      # with it. This is the only step that runs under a terminal.
+      - name: Tests must not depend on a terminal
+        run: make check-tty
+
   # The package has to build, install, and produce a working emerge. Building
   # it proves very little on its own -- a .deb full of the wrong paths builds
   # perfectly -- so this installs the result and runs it.
