@@ -775,11 +775,11 @@ Always `python3 -m py_compile emerge` after edits.
 
 `make check` runs everything, stdlib only — a few hundred unit tests and a
 few dozen end-to-end ones. (No count here: the last one written down went
-stale inside a single session.) The unit half is a few seconds. The integration half is dominated by one
-test that drives a real `apt-get`, and its wall time swings hard with system
-load — measured between 14s and 115s for the same suite on the same machine,
-so treat a slow run as load rather than a hang. `make check-unit` is the fast
-loop.
+stale inside a single session.) The unit half is a few seconds. The
+integration half is dominated by one test that drives a real `apt-get`, and
+its wall time swings hard with system load — measured between 14s and 115s
+for the same suite on the same machine, so treat a slow run as load rather
+than a hang. `make check-unit` is the fast loop.
 
 **Every integration class skips itself when the tool it drives is missing**,
 which is what lets the suite run off a Debian box — and is also how a whole
@@ -995,20 +995,22 @@ rather than failing. All seven copies were shipped that way.
 
 `make deb` builds `$(BUILD_DIR)/apt-emerge_<version>_all.deb`, where
 `BUILD_DIR` defaults to `dist/` and is settable so an isolated build cannot
-clobber a plain one. The variable was `BUILD_DIR` until 2026-08-05; `BUILD_DIR`
+clobber a plain one. The variable was `OBJDIR` until 2026-08-05; `BUILD_DIR`
 is the canonical spelling across these projects, and the two are not
 synonyms in any case — this holds a build tree of `.deb`, `.changes` and
-`.buildinfo`, and nothing here compiles to an object file at all. Source format is **`3.0 (native)`**: this repo *is* upstream, there
-is no separate tarball, and a quilt package would mean inventing an
+`.buildinfo`, and nothing here compiles to an object file at all.
+
+Source format is **`3.0 (native)`**: this repo *is* upstream, there is no
+separate tarball, and a quilt package would mean inventing an
 upstream/packaging split that does not exist.
 
 `clean` removes the files it names and no others — no wildcard sweeps, no
 `rm -rf` of a bare variable. The directories it does remove whole are ones the
 build created (`$(BUILD_DIR)`, `debian/apt-emerge`, `debian/.debhelper`), and
-each is rejected if it is absolute or contains `..`, so `make clean BUILD_DIR=/`
-is not
-a working command. This is a safety property rather than a style choice:
-`clean` is the one target everybody runs without reading it.
+each is rejected if it is absolute or contains `..`, so
+`make clean BUILD_DIR=/` is not a working command. This is a safety property
+rather than a style choice: `clean` is the one target everybody runs without
+reading it.
 
 Layout decisions worth not re-litigating:
 
@@ -1863,6 +1865,62 @@ to be true for it to fail, and go and make that true.
   arguments.
 
 ---
+
+## The log, and its format
+
+**The whole history was reformatted on 2026-08-06 and force-pushed, so every
+sha before that date is dead.** A clone taken earlier shares no commits with
+this one and cannot be fast-forwarded; it has to be re-fetched or reset. The
+pre-rewrite history survives locally on `backup/pre-reformat`. Nothing
+outside the tree referenced a sha, which was checked rather than assumed —
+no `Fixes:` or `Link:` trailer exists anywhere in the log.
+
+The format is the kernel's, from the global guidelines rather than from
+anything decided here: `subsystem: summary in the imperative`, no trailing
+period, 75 columns hard on the subject *and* on every body line, and no
+attribution trailers of any kind. `tools/hooks/commit-msg` enforces the two
+halves a script can see; the rest is a review item.
+
+The last 41 commits already followed it and kept their subjects. The first
+69 predated it and were rewritten; every body in the file was rewrapped from
+76–80 columns to 75. **The prefix is one word and it is not free-form** —
+pick from what the log already uses rather than inventing a synonym, or the
+`git log --grep '^config:'` that makes the log filterable stops working:
+
+> `apt`, `build`, `ci`, `cli`, `config`, `deselect`, `docs`, `dpkg`,
+> `feature`, `fix`, `license`, `packaging`, `remove`, `rework`, `search`,
+> `session`, `solver`, `sync`, `test`, `tools`, `unmerge`, `world`
+
+Three adjacent pairs were squashed, 110 commits into 107, each of them
+documentation that the no-docs-only rule wants riding with its code: the
+`--oneshot` verification note into `--oneshot` itself (which also takes a
+committed `.project.md.swp` out of the history), the backlog tick into the
+commit that earned it, and the README author section into `-V`. The large
+`docs: fold the session in` commits were deliberately **not** squashed —
+they are the case the rule explicitly exempts, and the log already makes
+that judgement in both directions.
+
+**The rewrite carried a proof, because reading a sample of 110 messages is
+not verification of the rest.** Trees were taken verbatim from the original
+commits, so no file content could change; the rewrapper refuses to write
+unless each body's whitespace-normalised token stream and paragraph count
+come out identical; and a separate pass compared 858 properties — every
+tree, author, author date, committer and committer date against its
+original, the final tree and an empty `git diff` against the backup, every
+tree present in the old history, every subject and body line inside 75
+columns, and every message through the commit-msg hook. Both tools were
+mutation-checked, and the first attempt at that was itself vacuous: the
+mutants were run from the wrong directory, so they failed on `git log`
+rather than on the mutation, and "the check fired" would have been a lie.
+
+**One find, and it is about mechanical rewrites of prose.** The Packaging
+section said *"the variable was `BUILD_DIR` until 2026-08-05; `BUILD_DIR` is
+the canonical spelling"*. That sentence was written by the rename commit
+itself, whose whole job was to record that the old name was `OBJDIR` — and
+the sweep that renamed the variable renamed the one word the sentence
+existed to preserve. A rename over prose has no AST to check itself against,
+so the place most likely to be damaged is the place that documents the old
+name.
 
 ## Commit history shape (recent, most-relevant last)
 
