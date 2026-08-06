@@ -246,7 +246,15 @@ half-supporting it.
   that works (`dpkg -r libfoo:amd64`), rather than letting dpkg produce the
   raw error after the plan has already been shown and confirmed.
 
-Whether to implement multiarch properly is open, and is the owner's call.
+**Settled 2026-08-07 (owner): detect and refuse, do not implement it.** The
+rejected option was keying by `name:architecture` throughout, and it is
+rejected on scope rather than on difficulty: it reaches the resolver, the
+world file, depclean and the index, and `sync` fetches `binary-<native>`
+only, so a foreign-arch package has no index entry to be resolved against
+at all — which makes it a feature to build, not a refactor to apply. The
+backend exists for embedded boxes, which are single-architecture; any
+desktop with i386 enabled runs the apt backend, which delegates to apt and
+is unaffected. Half-supporting it is the one answer nobody wanted.
 
 ### CLI surface (Portage dialect)
 
@@ -1557,8 +1565,8 @@ write surface ever needs testing.
    - *apt backend only*, like `-b/-B`: it needs build tooling, and the dpkg
      backend is binary-only by design.
 
-10. **What `@selected` means when a world entry is not installed.** Open,
-    and deliberately not settled while fixing the silence around it.
+10. ~~**What `@selected` means when a world entry is not installed.**~~
+    **Settled 2026-08-07 (owner): the current reading stands.**
 
     The document above says `@selected` is the world file. The dpkg backend
     computes `world & installed`, so an entry naming a package that is not
@@ -1572,10 +1580,13 @@ write surface ever needs testing.
       chose, so a package you removed stays removed and the stale entry is
       inert.
 
-    Changing it is a real behaviour change: under Portage's reading, every
-    `emerge -u @world` would try to reinstall what an admin deliberately
-    removed by hand, which on Debian is a common way to work. That is the
-    owner's call, not a decision to make while passing through.
+    Portage's reading was rejected because it fights the admin. Under it
+    every `emerge -u @world` would try to reinstall what somebody removed
+    by hand with `dpkg -r`, which on Debian is an ordinary way to work —
+    hard rule 4 asks for Portage's dialect, not for Portage's answer where
+    the platform underneath disagrees. The stale entry is reported on every
+    resolve and `--deselect` clears it, so the case the other reading was
+    meant to serve now has a verb of its own.
 
     What *was* wrong either way is that the drop happened in silence, so
     the two ways of naming one package disagreed: `emerge -p foo` answers
@@ -1666,12 +1677,30 @@ survives as an escape hatch rather than an override, because
 `b` installed is not a break) but not `Provides`, so a dependency satisfied
 by a virtual package looks broken to it and not to dpkg.
 
-**What is left open is the divergence itself**, and it is not a wording
-question: on apt, `emerge -C libjpeg62-turbo` offers to remove 868
-packages; on dpkg the same command refuses until you name them. Real
-Portage does neither — it unmerges exactly what you name and warns that you
-have broken something. Which of the three this project should mean is the
-owner's call, so nothing here changed the behaviour.
+**The divergence itself is settled 2026-08-07 (owner): keep it.** On apt,
+`emerge -C libjpeg62-turbo` offers to remove 868 packages; on dpkg the same
+command refuses until you name them; real Portage does neither, unmerging
+exactly what you name and warning that you have broken something. The
+decision is that **each backend tells the truth about the tool underneath
+it**, which is worth more here than one answer that is a lie on one of
+them.
+
+Both alternatives were considered and rejected:
+
+- **Matching Portage on both** would mean bypassing apt's dependency
+  handling to unmerge one package out of a cascade. Gentoo users expect a
+  broken graph and a warning; on Debian that is a worse default, and it
+  would mean this program deciding to break a system apt would have
+  protected.
+- **Making apt refuse as dpkg does** takes away a capability apt genuinely
+  has, and which the 868-package list — shown and confirmed — is the honest
+  way to offer.
+
+Hard rule 4 asks for Portage's dialect, and the dialect is what the two
+backends already share: the same verb, the same output format, the same
+confirmation. Where the tools underneath genuinely differ, saying so is
+answering in the dialect rather than departing from it. Both behaviours are
+documented in the README and the man page for that reason.
 
 - `unmerge` listed only the names you typed while `apt-get remove` cascaded.
   `emerge -C libjpeg62-turbo` showed 1 package and would have removed 868.
