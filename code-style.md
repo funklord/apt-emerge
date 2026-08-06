@@ -30,6 +30,10 @@ used: a leading underscore (`_name`) is Python's own private marker and
 stands in for "unprefixed" -- it reads as "this does not leave the module",
 which here means "not part of what a reader of the CLI ever sees".
 
+- **Prefer the plain descriptive name over the redundant one.** Name the
+  thing, not its category: `plan`, not `plan_struct` or `plan_result`. The
+  script is clean of this today -- `print_merge_list` and `show_info` name
+  a merge list and the `--info` block, which are the things themselves.
 - **No abbreviations that are not already vocabulary.** This has teeth
   here for a specific reason: the program speaks a Portage dialect, and a
   name invented internally tends to surface in output a user reads
@@ -160,6 +164,7 @@ Unicode.
 **This project is excepted** and does not enable the check: it prints status
 ticks, and that output lives in the source as string literals.
 
+## The commit-msg hook
 
 The commit-msg hook is `tools/hooks/commit-msg`, installed with `make hooks`.
 It rejects generator attribution and a subject over 75 columns. It lives in
