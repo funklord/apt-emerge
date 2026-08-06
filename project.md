@@ -1025,7 +1025,11 @@ Layout decisions worth not re-litigating:
   agree.
 - **Not `/usr/local`.** That belongs to the local admin and dpkg must not own
   anything there. The manual install in the README still uses it, correctly —
-  that is the un-packaged path.
+  that is the un-packaged path, and **it carries no man page**. The README
+  says so outright rather than letting a reader look for one: `--help` is the
+  whole option surface on a box the script was copied to, which is safe to
+  say only because `TestPackaging` holds `--help` and `emerge.1` to each
+  other in both directions.
 - **`Rules-Requires-Root: no`**, so the build needs no fakeroot.
 - **Version.** Two numbers that describe different things and are no longer
   tied. `VERSION` at the root states apt-emerge's own version and is what

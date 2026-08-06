@@ -40,11 +40,26 @@ The single-file constraint exists so an embedded box can be fixed with one
 `scp` and a text editor — the packaging is a convenience on top of that, never
 a requirement.
 
+**That path gives you no man page**, which is the trade for having no install
+step to run. Nothing is lost from the option list: `emerge --help` and
+`emerge(1)` are held to each other in both directions by a test, so neither
+documents an option the other omits — the page adds the explanation, not the
+coverage. Copy it across too if you want it:
+
+```sh
+sudo install -m 644 emerge.1 /usr/local/share/man/man1/emerge.1
+```
+
 Other targets: `make check` runs everything, `make check-unit` runs the fast
 half, `make style` is the indentation gate, and `make install` takes the
 usual `DESTDIR` and `prefix`.
 
 ## What it does
+
+**`man emerge` is the reference** — every option with its own entry, plus the
+sets, the environment variables and the files it touches. `emerge --help` is
+the same list in short form, and is what you have on a box you only copied
+the script to. What follows here is the tour, not the reference.
 
 Ordinary operations map onto the Portage verbs you already know:
 

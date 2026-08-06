@@ -2823,6 +2823,20 @@ class TestPackaging(unittest.TestCase):
 				              f"emerge.1 documents {opt}, which the script "
 				              f"does not mention at all")
 
+	def test_the_man_page_has_the_sections_the_readme_sends_people_to(self):
+		"""The README calls `man emerge` the reference and says what is in
+        it, because the single-file install carries no page and a reader has
+        to know what they are missing. A section that goes away makes that
+        sentence a lie, silently -- the README is prose and nothing else
+        reads it."""
+		man = self.read("emerge.1")
+		present = set(re.findall(r"^\.SH (.+)$", man, re.M))
+		self.assertGreater(len(present), 5, "the .SH scrape found too few")
+		for section in ("OPTIONS", "SETS", "ENVIRONMENT", "FILES"):
+			with self.subTest(section=section):
+				self.assertIn(section, present,
+				              f"README promises {section} in emerge.1")
+
 	def test_every_name_the_script_answers_to_is_shipped(self):
 		"""argv[0] selects the action, so a name the script recognises but
         the package does not install is a feature that exists only for
