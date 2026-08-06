@@ -1984,3 +1984,41 @@ testing caught every one; reading them caught none. The container job earned
 its place again, and the habit that generalises is the one already written
 above: after something passes, work out what would have had to be true for
 it to fail, and go and make that true.
+
+The rest of that session turned the same question on the suite itself, and
+the useful finding is about **instruments**.
+
+**Counting occurrences is not coverage.** A grep survey of which options the
+tests exercise was wrong in both directions: it called `--buildpkg` and
+`--no-verify` untested, because their tests pass options through a helper's
+defaults rather than a literal dict, and it read `fetchonly`'s twenty-one
+mentions as coverage when every one of them was `False`. Mutation answered
+correctly both times. Two sweeps followed, each finding a class of thing
+nothing protected:
+
+- **Flag wiring.** Replacing every read of an option in `main()` with
+  `False` left `-v`, `-u`, `-D`, `--no-dep-upgrade` and `--no-verify`
+  unnoticed. Their behaviour is tested hard; the line that carries the flag
+  to it was not, which is the shape of two bugs already shipped here.
+- **The root guards.** All ten `need_root()` calls could be deleted with the
+  suite still green — structurally so, because the integration harness has
+  to stub `need_root` out to run unprivileged at all. Asserting
+  `SystemExit(1)` was not enough either: without the guard, `merge` and
+  `unmerge` still exit 1, from dpkg failing several steps later. Exit status
+  cannot tell refusing from failing, so the test forbids subprocesses.
+
+**Two backends, two different wrong answers** recurred as a theme. A bad
+search regex was a traceback on dpkg and `[ Applications found : 0 ]` on
+apt; `emerge -C` promised an override dpkg will not give; maintainer scripts
+ran interactively on one backend and not the other. Diffing the two classes
+method by method — counting guards and messages — finds these in minutes.
+
+**The documentation was audited the same way and was stale in the same
+places:** the man page still promised the cascade `-C` shows, `-V` described
+one version where it now prints two, and the one-action rule was enforced in
+code and written down nowhere. Rendering the page found a `.PP` that should
+have been `.IP` — invisible in the source, obvious in `man`.
+
+Finally the series was checked to be **bisectable**: every commit in the
+range compiles and passes the unit suite on its own, so a future bisect
+through it will not lie.
