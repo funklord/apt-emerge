@@ -355,6 +355,18 @@ Passed through to source builds
 and displayed as USE flags. Defaults to
 .BR "nocheck parallel=<nproc>" .
 .TP
+.B NO_COLOR
+Turn coloured output off. Any non-empty value does it, whatever the value
+says, so
+.B NO_COLOR=0
+disables colour as surely as
+.BR NO_COLOR=1 :
+the convention is that the variable being set is the signal. An
+exported-but-empty
+.B NO_COLOR
+counts as unset. Colour is otherwise used only when standard output is a
+terminal.
+.TP
 .BR EDITOR ", " VISUAL
 Editor used by
 .BR --dispatch-conf .

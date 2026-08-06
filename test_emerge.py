@@ -28,6 +28,7 @@ import importlib.util
 import io
 import itertools
 import os
+import pty
 import random
 import re
 import shutil
@@ -217,6 +218,85 @@ VERSION_PAIRS = [
     ("6.12.96-1", "6.12.90-2", 1),
     ("3.21.12-11+deb13u1", "3.21.12-11", 1),
 ]
+
+
+class TestWantColor(unittest.TestCase):
+	"""NO_COLOR, and the isatty fallback underneath it."""
+
+	class Stream:
+		def __init__(self, tty):
+			self.tty = tty
+
+		def isatty(self):
+			return self.tty
+
+	def want(self, env, tty=True):
+		return em.want_color(env, self.Stream(tty))
+
+	def test_a_terminal_gets_colour(self):
+		self.assertTrue(self.want({}))
+
+	def test_a_pipe_does_not(self):
+		self.assertFalse(self.want({}, tty=False))
+
+	def test_no_color_turns_it_off(self):
+		self.assertFalse(self.want({"NO_COLOR": "1"}))
+
+	def test_no_color_is_presence_not_truth(self):
+		"""The convention is that the variable being set is the signal,
+        whatever it contains, so NO_COLOR=0 disables colour too. Reading
+        the value is the mistake it exists to prevent: every tool would
+        then pick its own spelling of "off" and none would agree."""
+		self.assertFalse(self.want({"NO_COLOR": "0"}))
+		self.assertFalse(self.want({"NO_COLOR": "false"}))
+		self.assertFalse(self.want({"NO_COLOR": "no"}))
+
+	def test_an_empty_no_color_counts_as_unset(self):
+		"""Also the standard, and the case an `if "NO_COLOR" in env` would
+        get wrong -- an exported-but-empty variable is how a shell leaves
+        one behind."""
+		self.assertTrue(self.want({"NO_COLOR": ""}))
+
+	def test_it_is_wired_to_the_real_output(self):
+		"""The function decides nothing unless USE_COLOR calls it, and a
+        flag that never reaches the thing acting on it is the shape of two
+        bugs already shipped here. So this drives the installed script
+        through a real pty and reads the bytes back: without NO_COLOR the
+        einfo carries an escape sequence, with it the same line is plain."""
+		def run(env):
+			# The slave stays open while reading. Once every slave fd is
+			# closed, Linux answers EIO on the master rather than handing
+			# back what is still buffered, so draining it non-blocking with
+			# the slave held open is the way to get the bytes at all.
+			master, slave = pty.openpty()
+			try:
+				# stderr goes to the same pty, as a terminal gives it:
+				# "no targets given" is an eerror, so it arrives there.
+				subprocess.run([sys.executable, SCRIPT, "-p"], stdout=slave,
+				               stderr=slave, env=env, timeout=60)
+				os.set_blocking(master, False)
+				out = b""
+				while True:
+					try:
+						chunk = os.read(master, 4096)
+					except (BlockingIOError, OSError):
+						break
+					if not chunk:
+						break
+					out += chunk
+				return out.decode("utf-8", "replace")
+			finally:
+				os.close(slave)
+				os.close(master)
+
+		base = dict(os.environ)
+		base.pop("NO_COLOR", None)
+		coloured = run(base)
+		self.assertIn("no targets given", coloured)
+		self.assertIn("\033[", coloured, "a terminal should have got colour")
+		plain = run(dict(base, NO_COLOR="1"))
+		self.assertIn("no targets given", plain)
+		self.assertNotIn("\033[", plain)
 
 
 def sign(n):

@@ -143,7 +143,25 @@ LICENCE   = "GPL-2.0-or-later"
 # Portage colours & message helpers
 # ---------------------------------------------------------------------------
 
-USE_COLOR = sys.stdout.isatty()
+def want_color(env=None, stream=None):
+	"""Whether to paint output. Read once, into USE_COLOR below.
+
+	NO_COLOR is the cross-tool convention: if it is present and not empty,
+	colour is off whatever it contains. NO_COLOR=0 therefore disables
+	colour too, which surprises people -- but reading the value is the
+	mistake the convention exists to stop, since every tool would then
+	pick its own spelling of "off" and none would agree.
+
+	Both inputs are arguments rather than globals so this is testable
+	without patching os or sys, which the suite's own leak sentinel would
+	then have to catch."""
+	env = os.environ if env is None else env
+	if env.get("NO_COLOR"):
+		return False
+	stream = sys.stdout if stream is None else stream
+	return stream.isatty()
+
+USE_COLOR = want_color()
 def c(code, s): return f"\033[{code}m{s}\033[0m" if USE_COLOR else s
 BOLD   = lambda s: c("1", s)
 GREEN  = lambda s: c("32", s)

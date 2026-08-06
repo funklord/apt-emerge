@@ -122,7 +122,34 @@ as a rule: `wc -l` is right there.)
     `UCF_CACHE=/var/lib/ucf/cache`
 - **Colours + message helpers** (~83–104): `einfo/ewarn/eerror`, and `eblock()`
   which prefixes every line of a multi-line error with `!!!` (used for
-  `NduWall`).
+  `NduWall`). `want_color()` decides once, into `USE_COLOR`: **`NO_COLOR`
+  disables it if the variable is set and non-empty, whatever it contains**
+  — so `NO_COLOR=0` disables colour, which is the convention working as
+  specified rather than a bug. Reading the *value* is the mistake it exists
+  to prevent, since every tool would then spell "off" differently and none
+  would agree; an exported-but-empty variable counts as unset, which an
+  `"NO_COLOR" in env` test would get wrong. Otherwise colour follows
+  `sys.stdout.isatty()`.
+
+  Both inputs are parameters rather than globals, so the decision is
+  testable without patching `os` or `sys` — which the suite's own leak
+  sentinel would then have to catch. The unit tests cover the rule; a
+  separate test drives the real script through a `pty.openpty()` pair and
+  reads the bytes back, because a helper nothing wires up is the shape of
+  two bugs already shipped here. That one earns its place: breaking *only*
+  the wiring (`USE_COLOR = sys.stdout.isatty()`, bypassing the function)
+  fails it and nothing else.
+
+  Reading those bytes has its own trap, worth knowing before writing
+  another pty test: once every slave fd is closed, Linux answers `EIO` on
+  the master rather than handing back what is still buffered. Drain it
+  non-blocking with the slave still open.
+
+  **Portage's own `NOCOLOR` is deliberately not implemented.** It is a
+  `make.conf` variable rather than a shell convention, and its exact
+  semantics could not be checked from here — guessing at them is how the
+  `sddm-greeter` entry got written. Worth settling against a real Portage
+  before adding, since hard rule 4 argues for it.
 - **`run`/`capture`/`stream_lines`** (~110–138): `stream_lines` splits a binary
   pipe on both `\r` and `\n` to tame dpkg's pty carriage-return progress
   (fixes run-together/space-padded output). All real apt/dpkg installs go
