@@ -367,6 +367,19 @@ exported-but-empty
 counts as unset. Colour is otherwise used only when standard output is a
 terminal.
 .TP
+.B NOCOLOR
+Portage's own spelling, as in
+.BR make.conf .
+This one is read for its value, not its presence:
+.BR true ", " yes " or " 1
+turn colour off, and anything else leaves it alone. Note that the two
+disagree about the same string --
+.B NO_COLOR=0
+turns colour off and
+.B NOCOLOR=0
+does not -- because one is a convention about a variable being set and the
+other is a setting.
+.TP
 .BR EDITOR ", " VISUAL
 Editor used by
 .BR --dispatch-conf .

@@ -145,11 +145,19 @@ as a rule: `wc -l` is right there.)
   the master rather than handing back what is still buffered. Drain it
   non-blocking with the slave still open.
 
-  **Portage's own `NOCOLOR` is deliberately not implemented.** It is a
-  `make.conf` variable rather than a shell convention, and its exact
-  semantics could not be checked from here — guessing at them is how the
-  `sddm-greeter` entry got written. Worth settling against a real Portage
-  before adding, since hard rule 4 argues for it.
+  **Portage's own `NOCOLOR` is honoured too**, and it is the opposite kind
+  of variable: read for its *value*, where `true`, `yes` or `1` (any case,
+  surrounding space ignored) turn colour off and anything else leaves it
+  alone. Those semantics come from the owner rather than from a
+  measurement — there is no Portage here to check against, and guessing at
+  them is how the `sddm-greeter` entry that matched nothing got written.
+
+  **The two spellings disagree about the same string, and that is not a
+  bug to tidy up.** `NO_COLOR=0` turns colour **off**; `NOCOLOR=0` leaves
+  it **on**. One is a convention about a variable being set, the other is a
+  setting, so neither can be implemented in terms of the other however much
+  the names suggest it. `test_the_two_spellings_disagree_about_zero` pins
+  both in one place precisely because the next reader will see a typo.
 - **`run`/`capture`/`stream_lines`** (~110–138): `stream_lines` splits a binary
   pipe on both `\r` and `\n` to tame dpkg's pty carriage-return progress
   (fixes run-together/space-padded output). All real apt/dpkg installs go

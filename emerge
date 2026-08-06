@@ -152,11 +152,20 @@ def want_color(env=None, stream=None):
 	mistake the convention exists to stop, since every tool would then
 	pick its own spelling of "off" and none would agree.
 
+	NOCOLOR is Portage's own, from make.conf, and it is the opposite kind
+	of variable: a value rather than a presence, true/yes/1 turning colour
+	off and anything else leaving it alone. The two are one character
+	apart and disagree about the same string -- NO_COLOR=0 turns colour
+	OFF and NOCOLOR=0 leaves it ON -- so neither can be implemented in
+	terms of the other, however much it looks like they could.
+
 	Both inputs are arguments rather than globals so this is testable
 	without patching os or sys, which the suite's own leak sentinel would
 	then have to catch."""
 	env = os.environ if env is None else env
 	if env.get("NO_COLOR"):
+		return False
+	if env.get("NOCOLOR", "").strip().lower() in ("true", "yes", "1"):
 		return False
 	stream = sys.stdout if stream is None else stream
 	return stream.isatty()

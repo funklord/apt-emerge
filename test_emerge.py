@@ -257,6 +257,28 @@ class TestWantColor(unittest.TestCase):
         one behind."""
 		self.assertTrue(self.want({"NO_COLOR": ""}))
 
+	def test_portages_nocolor_turns_it_off(self):
+		"""NOCOLOR is a make.conf variable, so it is read for its value
+        rather than its presence. Case and surrounding space are not the
+        user's problem."""
+		for value in ("true", "yes", "1", "True", "YES", " true "):
+			with self.subTest(value=value):
+				self.assertFalse(self.want({"NOCOLOR": value}))
+
+	def test_nocolor_saying_no_leaves_colour_alone(self):
+		for value in ("false", "no", "0", "", "banana"):
+			with self.subTest(value=value):
+				self.assertTrue(self.want({"NOCOLOR": value}))
+
+	def test_the_two_spellings_disagree_about_zero(self):
+		"""The trap, pinned in one place because it looks like a typo.
+        They are one character apart and mean opposite things by the same
+        string: NO_COLOR is presence, so =0 disables; NOCOLOR is a value,
+        so =0 does not. Neither can be implemented in terms of the other,
+        and a future tidy-up that merges them breaks exactly this."""
+		self.assertFalse(self.want({"NO_COLOR": "0"}))
+		self.assertTrue(self.want({"NOCOLOR": "0"}))
+
 	def test_it_is_wired_to_the_real_output(self):
 		"""The function decides nothing unless USE_COLOR calls it, and a
         flag that never reaches the thing acting on it is the shape of two
@@ -289,14 +311,16 @@ class TestWantColor(unittest.TestCase):
 				os.close(slave)
 				os.close(master)
 
-		base = dict(os.environ)
-		base.pop("NO_COLOR", None)
+		base = {k: v for k, v in os.environ.items()
+		        if k not in ("NO_COLOR", "NOCOLOR")}
 		coloured = run(base)
 		self.assertIn("no targets given", coloured)
 		self.assertIn("\033[", coloured, "a terminal should have got colour")
-		plain = run(dict(base, NO_COLOR="1"))
-		self.assertIn("no targets given", plain)
-		self.assertNotIn("\033[", plain)
+		for var, value in (("NO_COLOR", "1"), ("NOCOLOR", "true")):
+			with self.subTest(variable=var):
+				plain = run(dict(base, **{var: value}))
+				self.assertIn("no targets given", plain)
+				self.assertNotIn("\033[", plain)
 
 
 def sign(n):
