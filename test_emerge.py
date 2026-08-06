@@ -115,7 +115,15 @@ def load():
 	loader = importlib.machinery.SourceFileLoader("emerge_under_test", SCRIPT)
 	spec = importlib.util.spec_from_loader(loader.name, loader)
 	mod = importlib.util.module_from_spec(spec)
-	loader.exec_module(mod)
+	# Import with a stdout that is not a terminal, so the copy comes out
+	# with USE_COLOR false. The script decides that once, at import, from
+	# sys.stdout.isatty(), and bakes the answer into constants -- ARROW is
+	# already BGREEN(">>>") by the time anything here could set the flag.
+	# Without this, a test asserting on output passes when the suite is
+	# piped and fails when it is run from a terminal, which is how
+	# `make deb` broke for one person and nobody else.
+	with contextlib.redirect_stdout(io.StringIO()):
+		loader.exec_module(mod)
 	# every path the dpkg backend writes to, out of the way of the system
 	scratch = _scratch()
 	mod.LIB_DIR = os.path.join(scratch, "lib")
@@ -135,6 +143,24 @@ em = load()
 
 HAVE_DPKG = shutil.which("dpkg") is not None
 HAVE_DIFF3 = shutil.which("diff3") is not None
+
+
+class TestTheHarness(unittest.TestCase):
+	"""What load() has to normalise for a test to mean the same thing
+    wherever it runs."""
+
+	def test_a_loaded_copy_never_colours_its_output(self):
+		"""Six places used to turn colour off, and one of them forgot, so
+        `Emerging (1 of 2) libb` was really `Emerging (1 of 2) \033[1;32m...`
+        and the test passed only when stdout was a pipe. Running the suite
+        from a terminal failed it, which is how `make deb` broke for the
+        one person running it by hand. load() owns this now; asserting the
+        flag alone is not enough, because ARROW is coloured at import and
+        setting the flag afterwards would leave it that way."""
+		mod = load()
+		self.assertFalse(mod.USE_COLOR)
+		self.assertEqual(mod.ARROW, ">>>")
+		self.assertEqual(mod.BGREEN("x"), "x")
 
 
 # ---------------------------------------------------------------------------
@@ -2100,7 +2126,6 @@ class TestStaleWorldEntries(unittest.TestCase):
 		self.mod.TREE_DIR = os.path.join(lib, "tree")
 		self.mod.WORLD = os.path.join(lib, "world")
 		self.mod.STATUS = os.path.join(root, "status")
-		self.mod.USE_COLOR = False
 		self.put(self.mod.STATUS,
 		         "Package: real\nStatus: install ok installed\n"
 		         "Version: 1.0\nArchitecture: all\nPriority: optional\n\n")
@@ -2186,7 +2211,6 @@ class TestDeselect(unittest.TestCase):
 		self.mod.TREE_DIR = os.path.join(lib, "tree")
 		self.mod.WORLD = os.path.join(lib, "world")
 		self.mod.STATUS = os.path.join(root, "status")
-		self.mod.USE_COLOR = False
 		self.mod.need_root = lambda: None
 		with open(self.mod.STATUS, "w") as f:
 			f.write("Package: real\nStatus: install ok installed\n"
@@ -2859,7 +2883,6 @@ class TestPackaging(unittest.TestCase):
 		are real captures, so they can simply be re-rendered and compared."""
 		readme = self.read("README.md")
 		mod = load()
-		mod.USE_COLOR = False
 		mod._session_critical_cache = {"libgl1-mesa-dri", "libglx-mesa0"}
 		mod._session_blind = False
 		buf = io.StringIO()
@@ -2877,7 +2900,6 @@ class TestPackaging(unittest.TestCase):
 	def test_the_readme_install_example_matches_the_merge_list_format(self):
 		readme = self.read("README.md")
 		mod = load()
-		mod.USE_COLOR = False
 		buf = io.StringIO()
 		with contextlib.redirect_stdout(buf):
 			mod.print_merge_list([("sl", "5.02-1+b1", None, 13210,
@@ -4894,7 +4916,6 @@ class TestConfigWrite(unittest.TestCase):
 		with open(self.path, "wb") as f:
 			f.write(self.LATIN1)
 		mod = load()
-		mod.USE_COLOR = False
 		buf = io.StringIO()
 		with contextlib.redirect_stdout(buf):
 			mod.color_diff(mod.read_lines(self.path), ["# other\n"],

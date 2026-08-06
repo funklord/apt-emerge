@@ -1210,6 +1210,24 @@ to do with what they claimed to check:
   everywhere rather than only where /proc happens to be off limits.
 - A stub used `staticmethod(lambda ...)` on an instance attribute, which is
   callable only on 3.10+.
+- **A terminal is part of the machine too.** `USE_COLOR =
+  sys.stdout.isatty()` is evaluated once, at import, so a copy loaded from
+  an interactive shell paints its output and one loaded from a pipe does
+  not. `test_progress_counts_upwards_in_the_order_things_happen` looked for
+  `Emerging (1 of 2) libb` in text that really read `Emerging (1 of 2)
+  \033[1;32mlibb-1\033[0m`. Every automated path — CI, `make check` from a
+  script, an agent running the suite — pipes stdout, so it passed
+  everywhere except under the one condition a person actually uses, where
+  it took `make deb` down with it through `dh_auto_test`.
+
+  The defect underneath was **six writers**: five tests set
+  `mod.USE_COLOR = False` by hand and the sixth forgot, which is the same
+  shape as the three copies of the durability sequence. `load()` owns it
+  now, and owns it by importing the module with a non-tty stdout rather
+  than by setting the flag afterwards — the flag alone is not enough,
+  because `ARROW` is `BGREEN(">>>")` at import and would stay coloured.
+  `TestTheHarness` pins both. Mutation-checked the way the bug was found:
+  reverted, it fails under a pty and passes through a pipe.
 
 For portability, run a real old interpreter rather than reasoning about one:
 `uv python install 3.9` takes seconds. `ast.parse(feature_version=...)` is
