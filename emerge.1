@@ -9,7 +9,7 @@ emerge \- Portage-flavoured package manager front-end for Debian
 .RI ...
 .br
 .B emerge
-.RB { --sync | --version | --help }
+.RB { --sync | --info | --version | --help }
 .br
 .B dispatch-conf
 .br
@@ -39,6 +39,12 @@ file. It is binary-only by design. Force either with
 or
 .BR EMERGE_BACKEND .
 .SH ACTIONS
+One action per run. Naming two is refused rather than silently performing
+whichever the dispatch order reaches first, which is what used to happen:
+.B "emerge -C --depclean foo"
+ran the depclean and dropped the removal.
+.BR --help ", " --version " and " --info
+answer and exit without acting.
 .TP
 .BR --depclean ", " -c
 Remove packages that are not part of the dependency tree of the
@@ -117,10 +123,25 @@ refused unless
 .B --ask
 or
 .B --pretend
-is given, so the full cascade is always shown before it happens.
+is given.
+.IP
+What happens then differs by backend, because the underlying tools differ.
+.B apt-get remove
+takes everything depending on the target with it, so the apt backend shows
+that whole list and asks before running it. dpkg refuses to remove a package
+another installed one needs, so on the dpkg backend there is no cascade to
+show and
+.B --ask
+does not override anything: it tells you to name the dependents in the same
+command, which is what dpkg will accept.
 .TP
 .BR --version ", " -V
-Print the version, the active backend, and the copyright and licence.
+Print two different versions, the active backend, and the copyright and
+licence. The first line names the Portage release whose dialect this speaks,
+which is a compatibility surface scripts read and is the same in every
+release of this program; the second names apt-emerge's own version, which is
+the one a bug report needs. See also
+.BR --info .
 .TP
 .BR --help ", " -h
 Print the full built-in help, which is more detailed than this page.

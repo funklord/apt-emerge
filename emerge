@@ -3821,6 +3821,10 @@ Help (this screen):
    --help (-h)   Displays this help.
 
 Actions:
+
+One action per run: naming two is refused rather than silently doing
+whichever comes first. --help, --version and --info answer and exit.
+
    --depclean (-c)
                  Cleans the system by removing packages that are not
                  associated with explicitly merged packages. Depclean works
