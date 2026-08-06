@@ -1758,6 +1758,16 @@ to be true for it to fail, and go and make that true.
   definition, and the alternative is a `dpkg-query` fork per package on
   every run. `debian/apt-emerge.lintian-overrides` records that, so the
   package lints clean and a *new* tag is visible rather than lost in noise.
+- **A search term is a regex, and the two backends mishandled a bad one in
+  different directions.** The dpkg backend compiles it itself and raised
+  `unterminated character set` as a traceback; the apt backend hands it to
+  `apt-cache search`, which prints `E: Regex compilation error`, **exits 0
+  anyway**, and was therefore reported as `[ Applications found : 0 ]` — a
+  wrong answer rather than a complaint, and the worse of the two, because
+  nothing about it looks like a failure. The pattern is validated in
+  `main()` now, once, so both give the same message; the apt path also
+  surfaces an `E:` on stderr, since POSIX extended regex is not Python's
+  dialect and may refuse something Python accepted.
 - Never fork per search result. `emerge -s '^lib'` matches 29,185 packages;
   one `apt-cache policy` per hit meant the search never finished. Batch it.
   The same mistake reappeared in `archive_settled`, which forked

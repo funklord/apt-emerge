@@ -3181,6 +3181,70 @@ class TestInfo(unittest.TestCase):
 		self.info("--info")
 
 
+class TestSearchPatterns(unittest.TestCase):
+	"""A search term is a regex, and users mistype regexes.
+
+    The two backends failed differently on the same input, which is why the
+    check is in main() rather than in either of them. The dpkg backend
+    compiles the pattern itself and raised `unterminated character set` as
+    a traceback. The apt backend hands it to `apt-cache search`, which
+    prints "E: Regex compilation error", exits 0 regardless, and so was
+    reported as `[ Applications found : 0 ]` -- a wrong answer rather than
+    a complaint, and the worse of the two, because nothing about it looks
+    like a failure."""
+
+	def setUp(self):
+		self.mod = load()
+		self.said = []
+		self.mod.eerror = self.said.append
+
+		class B:
+			name = "apt"
+			searched = []
+
+			def search(_s, terms, desc):
+				B.searched.append(list(terms))
+		self.backend = B
+		B.searched = []
+		self.mod.pick_backend = lambda flag, pretend=False: B()
+
+	def search(self, *terms):
+		with contextlib.redirect_stdout(io.StringIO()):
+			self.mod.main(["-s", *terms])
+
+	def test_a_broken_pattern_is_refused_before_any_backend_sees_it(self):
+		for bad in ("[", "a(", "*x", "(?P<"):
+			with self.subTest(pattern=bad):
+				self.said.clear()
+				self.backend.searched = []
+				with self.assertRaises(SystemExit) as exit:
+					self.search(bad)
+				self.assertEqual(exit.exception.code, 1)
+				self.assertEqual(self.backend.searched, [],
+				                 "the backend was asked to search anyway")
+				self.assertTrue(any(bad in s for s in self.said),
+				                f"the complaint should quote it: {self.said}")
+
+	def test_it_says_where_the_pattern_went_wrong(self):
+		"""Naming the position is the difference between a usable message
+        and one that says only that something is wrong."""
+		with self.assertRaises(SystemExit):
+			self.search("a(")
+		joined = " ".join(self.said)
+		self.assertIn("position", joined)
+		self.assertIn("quote it", joined,
+		              "the usual cause is the shell, so say so")
+
+	def test_an_ordinary_pattern_still_reaches_the_backend(self):
+		self.search("^sl$")
+		self.assertEqual(self.backend.searched, [["^sl$"]])
+
+	def test_every_term_is_checked_not_just_the_first(self):
+		with self.assertRaises(SystemExit):
+			self.search("^sl$", "[")
+		self.assertEqual(self.backend.searched, [])
+
+
 class TestPortageAtoms(unittest.TestCase):
 	"""The premise is that emerge's command line works here, so the spellings
     a Portage user's fingers produce should not fall through to apt and come
