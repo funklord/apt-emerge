@@ -1701,6 +1701,12 @@ class TestMaintainerScriptsAreNotInteractive(unittest.TestCase):
 
 	def setUp(self):
 		self.mod = load()
+		# Silenced before any backend is built: constructing one seeds the
+		# world file and announces it, which as root drops "Seeded world
+		# file with 170 packages" into the middle of the test output.
+		# Invisible to an ordinary user, since the seed guard returns
+		# early for one.
+		self.mod.einfo = lambda m: None
 		self.mod.need_root = lambda: None
 		self.calls = []
 
@@ -1853,6 +1859,12 @@ class TestDpkgUnmergeGuard(unittest.TestCase):
 
 	def setUp(self):
 		self.mod = load()
+		# Silenced before any backend is built: constructing one seeds the
+		# world file and announces it, which as root drops "Seeded world
+		# file with 170 packages" into the middle of the test output.
+		# Invisible to an ordinary user, since the seed guard returns
+		# early for one.
+		self.mod.einfo = lambda m: None
 		self.be = self.mod.DpkgBackend()
 		self.mod.installed_state = lambda: {
 		    "lib": {"Package": "lib", "Version": "1.0",
@@ -2688,6 +2700,12 @@ class TestMultiarchIsNoticed(unittest.TestCase):
 
 	def setUp(self):
 		self.mod = load()
+		# Silenced before any backend is built: constructing one seeds the
+		# world file and announces it, which as root drops "Seeded world
+		# file with 170 packages" into the middle of the test output.
+		# Invisible to an ordinary user, since the seed guard returns
+		# early for one.
+		self.mod.einfo = lambda m: None
 		root = _scratch()
 		os.makedirs(root)
 		self.mod.STATUS = os.path.join(root, "status")
