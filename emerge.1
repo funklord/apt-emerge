@@ -400,6 +400,17 @@ As-shipped config files, used as the ancestor for 3-way merges.
 .I /var/lib/emerge-dpkg/world
 The world file (dpkg backend only).
 .TP
+.I /var/lib/emerge-dpkg/world.lock
+Held while the world file is read and written back, so two
+.B emerge
+runs cannot lose each other's changes (dpkg backend only). It coordinates
+this program with itself and nothing else: it is not dpkg's frontend lock,
+and does not make a concurrent
+.B dpkg
+or
+.B apt-get
+safe. A run that dies releases it, since the kernel does.
+.TP
 .I /var/lib/emerge-dpkg/tree
 Downloaded Packages indexes (dpkg backend only).
 .TP

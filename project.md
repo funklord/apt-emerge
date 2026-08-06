@@ -743,17 +743,49 @@ truncated its fixture at a fixed 120 bytes, and this index compresses to 88
   `.tmp` beside somebody's config in `/etc` says nothing about whose it is.
 - `--with` allow-set is per-invocation, never persisted.
 
-**What is not protected: two runs at once.** Nothing takes a lock. On the apt
-backend that mostly does not matter, because apt takes dpkg's frontend lock
-and the second run waits. The dpkg backend has no equivalent: two concurrent
-runs would each read the world file, each modify their copy, and each write
-it back, so one set of changes is lost — `merge`, `unmerge` and `--deselect`
-are all read-modify-write against it. A `--sync` racing a resolve is safer
-than it was now that indexes are replaced atomically rather than rewritten
-in place, but the world file is not covered by that.
+**Two runs at once: the world file is locked now.** `merge`, `unmerge` and
+`--deselect` are all read-modify-write against it, so two concurrent runs
+each read it, each changed their copy and each wrote it back — one set of
+changes lost, with nothing left to show it happened. Atomicity was never
+the answer to that: `write_atomic` stops a *torn* file, and a lost update
+is a different failure with the same cause.
 
-Whether to take a lock, and where it should live so that it does not
-pretend to coordinate with apt when it cannot, is open and unstarted.
+`world_lock()` is an `flock` held across each of those three windows.
+Three decisions in it are the point:
+
+- **It coordinates emerge with emerge and says so by where it lives** —
+  `world.lock`, beside the file it protects. It is emphatically *not*
+  dpkg's frontend lock. The apt backend needs none of this because apt
+  takes that one and the second run waits; the dpkg backend has no
+  equivalent, and a lock that *looked* like dpkg's would be worse than
+  none, reading as protection against a `dpkg -i` in another window that
+  it cannot give.
+- **`flock`, so the kernel drops it when the process dies.** No stale lock
+  to clear, no pid file to disbelieve — which matters for a tool people
+  interrupt.
+- **The root check and the pretend check both come first.** Creating the
+  lock file needs the same privileges as writing the world file, so
+  locking before `need_root()` turns a clean refusal into a
+  `PermissionError` traceback; and a `-p` run takes no lock at all,
+  because the lock file would be litter of exactly the kind `-p` creating
+  a world file already was. Both are pinned by tests.
+
+Never nest it: `flock` is per open file description, so a second one in
+the same process waits on the first forever. Seeding runs in the
+constructor and finishes before any of the three callers.
+
+**And the seed was the one world write that was not atomic**, which is
+worth recording because the document above claimed otherwise for a while.
+`_seed_world` had its own `open(WORLD, "w")` — the exact shape
+`write_atomic` exists to remove — so an interrupted first run left a
+truncated world file, and a truncated one parses perfectly with packages
+missing from it. It goes through `_write_world` and the lock now, and if
+another run seeded while it waited, it keeps that answer rather than
+announcing a seed that did not happen.
+
+What is still not protected is anything *outside* the world file: a
+`--sync` racing a resolve is safe only because indexes are replaced
+atomically, and concurrent dpkg operations remain dpkg's business.
 
 ---
 

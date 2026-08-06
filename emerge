@@ -71,8 +71,10 @@ Paths (dpkg backend): tree /var/lib/emerge-dpkg/tree, world file
 """
 
 import base64
+import contextlib
 import difflib
 import email.utils
+import fcntl
 import functools
 import gzip
 import hashlib
@@ -1457,6 +1459,45 @@ def write_atomic(path, data, prepare=None, suffix=".tmp"):
 	_fsync_dir(path)
 
 
+@contextlib.contextmanager
+def world_lock():
+	"""Hold the world file against another emerge for a read-modify-write.
+
+    `merge`, `unmerge` and `--deselect` all read the world file, change
+    their copy and write it back. Two runs at once therefore lose one set
+    of changes entirely -- `write_atomic` stops a *torn* file and has
+    nothing to say about a lost update, which is a different failure with
+    the same cause and no trace afterwards.
+
+    **This lock coordinates with nothing but ourselves, deliberately.** It
+    is not dpkg's frontend lock. The apt backend needs none of this because
+    apt takes that one and a second run waits; the dpkg backend has no
+    equivalent, and taking a lock that *looked* like dpkg's would be worse
+    than taking none, since it would read as protection against a `dpkg -i`
+    in another window that it cannot provide. The file it holds sits beside
+    the world file for the same reason: it is that file's lock, and says so
+    by where it lives.
+
+    `flock`, so the kernel drops it when the process dies. There is no
+    stale lock to clear after a crash and no pid file to disbelieve --
+    which matters for a tool people interrupt.
+
+    Never nest it: flock is per open file description, so a second one in
+    this same process would wait for the first forever. Seeding happens in
+    the constructor and is finished before any of the three callers run."""
+	os.makedirs(os.path.dirname(WORLD) or ".", exist_ok=True)
+	fd = os.open(WORLD + ".lock", os.O_CREAT | os.O_WRONLY, 0o644)
+	try:
+		try:
+			fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+		except OSError:
+			einfo("Waiting for another emerge to release the world file...")
+			fcntl.flock(fd, fcntl.LOCK_EX)
+		yield
+	finally:
+		os.close(fd)
+
+
 def decompress_bounded(raw, ext, limit=MAX_INDEX_BYTES):
 	"""Decompress an index, refusing to produce more than `limit` bytes.
 
@@ -1804,9 +1845,19 @@ class DpkgBackend:
 			# answer than the file.
 			self._world_seed = set(inst)
 			return
-		os.makedirs(LIB_DIR, exist_ok=True)
-		with open(WORLD, "w") as f:
-			f.write("\n".join(sorted(inst)) + "\n")
+		# Through the same writer as every other world write, and under the
+		# same lock. It had its own `open(WORLD, "w")`, which is the exact
+		# shape write_atomic exists to remove: an interrupted seed left a
+		# truncated world file, and a truncated one parses perfectly with
+		# packages missing from it. project.md claimed all world writes were
+		# atomic while this one, the first ever made, was not.
+		with world_lock():
+			if os.path.exists(WORLD):
+				# Another run seeded it while we waited. Its answer is as
+				# good as ours -- same machine, same dpkg status -- and
+				# overwriting it would announce a seed that did not happen.
+				return
+			self._write_world(inst)
 		einfo(f"Seeded world file with {len(inst)} currently installed packages.")
 
 	def _read_world(self):
@@ -2369,8 +2420,9 @@ class DpkgBackend:
 		archive_settled(conf, [st["Package"] for st in self._plan])
 		atoms = getattr(self, "_atoms", [])
 		if not opts["oneshot"] and atoms:
-			w = self._read_world() | set(atoms)
-			self._write_world(w)
+			with world_lock():
+				w = self._read_world() | set(atoms)
+				self._write_world(w)
 			print(f"\n{ARROW} Recording targets in \"world\" favorites file "
 			      f"({WORLD})")
 		print(f"{ARROW} {BGREEN('Auto-cleaning packages...')}\n")
@@ -2473,7 +2525,8 @@ class DpkgBackend:
 		if r.returncode != 0:
 			print(r.stderr, file=sys.stderr)
 			efail("unmerge failed."); sys.exit(1)
-		self._write_world(self._read_world() - {p for p, _ in removals})
+		with world_lock():
+			self._write_world(self._read_world() - {p for p, _ in removals})
 		print(f"\n{ARROW} {BGREEN('Auto-cleaning packages...')}")
 		einfo("GNU info directory index is up-to-date.")
 
@@ -2489,10 +2542,14 @@ class DpkgBackend:
         except with a text editor."""
 		world = self._read_world()
 		drop = [n for n in names if n in world]
-		# Before announcing anything. Printing "Removing x" and then finding
-		# out we are not root tells the user the thing happened when it did
-		# not -- and stdout is block-buffered while the error is not, so the
-		# two even arrive in the wrong order.
+		# Before announcing anything, and before taking the lock. Printing
+		# "Removing x" and then finding out we are not root tells the user
+		# the thing happened when it did not -- and stdout is block-buffered
+		# while the error is not, so the two even arrive in the wrong order.
+		# The lock has to come after this too: creating its file needs the
+		# same privileges, so locking first turns a clean refusal into a
+		# PermissionError traceback, and a pretend run would leave the lock
+		# file behind exactly as it once left a world file.
 		if drop and not pretend:
 			need_root()
 		verb = "Would remove" if pretend else "Removing"
@@ -2503,7 +2560,12 @@ class DpkgBackend:
 			else:
 				ewarn(f"{name} is not in @selected; skipping.")
 		if drop and not pretend:
-			self._write_world(world - set(drop))
+			with world_lock():
+				# Re-read inside the lock. What was read above decided only
+				# what to *say*; another run may have changed the file since,
+				# and removing a name it already removed is a set difference
+				# that costs nothing.
+				self._write_world(self._read_world() - set(drop))
 		return drop
 
 	# -- search ---------------------------------------------------------------

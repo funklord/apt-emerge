@@ -20,6 +20,7 @@ when those tools are absent, so the suite still runs on a non-Debian box.
 
 import base64
 import contextlib
+import fcntl
 import gzip
 import hashlib
 import lzma
@@ -2111,6 +2112,151 @@ class TestDpkgBackendDrivesDpkg(unittest.TestCase):
 		self.assertEqual(written, [{"keep"}])
 
 
+class TestWorldLock(unittest.TestCase):
+	"""The world file is read-modify-written by merge, unmerge and
+    --deselect, so two runs at once lose one set of changes. write_atomic
+    prevents a torn file and says nothing about that.
+
+    Exclusion is checked from a second open file description rather than a
+    second process: flock is per description, so two opens conflict even
+    inside one process -- measured before the tests were written on it."""
+
+	def setUp(self):
+		self.mod = load()
+		os.makedirs(self.mod.LIB_DIR, exist_ok=True)
+
+	def free(self):
+		fd = os.open(self.mod.WORLD + ".lock",
+		             os.O_CREAT | os.O_WRONLY, 0o644)
+		try:
+			fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+			fcntl.flock(fd, fcntl.LOCK_UN)
+			return True
+		except OSError:
+			return False
+		finally:
+			os.close(fd)
+
+	def test_it_excludes_another_holder(self):
+		with self.mod.world_lock():
+			self.assertFalse(self.free())
+
+	def test_it_is_released_afterwards(self):
+		with self.mod.world_lock():
+			pass
+		self.assertTrue(self.free())
+
+	def test_a_failure_inside_still_releases_it(self):
+		"""A lock a crashed run keeps is worse than no lock: every later
+        run waits forever on a holder that is gone. flock also has the
+        kernel drop it if the process dies, so there is nothing stale to
+        clear -- this covers the ordinary raise."""
+		with self.assertRaises(RuntimeError):
+			with self.mod.world_lock():
+				raise RuntimeError("boom")
+		self.assertTrue(self.free())
+
+	def test_it_lives_beside_the_world_file_it_locks(self):
+		"""Not in a shared place, and emphatically not dpkg's frontend
+        lock: it coordinates emerge with emerge and nothing else. Where it
+        lives is how it says so."""
+		with self.mod.world_lock():
+			pass
+		self.assertTrue(os.path.exists(self.mod.WORLD + ".lock"))
+		self.assertEqual(os.path.dirname(self.mod.WORLD + ".lock"),
+		                 os.path.dirname(self.mod.WORLD))
+
+	def test_a_pretend_deselect_takes_none_and_leaves_nothing(self):
+		"""`-p` creating a world file is a bug this project already
+        shipped; a lock file is the same bug with a new name."""
+		be = self.mod.DpkgBackend(pretend=True)
+		with open(self.mod.WORLD, "w") as f:
+			f.write("sl\n")
+		if os.path.exists(self.mod.WORLD + ".lock"):
+			os.unlink(self.mod.WORLD + ".lock")
+		with contextlib.redirect_stdout(io.StringIO()):
+			be.deselect(["sl"], pretend=True)
+		self.assertFalse(os.path.exists(self.mod.WORLD + ".lock"))
+		with open(self.mod.WORLD) as f:
+			self.assertEqual(f.read().split(), ["sl"])
+
+	def watch(self):
+		"""Record entries into the real lock, so a caller that stopped
+        taking it is visible."""
+		entered = []
+		real = self.mod.world_lock
+
+		@contextlib.contextmanager
+		def watched():
+			entered.append(True)
+			with real():
+				yield
+
+		self.mod.world_lock = watched
+		return entered
+
+	def test_merge_takes_it_around_recording_the_atoms(self):
+		self.mod.need_root = lambda: None
+		self.mod.load_conf = lambda: {}
+		self.mod.archive_settled = lambda conf, pkgs: 0
+		self.mod.pending_notice = lambda conf: None
+		self.mod.einfo = lambda m: None
+
+		class R:
+			stdout, stderr, returncode = "", "", 0
+		self.mod.capture = lambda cmd, env=None: R
+		be = self.mod.DpkgBackend()
+		be._plan = [{"Package": "sl", "Version": "1"}]
+		be._atoms = ["sl"]
+		be._download = lambda: ["/d/sl.deb"]
+		entered = self.watch()
+		with contextlib.redirect_stdout(io.StringIO()):
+			be.merge([], [], {"fetchonly": False, "oneshot": False})
+		self.assertEqual(entered, [True])
+		with open(self.mod.WORLD) as f:
+			self.assertIn("sl", f.read().split())
+
+	def test_unmerge_takes_it_too(self):
+		self.mod.need_root = lambda: None
+		self.mod.einfo = lambda m: None
+
+		class R:
+			stdout, stderr, returncode = "", "", 0
+		self.mod.capture = lambda cmd, env=None: R
+		be = self.mod.DpkgBackend()
+		with open(self.mod.WORLD, "w") as f:
+			f.write("sl\nbash\n")
+		entered = self.watch()
+		with contextlib.redirect_stdout(io.StringIO()):
+			be.unmerge([("sl", "1")])
+		self.assertEqual(entered, [True])
+		with open(self.mod.WORLD) as f:
+			self.assertEqual(f.read().split(), ["bash"])
+
+	def test_a_real_deselect_takes_it(self):
+		"""The wiring, not the primitive: a lock nothing enters protects
+        nothing, and the callers are where that goes wrong."""
+		self.mod.need_root = lambda: None
+		with open(self.mod.WORLD, "w") as f:
+			f.write("sl\n")
+		entered = []
+		real = self.mod.world_lock
+
+		@contextlib.contextmanager
+		def watched():
+			entered.append(True)
+			with real():
+				yield
+
+		self.mod.world_lock = watched
+		be = self.mod.DpkgBackend()
+		with contextlib.redirect_stdout(io.StringIO()):
+			be.deselect(["sl"], pretend=False)
+		self.assertEqual(entered, [True])
+		with open(self.mod.WORLD) as f:
+			self.assertEqual(f.read().split(), [])
+
+
 class TestSeedWorldTiming(unittest.TestCase):
 	"""When the world file is seeded, which is load-bearing.
 
@@ -2126,36 +2272,33 @@ class TestSeedWorldTiming(unittest.TestCase):
 
 	def setUp(self):
 		self.mod = load()
-		self.seeded, self.made, self.written = [], [], {}
+		self.seeded = []
 		self.installed = {"bash": {"Package": "bash"},
 		                  "coreutils": {"Package": "coreutils"}}
 		self.mod.installed_state = lambda: dict(self.installed)
 		self.mod.einfo = self.seeded.append
-		real_exists = self.mod.os.path.exists
-		self.world_exists = False
+		# Only root is faked. The seed writes for real, into the scratch
+		# directory load() hands out -- it used to be observed through a
+		# fake `open`, which stopped seeing anything the moment seeding
+		# started going through write_atomic like every other world write.
+		# Reading the file back is what the test meant all along.
 		self.patch(self.mod.os, "geteuid", lambda: 0)
-		self.patch(self.mod.os.path, "exists",
-		           lambda p: (self.world_exists if p == self.mod.WORLD
-		                      else real_exists(p)))
-		self.patch(self.mod.os, "makedirs",
-		           lambda *a, **kw: self.made.append(a))
-		self.mod.open = self.fake_open
 
 	def patch(self, obj, attr, value):
 		original = getattr(obj, attr)
 		self.addCleanup(setattr, obj, attr, original)
 		setattr(obj, attr, value)
 
-	def fake_open(self, path, mode="r", *a, **kw):
-		buf = io.StringIO()
-		if "w" in mode:
-			self.written[path] = buf
-			buf.close = lambda: None
-		return buf
-
 	def seeded_names(self):
-		buf = self.written.get(self.mod.WORLD)
-		return sorted(buf.getvalue().split()) if buf else []
+		if not os.path.exists(self.mod.WORLD):
+			return []
+		with open(self.mod.WORLD) as f:
+			return sorted(f.read().split())
+
+	def created(self):
+		"""Everything the run left behind, lock file included."""
+		return sorted(p for p in (self.mod.WORLD, self.mod.WORLD + ".lock",
+		                          self.mod.LIB_DIR) if os.path.exists(p))
 
 	def test_the_seed_is_taken_at_construction(self):
 		self.mod.DpkgBackend()
@@ -2170,6 +2313,22 @@ class TestSeedWorldTiming(unittest.TestCase):
 		be._read_world()
 		self.assertNotIn("freshly-installed-dep", self.seeded_names())
 
+	def test_the_seed_goes_through_the_shared_writer(self):
+		"""It had its own `open(WORLD, "w")` and was therefore the one
+        world write that an interrupt could truncate -- while project.md
+        stated that all of them were atomic. A private copy of a durability
+        sequence is exactly how that gap opens."""
+		wrote = []
+		real = self.mod.write_atomic
+
+		def watched(path, data, *a, **kw):
+			wrote.append(path)
+			return real(path, data, *a, **kw)
+
+		self.patch(self.mod, "write_atomic", watched)
+		self.mod.DpkgBackend()
+		self.assertEqual(wrote, [self.mod.WORLD])
+
 	def test_seeding_happens_once(self):
 		be = self.mod.DpkgBackend()
 		for _ in range(4):
@@ -2177,30 +2336,31 @@ class TestSeedWorldTiming(unittest.TestCase):
 		self.assertEqual(len(self.seeded), 1)
 
 	def test_an_existing_world_file_is_never_reseeded(self):
-		self.world_exists = True
+		os.makedirs(self.mod.LIB_DIR, exist_ok=True)
+		with open(self.mod.WORLD, "w") as f:
+			f.write("chosen-by-hand\n")
 		self.mod.DpkgBackend()
 		self.assertEqual(self.seeded, [])
-		self.assertEqual(self.made, [])
+		self.assertEqual(self.seeded_names(), ["chosen-by-hand"])
 
 	def test_version_creates_nothing(self):
 		"""-V wants the backend's name, not a backend. Constructing one
 		seeds the world file, and a version query must not write to
-		/var/lib."""
-		self.mod.shutil = self.mod.shutil
+		/var/lib -- nor leave a lock file there, which is the same
+		promise with a new way to break it."""
 		self.patch(self.mod.shutil, "which", lambda p: None)   # force dpkg
 		out = io.StringIO()
 		with contextlib.redirect_stdout(out):
 			self.mod.main(["-V"])
 		self.assertIn("dpkg backend", out.getvalue())
-		self.assertEqual(self.made, [])
 		self.assertEqual(self.seeded, [])
-		self.assertEqual(self.written, {})
+		self.assertEqual(self.created(), [])
 
 	def test_help_creates_nothing_either(self):
 		self.patch(self.mod.shutil, "which", lambda p: None)
 		with contextlib.redirect_stdout(io.StringIO()):
 			self.mod.main(["--help"])
-		self.assertEqual(self.made, [])
+		self.assertEqual(self.created(), [])
 
 	def test_backend_name_agrees_with_the_backend_it_would_build(self):
 		for forced in ("apt", "dpkg"):
