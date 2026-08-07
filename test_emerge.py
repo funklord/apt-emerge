@@ -778,6 +778,87 @@ class TestMerge3(unittest.TestCase):
 					self.assertEqual("".join(out), r.stdout)
 
 
+class TestMerge2(unittest.TestCase):
+	"""The built-in merge with no ancestor to merge against.
+
+    Property-based for the same reason merge3 is: a hand-written
+    expectation here encodes what its author believed difflib does, so when
+    the author is wrong the code and the test are wrong together and agree
+    forever. The invariant below is the whole claim a merge makes."""
+
+	def _resolve(self, merged, side):
+		"""One side of every conflict, taken the way a reader with an editor
+        takes it: keep the marked region you want, delete the markers and
+        the region you do not."""
+		out, keeping = [], True
+		for line in merged:
+			if line.startswith("<<<<<<< "):
+				keeping = (side == "mine")
+			elif line == "=======\n":
+				keeping = (side == "theirs")
+			elif line.startswith(">>>>>>> "):
+				keeping = True
+			else:
+				if keeping:
+					out.append(line)
+		return out
+
+	def test_resolving_left_gives_yours_and_right_gives_theirs(self):
+		"""Nothing dropped, nothing invented, whatever alignment difflib
+        picks. A violation is a config merge losing one side's lines --
+        silently, into /etc.
+
+        Seeded, so a failure is reproducible rather than a rumour."""
+		rnd = random.Random(90210)
+		fuzz = TestMerge3._fuzz_lines
+		mutate = TestMerge3._fuzz_mutate
+		for i in range(600):
+			mine = fuzz(self, rnd)
+			theirs = mutate(self, rnd, mine)
+			with self.subTest(i=i, mine=mine, theirs=theirs):
+				out, n = em.merge2(mine, theirs)
+				self.assertEqual(self._resolve(out, "mine"), mine)
+				self.assertEqual(self._resolve(out, "theirs"), theirs)
+				self.assertEqual(n > 0, mine != theirs)
+
+	def test_shared_runs_are_not_put_to_the_reader(self):
+		"""The point of merging rather than offering keep-or-replace: only
+        the differences are asked about."""
+		out, n = em.merge2(L("a", "b", "mine", "d", "e"),
+		                   L("a", "b", "theirs", "d", "e"))
+		self.assertEqual(n, 1)
+		self.assertEqual(out, ["a\n", "b\n", "<<<<<<< current\n", "mine\n",
+		                       "=======\n", "theirs\n", ">>>>>>> new\n",
+		                       "d\n", "e\n"])
+
+	def test_identical_files_merge_to_themselves_without_conflict(self):
+		out, n = em.merge2(L("a", "b"), L("a", "b"))
+		self.assertEqual((out, n), (L("a", "b"), 0))
+
+	def test_empty_inputs(self):
+		self.assertEqual(em.merge2([], []), ([], 0))
+
+	def test_a_last_line_without_a_newline_does_not_glue_the_marker(self):
+		"""A config file's last line need not end in a newline. Appending a
+        marker after one that does not produced `mine>>>>>>> new` -- one
+        corrupt line, in the one place the reader has to look, and not
+        removable by deleting marker lines."""
+		out, _ = em.merge2(["a\n", "mine"], ["a\n", "theirs"])
+		self.assertIn("=======\n", out)
+		self.assertIn(">>>>>>> new\n", out)
+		self.assertEqual("".join(out).count(">>>>>>>"), 1)
+		for line in out[:-1]:
+			self.assertTrue(line.endswith("\n"), out)
+
+	def test_merge3_does_not_glue_it_either(self):
+		"""Same defect, same fix, and it was latent there first -- every
+        fuzz case above happens to end in a newline."""
+		out, n = em.merge3(["base"], ["mine"], ["theirs"])
+		self.assertEqual(n, 1)
+		for line in out[:-1]:
+			self.assertTrue(line.endswith("\n"), out)
+
+
 class TestSignificant(unittest.TestCase):
 	def test_strips_comments_and_blank_lines(self):
 		lines = L("# comment", "", "  ", "key = value", "; ini comment",
@@ -4501,15 +4582,25 @@ class TestDispatchConf(unittest.TestCase):
 		out = self.dispatch("s")
 		self.assertIn(f"launch mergetool ({tool})", out)
 
-	def test_a_two_way_review_points_at_the_answer_it_still_has(self):
-		"""With no ancestor, 3 and 4 are absent and the menu reads as a
-        choice between discarding your edits and discarding the update.
-        The third answer is option 5, and nothing said so."""
-		warns = []
-		self.mod.ewarn = warns.append
+	def test_a_two_way_review_still_offers_the_built_in_merge(self):
+		"""The built-in merge is what this program offers instead of dpkg's
+        keep-or-replace, and it used to withdraw itself exactly where it was
+        most needed: with no ancestor, 3 and 4 were absent and the only way
+        left to combine the two files was an external tool. That is
+        backwards -- the external tool is for someone who prefers their
+        own."""
 		self.park("app.conf", "mine\n", "theirs\n")     # no ancestor
-		self.dispatch("s")
-		self.assertTrue(any("option 5" in w for w in warns), warns)
+		out = self.dispatch("s")
+		self.assertIn("use the merged version", out)
+		self.assertIn("edit the merged version", out)
+
+	def test_a_two_way_merge_marks_up_both_versions(self):
+		t = self.park("app.conf", "shared\nmine\n", "shared\ntheirs\n")
+		self.dispatch("3")
+		got = self.content(t)
+		self.assertEqual(got, "shared\n<<<<<<< current\nmine\n=======\n"
+		                      "theirs\n>>>>>>> new\n")
+		self.assertFalse(self.parked_exists(t))
 
 	def test_the_menu_says_when_no_tool_is_configured_at_all(self):
 		self.conf["mergetool"] = self.conf["merge"] = ""

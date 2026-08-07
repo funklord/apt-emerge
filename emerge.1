@@ -319,7 +319,19 @@ against the new version. Files you never modified, differences that are only
 comments or whitespace, and conflict-free merges are applied automatically;
 only genuine conflicts are put to you, with keep / replace / merged /
 .RB $ EDITOR
-/ mergetool choices. Reachable as
+/ mergetool choices.
+.PP
+The first review after installing
+.B emerge
+has no archived ancestor yet, since the archive is written by installs
+.B emerge
+itself performed. The merged and edit choices are still offered there: with
+no ancestor a change cannot be attributed to either side, so every
+difference is marked up as a conflict, but the runs the two files share are
+still shared and only the differences are put to you. The external
+.I mergetool
+is for someone who prefers their own tool, not a requirement for merging.
+Reachable as
 .B dispatch-conf
 and
 .BR etc-update .

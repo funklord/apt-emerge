@@ -582,18 +582,50 @@ Debian already parks updated conffiles as `.dpkg-dist`/`.ucf-dist` (== Portage's
 - Scope: dpkg conffiles + ucf-managed files only. Files a maintainer script
   writes into `/etc` are NOT protected (would need pre/post snapshots).
 
-### The mergetool worked for nobody, and the review said so too late
+### The review with no ancestor had no merge in it
 
 Reported from a real review: a file with no archived ancestor announced
 *"2-way review only"*, and pressing **5** answered *"no mergetool
-configured"*. Both messages were true and the combination was a dead end —
-with no ancestor there is no merged version, so 3 and 4 are not offered and
-5 is the only entry that merges anything at all. It was also the only one
-that could not run. What was left was keep-your-edits or take-the-update,
-which is the choice dispatch-conf exists to avoid having to make.
+configured"*. Both messages were true and the combination was a dead end.
+What was left was keep-your-edits or take-the-update — dpkg's choice, the
+one this whole subsystem exists to replace.
 
-Three separate defects, and the third is the one that would have made the
-other two fixes worthless:
+**The first fix was the wrong shape, and the owner said so.** It repaired
+the external mergetool, which was genuinely broken three ways, and left
+the real defect standing: **the built-in merge withdrew itself.** `merge3`
+needs an ancestor, so with none there was no merged version, 3 and 4 were
+not offered, and the only way left to combine two files was a tool the
+user had to configure first. That is backwards. The built-in merge is
+what this program offers in place of dpkg's whole-file choice;
+`mergetool=` is for someone who prefers their own.
+
+`merge2()` is the missing half, and it is not a lesser merge — it is the
+same operation with one input fewer. Without an ancestor a change cannot
+be *attributed* to a side, so every difference is a conflict rather than
+something resolved silently; what it still does is share the runs the two
+files have in common, so the reader is asked about the differences instead
+of about the file. It is never auto-applied and cannot be: two files with
+no differences are retired before the merge is reached, so `conflicts` is
+always non-zero here.
+
+Its invariant is property-tested rather than exampled, for the reason the
+other three suites are: **resolving every conflict to the left reproduces
+your file exactly, and to the right reproduces the new one exactly.**
+Nothing dropped, nothing invented, whatever alignment difflib picks. A
+hand-written expectation would encode what its author believed difflib
+does, and be wrong in company with the code.
+
+Writing it surfaced a **latent defect in `merge3`**: a config file's last
+line need not end in a newline, and a marker appended after one that does
+not was glued to it — `listen 80>>>>>>> new`. One corrupt line, in the one
+place the reader has to look, and not removable by deleting marker lines.
+Every fuzz case happens to end in a newline, which is why 80,000 random
+triples never reached it. `_marker()` ends the content line instead,
+adding a trailing newline the file did not have: the conventional and
+recoverable of the two.
+
+Three further defects, in the external tool, of which the third would have
+made the other two fixes worthless:
 
 - **`merge` now defaults to Portage's own line**, verbatim: `sdiff
   --suppress-common-lines --output='%s' '%s' '%s'`. It was an empty string,
@@ -623,8 +655,8 @@ other two fixes worthless:
   tool that returns 1 for something else — kdiff3 on cancel — is caught by
   the seed check, since a cancelled tool leaves the output as it found it.
 
-The 2-way warning now also says where the third answer went, rather than
-leaving the reader to infer it from an option that is missing.
+The 2-way warning now says what the absent ancestor costs — every
+difference becomes a conflict — rather than only that it is absent.
 
 **Getting this in front of real sdiff took a pty, and the pipe version lied
 in the safe direction.** Driving the review over a pipe has Python's
@@ -632,14 +664,38 @@ in the safe direction.** Driving the review over a pipe has Python's
 run reports "mergetool did not produce a result" — indistinguishable from
 the bug being unfixed. Same trap as the colour test, and the same fix.
 
-**Still 2-way on first contact, and that part is not a defect.** The
-archive is written by `archive_settled()` after an install emerge itself
-performed, so a file parked by an upgrade that ran before emerge was
-installed has no ancestor and cannot have one. Recovering it from the
-previous version's `.deb` in `/var/cache/apt/archives` is possible in
-principle and unreliable in practice — the old `.deb` is only there if
-nothing cleaned the cache since — so it would be a feature to build, not a
-fix to apply.
+### Where a first-contact ancestor could come from
+
+The archive is written by `archive_settled()` after an install emerge
+itself performed, so a file parked by an upgrade that ran before emerge
+was installed has no ancestor. `merge2` makes that survivable rather than
+a dead end; recovering the real ancestor would make it a proper 3-way
+merge, and the ancestor is a specific, nameable file: the conffile as
+shipped by the version installed *before* the upgrade.
+
+**The local apt cache is not the source, and this was measured before
+being believed.** Of 789 version-changing upgrades in this box's
+`dpkg.log`, the superseded `.deb` was still in `/var/cache/apt/archives`
+for **25** of them — 3%. apt keeps the `.deb` of the version it installed,
+not the one it replaced. An earlier note here called that route "possible
+but unreliable", which was too kind by an order of magnitude.
+
+What *is* reliable is the pair of facts either side of it:
+
+- **Which version to look for is recorded locally.** `/var/log/dpkg.log`
+  logs `upgrade <pkg>:<arch> <old> <new>`, rotated but present, and
+  `/var/log/apt/history.log` carries the same. No network needed to learn
+  the version.
+- **The `.deb` itself is on snapshot.debian.org**, which keeps every
+  version ever published, with an HTTP API that maps package plus version
+  to files and hashes. Extracting one conffile from it needs `dpkg-deb`,
+  which the dpkg backend already requires.
+
+That makes it a feature to build rather than a fix to apply, and one with
+a policy question in it rather than only code: it is the first thing in
+this program that would reach the network during a *config review*, and
+snapshot.debian.org is a trust anchor the archive keyring does not cover.
+**Raised with the owner rather than decided in passing.**
 
 **A conffile is bytes, and not necessarily UTF-8 ones.** `read_lines` and
 `_write` pair `encoding="utf-8", errors="surrogateescape"` so a byte that

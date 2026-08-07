@@ -3346,6 +3346,55 @@ def _sync_regions(base, mine, theirs):
 		out.append((b, b + 1, m, t))
 	return out
 
+def _marker(out, text):
+	"""Append a conflict marker on a line of its own.
+
+    A file's last line need not end in a newline, and a marker appended
+    after one that does not is glued to it -- `listen 80>>>>>>> new` --
+    which corrupts the single line the reader most needs to see and is not
+    removable by deleting marker lines. Ending the content line instead
+    adds a trailing newline the file did not have: conventional, visible,
+    and the recoverable of the two."""
+	if out and not out[-1].endswith("\n"):
+		out[-1] += "\n"
+	out.append(text)
+
+def merge2(mine, theirs, labels=("current", "new")):
+	"""Two-way line merge, for a review with no archived ancestor.
+
+    The built-in merge is what this program offers in place of dpkg's
+    whole-file keep-or-replace, and it used to withdraw itself exactly
+    where it was most needed: with no ancestor there was no merged version,
+    so the merged and edit options were not offered at all and the only
+    remaining way to combine the two files was an external tool. That has
+    it backwards -- the external tool is for someone who prefers their own.
+
+    A two-way merge needs no ancestor. What it cannot do is attribute a
+    change to one side, so every difference is a conflict rather than
+    something to resolve silently; what it still does is share the runs the
+    two files have in common, so the reader is asked about the differences
+    instead of about the file.
+
+    The invariant, which is property-tested against random inputs:
+    resolving every conflict to the left side reproduces `mine` exactly and
+    to the right side reproduces `theirs` exactly. Nothing is dropped and
+    nothing is invented -- which is the whole claim a merge makes, and the
+    one worth checking mechanically, since a hand-written expectation here
+    encodes what its author believed difflib does."""
+	out, conflicts = [], 0
+	matcher = difflib.SequenceMatcher(None, mine, theirs, autojunk=False)
+	for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+		if tag == "equal":
+			out.extend(mine[i1:i2])
+			continue
+		conflicts += 1
+		_marker(out, f"<<<<<<< {labels[0]}\n")
+		out.extend(mine[i1:i2])
+		_marker(out, "=======\n")
+		out.extend(theirs[j1:j2])
+		_marker(out, f">>>>>>> {labels[1]}\n")
+	return out, conflicts
+
 def merge3(base, mine, theirs, labels=("current", "as-shipped", "new")):
 	"""Three-way line merge. Returns (merged_lines, conflict_count).
 
@@ -3394,13 +3443,13 @@ def merge3(base, mine, theirs, labels=("current", "as-shipped", "new")):
 			pass
 		else:
 			conflicts += 1
-			out.append(f"<<<<<<< {labels[0]}\n")
+			_marker(out, f"<<<<<<< {labels[0]}\n")
 			out.extend(m)
-			out.append(f"||||||| {labels[1]}\n")
+			_marker(out, f"||||||| {labels[1]}\n")
 			out.extend(b)
-			out.append("=======\n")
+			_marker(out, "=======\n")
 			out.extend(t)
-			out.append(f">>>>>>> {labels[2]}\n")
+			_marker(out, f">>>>>>> {labels[2]}\n")
 		out.extend(base[lo:hi])
 		bi, mi, ti = hi, m0 + (hi - lo), t0 + (hi - lo)
 	return out, conflicts
@@ -3829,6 +3878,14 @@ def dispatch_conf(opts):
 				      f"(ancestor: {src})")
 				auto += 1
 				continue
+		else:
+			# Never auto-applied, and it cannot be by construction: without
+			# an ancestor every difference is a conflict, and two files with
+			# no differences were retired further up. So this only ever
+			# reaches the reader, which is the point -- it keeps the merged
+			# and edit options on a review that would otherwise offer
+			# keep-or-replace and an external tool.
+			merged, conflicts = merge2(mine, theirs)
 
 		# interactive
 		print(f"\n{BLUE('=' * 72)}")
@@ -3836,12 +3893,8 @@ def dispatch_conf(opts):
 		if base is None:
 			ewarn("no archived ancestor yet -- 2-way review only "
 			      "(3-way merging starts from the next upgrade)")
-			# Without an ancestor there is no merged version to offer, so
-			# 3 and 4 are absent and the menu reads as keep-or-replace.
-			# Say where the third answer is rather than leaving the reader
-			# to infer it from an option that is missing.
-			ewarn("no merged version to offer, so 3 and 4 are not listed; "
-			      "option 5 merges the two by hand")
+			ewarn("without one every difference is a conflict, so 3 and 4 "
+			      "give you both versions marked up rather than merged")
 		elif conflicts:
 			ewarn(f"3-way merge against {src}: "
 			      f"{RED(str(conflicts))} conflict(s) need a decision")
