@@ -7,9 +7,9 @@ Copyright: 2026 Nabeel Sowan <nabeel@vibes.se>
 License: GPL-3.0-or-later
 
 License: GPL-3.0-or-later
- This program is free software; you can redistribute it and/or modify it
+ This program is free software: you can redistribute it and/or modify it
  under the terms of the GNU General Public License as published by the Free
- Software Foundation; either version 3 of the License, or (at your option)
+ Software Foundation, either version 3 of the License, or (at your option)
  any later version.
  .
  This program is distributed in the hope that it will be useful, but WITHOUT
@@ -18,7 +18,7 @@ License: GPL-3.0-or-later
  more details.
  .
  You should have received a copy of the GNU General Public License along
- with this program; if not, see <https://www.gnu.org/licenses/>.
+ with this program.  If not, see <https://www.gnu.org/licenses/>.
  .
  On Debian systems, the complete text of the GNU General Public License
  version 3 can be found in "/usr/share/common-licenses/GPL-3".
