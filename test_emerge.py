@@ -4065,6 +4065,33 @@ class TestInfo(unittest.TestCase):
 			self.mod.main(list(argv))
 		return buf.getvalue()
 
+	def test_it_reports_what_decides_a_config_review(self):
+		"""Config merging's failures are all quiet ones: a review that only
+        ever offers a 2-way merge looks like a design choice rather than a
+        missing ancestor, and the three things that decide it -- an empty
+        archive, recovery switched off, an absent dpkg.log -- are invisible
+        from outside. None of them was in here."""
+		d = tempfile.mkdtemp(prefix="emerge-info-")
+		self.addCleanup(shutil.rmtree, d, True)
+		self.mod.load_conf = lambda: {**self.mod.DEFAULT_CONF,
+		                              "archive-dir": d,
+		                              "config-protect": d}
+		self.mod.DPKG_LOG = os.path.join(d, "nosuch.log")
+		out = self.info("--info")
+		self.assertIn("Config archive", out)
+		self.assertIn("2-way until it fills", out)
+		self.assertIn("Ancestor recovery", out)
+		self.assertIn("Config files pending", out)
+		self.assertIn("empty or absent", out)
+
+	def test_the_recovery_row_says_when_it_is_switched_off(self):
+		d = tempfile.mkdtemp(prefix="emerge-info-")
+		self.addCleanup(shutil.rmtree, d, True)
+		self.mod.load_conf = lambda: {**self.mod.DEFAULT_CONF,
+		                              "archive-dir": d, "config-protect": d,
+		                              "recover-ancestor": "no"}
+		self.assertIn("recover-ancestor=no", self.info("--info"))
+
 	def test_it_names_this_program_s_own_version(self):
 		"""The first question a bug report answers, and the one the header
         line above it cannot: that names the Portage dialect, which is the
@@ -5918,6 +5945,62 @@ class TestRunMergetool(unittest.TestCase):
         crash."""
 		self.assertIsNone(self.mod.mergetool_program(
 		    self.conf(mergetool="meld '{mine}")))
+
+
+class TestAncestorWrite(unittest.TestCase):
+	"""The archive is the fourth piece of state to need an atomic write,
+    after the world file, the config file and the index.
+
+    A torn ancestor is not an unreadable one -- it parses perfectly with
+    lines missing, and every later 3-way merge is then made against a file
+    the package never shipped. Recovery sharpened it: this now runs during
+    an interactive command, right after a ten-megabyte download, and a
+    Ctrl-C during a long download is the exact case the index was made
+    atomic for."""
+
+	def setUp(self):
+		self.dir = tempfile.mkdtemp(prefix="emerge-anc-write-")
+		self.addCleanup(shutil.rmtree, self.dir, True)
+		self.conf = {"archive-dir": os.path.join(self.dir, "archive")}
+		self.src = os.path.join(self.dir, "shipped")
+		with open(self.src, "w") as f:
+			f.write("shipped\n")
+
+	def dest(self):
+		return em.archive_path(self.conf, "/etc/app.conf")
+
+	def test_it_stores_the_content(self):
+		em._store_ancestor(self.conf, "/etc/app.conf", self.src)
+		with open(self.dest()) as f:
+			self.assertEqual(f.read(), "shipped\n")
+
+	def test_a_failed_write_leaves_the_previous_ancestor_intact(self):
+		em._store_ancestor(self.conf, "/etc/app.conf", self.src)
+		with open(self.src, "w") as f:
+			f.write("newer\n")
+		real = em.os.replace
+		em.os.replace = lambda *a: (_ for _ in ()).throw(OSError(28, "full"))
+		self.addCleanup(setattr, em.os, "replace", real)
+		with self.assertRaises(OSError):
+			em._store_ancestor(self.conf, "/etc/app.conf", self.src)
+		with open(self.dest()) as f:
+			self.assertEqual(f.read(), "shipped\n", "the old one was lost")
+
+	def test_a_failed_write_leaves_no_temporary_behind(self):
+		real = em.os.replace
+		em.os.replace = lambda *a: (_ for _ in ()).throw(OSError(28, "full"))
+		self.addCleanup(setattr, em.os, "replace", real)
+		with self.assertRaises(OSError):
+			em._store_ancestor(self.conf, "/etc/app.conf", self.src)
+		self.assertEqual(os.listdir(os.path.dirname(self.dest())), [])
+
+	def test_the_mode_survives_the_rename(self):
+		"""os.replace swaps in a new inode and copy2 preserved the mode: the
+        ancestor of a conffile that is mode 600 must not come out
+        world-readable."""
+		os.chmod(self.src, 0o600)
+		em._store_ancestor(self.conf, "/etc/app.conf", self.src)
+		self.assertEqual(os.stat(self.dest()).st_mode & 0o777, 0o600)
 
 
 class TestConfigWrite(unittest.TestCase):

@@ -433,7 +433,17 @@ for dispatch-conf compatibility, which
 overrides.
 .TP
 .I /var/lib/emerge/config-archive
-As-shipped config files, used as the ancestor for 3-way merges.
+As-shipped config files, used as the ancestor for 3-way merges. Written
+atomically, so an interrupted run cannot leave a truncated ancestor \(em
+which would parse cleanly and misdirect every later merge of that file.
+.TP
+.I /var/log/dpkg.log
+Read to learn which version a config file was shipped with. Its rotations
+are read too. A machine with a volatile
+.I /var/log
+has none, and no ancestor can then be identified;
+.B emerge --info
+reports which of these are in play.
 .TP
 .I /var/lib/emerge-dpkg/world
 The world file (dpkg backend only).

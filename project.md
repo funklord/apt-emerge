@@ -776,6 +776,40 @@ object the test process uses, and this file has three leaked patches in
 its history to show for that kind of shortcut — one of them added while
 writing *these* tests, and caught by the sentinel rather than by review.
 
+### The archive was the fourth thing to need an atomic write
+
+`_store_ancestor` used `shutil.copy2`, which writes straight over the
+destination — the exact shape `write_atomic` exists to remove, and the
+same failure the world file, the config file and the index each had in
+turn. A torn ancestor is not an unreadable one: it parses perfectly with
+lines missing, and every later 3-way merge is then made against a file the
+package never shipped, which is a wrong merge rather than an error.
+
+It was survivable while this ran only after a successful install.
+Recovery sharpened it — the archive is now written during an interactive
+command, immediately after a ten-megabyte download, and "Ctrl-C during a
+long download" is the precise case the index was made atomic for.
+
+`prepare` carries the mode across, because `os.replace` swaps in a new
+inode and `copy2` preserved it: the ancestor of a conffile that is mode
+600 must not come out world-readable. A test that already existed for
+that caught the omission when it was mutated away, which is the check
+doing its job a second time.
+
+### `--info` said nothing about any of this
+
+The rule for that block is that its rows come from this program's own
+failures, and config merging's failures are all quiet ones: a review that
+only ever offers a 2-way merge looks like a design choice rather than a
+missing ancestor. The three things that decide it were invisible from
+outside — an empty archive, `recover-ancestor=no`, and an absent
+`/var/log/dpkg.log`. All three are rows now, with the pending count
+beside them.
+
+Measured before adding them, since `--info` is supposed to answer and
+exit: no change, 0.4–0.5s either way, because the cost is dominated by
+session detection rather than by walking `/etc`.
+
 ### The log is evidence about the log, not about the system
 
 `previous_version` walks `dpkg.log` to conclude something about the

@@ -3570,9 +3570,30 @@ def pkg_conffiles(pkg):
 	return conffiles_of([pkg]).get(pkg, [])
 
 def _store_ancestor(conf, target, source):
+	"""Record the as-shipped content of one file, atomically.
+
+    `shutil.copy2` writes straight over the destination, which is the shape
+    `write_atomic` exists to remove -- and the archive is the fourth piece
+    of state to need it, after the world file, the config file and the
+    index. A torn ancestor is not an unreadable one: it parses perfectly
+    with lines missing, and every later 3-way merge is then made against a
+    file the package never shipped, which is a wrong merge rather than an
+    error.
+
+    Recovery sharpened it. This used to run only after a successful
+    install; it now also runs during an interactive command, immediately
+    after a ten-megabyte download, and Ctrl-C during a long download is the
+    exact case the index was made atomic for.
+
+    `copystat` rather than nothing in `prepare`, because `os.replace` swaps
+    in a new inode and `copy2` preserved the mode: an ancestor of a
+    conffile that is mode 600 must not become world-readable."""
 	dest = archive_path(conf, target)
 	os.makedirs(os.path.dirname(dest), exist_ok=True)
-	shutil.copy2(source, dest)
+	with open(source, "rb") as f:
+		data = f.read()
+	write_atomic(dest, data, prepare=lambda tmp: shutil.copystat(source, tmp),
+	             suffix=".emerge-tmp")
 
 def archive_settled(conf, packages):
 	"""Record the as-shipped state of config files AFTER a merge.
@@ -4925,6 +4946,30 @@ def show_info(backend_flag):
 		    else f"{WORLD} (not created yet)")
 		row("Package tree", TREE_DIR if os.path.isdir(TREE_DIR)
 		    else f"{TREE_DIR} (run --sync)")
+
+	# Config merging, whose failures are all quiet ones: a review that only
+	# ever offers a 2-way merge looks like a design choice rather than a
+	# missing ancestor, and the three things that decide it are invisible
+	# from the outside. Every row here answers a question somebody would
+	# otherwise have to be walked through.
+	try:
+		cconf = load_conf()
+		archived = sum(len(files) for _, _, files
+		               in os.walk(cconf["archive-dir"]))
+		row("Config archive", f"{cconf['archive-dir']}: {archived} file(s)"
+		    + (" -- reviews are 2-way until it fills" if not archived
+		       else ""))
+		row("Ancestor recovery",
+		    "on" if conf_yes(cconf, "recover-ancestor")
+		    else "off (recover-ancestor=no)")
+		row("Config files pending", str(len(scan_pending(cconf))))
+	except OSError as e:
+		row("Config archive", f"unreadable: {e.strerror}")
+	# Recovery reads this to learn which version to look for, and a machine
+	# with a volatile /var/log -- or a container image -- simply has none.
+	logs = sum(1 for _ in dpkg_log_lines())
+	row("dpkg log", f"{DPKG_LOG}: {logs} line(s)" if logs
+	    else f"{DPKG_LOG}: empty or absent (no ancestor can be identified)")
 
 	leaders = _find_session_leaders()
 	row("Graphical session",
