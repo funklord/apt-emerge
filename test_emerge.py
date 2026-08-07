@@ -859,6 +859,54 @@ class TestMerge2(unittest.TestCase):
 			self.assertTrue(line.endswith("\n"), out)
 
 
+class TestNativeArch(unittest.TestCase):
+	"""One spelling of "what architecture is this", where there were three.
+
+    They disagreed about every way it can fail -- no fallback, "unknown",
+    and "all" -- which is the sort of difference that is invisible until
+    the day one of them is the one that runs."""
+
+	def setUp(self):
+		self.mod = load()
+
+	def patch_which(self, fn):
+		original = self.mod.shutil.which
+		self.addCleanup(setattr, self.mod.shutil, "which", original)
+		self.mod.shutil.which = fn
+
+	def test_it_reads_the_architecture(self):
+		self.mod.capture = lambda cmd, env=None: types.SimpleNamespace(
+		    stdout="amd64\n", returncode=0)
+		self.patch_which(lambda n: "/usr/bin/" + n)
+		self.assertEqual(self.mod.native_arch(), "amd64")
+
+	def test_a_missing_dpkg_gives_the_caller_s_default(self):
+		self.patch_which(lambda n: None)
+		self.assertEqual(self.mod.native_arch(), "unknown")
+		self.assertEqual(self.mod.native_arch("all"), "all")
+
+	def test_an_empty_answer_gives_the_caller_s_default(self):
+		"""dpkg present but saying nothing -- previously an empty string in
+        two of the three call sites, which then went into a filename or an
+        index path."""
+		self.mod.capture = lambda cmd, env=None: types.SimpleNamespace(
+		    stdout="\n", returncode=0)
+		self.patch_which(lambda n: "/usr/bin/" + n)
+		self.assertEqual(self.mod.native_arch("all"), "all")
+
+	def test_it_reads_under_the_c_locale_like_every_other_parsed_output(self):
+		"""Harmless here, since the output is not translated -- but an
+        exception to that rule which is safe only by accident is one the
+        next reader has to re-derive."""
+		seen = {}
+		self.mod.capture = lambda cmd, env=None: (
+		    seen.update(env or {}), types.SimpleNamespace(
+		        stdout="amd64\n", returncode=0))[1]
+		self.patch_which(lambda n: "/usr/bin/" + n)
+		self.mod.native_arch()
+		self.assertEqual(seen.get("LC_ALL"), "C")
+
+
 class TestAncestorRecovery(unittest.TestCase):
 	"""Finding the version a config file was shipped with, when nothing
     archived it.

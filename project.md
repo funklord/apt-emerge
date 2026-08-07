@@ -2270,6 +2270,17 @@ to be true for it to fail, and go and make that true.
   `main()` now, once, so both give the same message; the apt path also
   surfaces an `E:` on stderr, since POSIX extended regex is not Python's
   dialect and may refuse something Python accepted.
+- **Three spellings of "what architecture is this"** had accumulated, and
+  they disagreed about every way it can fail rather than about the answer:
+  `sync` inherited the ambient locale and had no fallback, `--info`
+  guarded on dpkg being present and said `unknown`, and ancestor recovery
+  guarded on nothing and said `all`. Differences that exist only because
+  of which caller was written when. `native_arch(default)` is the one
+  spelling now. The locale half is the part worth keeping in mind: the
+  output is a bare architecture string and is not translated, so
+  inheriting the locale was safe *by accident*, and an exception to
+  "anything whose output is read runs under `parse_env()`" which is safe
+  by accident is one the next reader has to re-derive.
 - Never fork per search result. `emerge -s '^lib'` matches 29,185 packages;
   one `apt-cache policy` per hit meant the search never finished. Batch it.
   The same mistake reappeared in `archive_settled`, which forked

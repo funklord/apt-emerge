@@ -1330,6 +1330,27 @@ def system_set(inst):
 # Sources: /etc/apt/sources.list + deb822 *.sources (http, https, file)
 # ---------------------------------------------------------------------------
 
+def native_arch(default="unknown"):
+	"""What dpkg calls this machine's architecture.
+
+    One spelling, because there were three and they disagreed about every
+    way it can fail: `sync` inherited the ambient locale and had no
+    fallback, `--info` guarded on dpkg being present and said "unknown",
+    and ancestor recovery guarded on nothing and said "all". Three answers
+    to one question, differing only in which caller happened to be written
+    when.
+
+    The locale part is the one that could have bitten: this output is a
+    bare architecture string and is not translated, so inheriting the
+    locale was harmless here -- but every other command whose output this
+    program *reads* goes through parse_env(), and an exception to that
+    rule which is safe only by accident is one the next reader has to
+    re-derive."""
+	if not shutil.which("dpkg"):
+		return default
+	out = capture(["dpkg", "--print-architecture"], env=parse_env()).stdout
+	return out.strip() or default
+
 def read_sources():
 	"""Return [(base_url, suite, [components], signed_by)]. A suite ending in
     '/' is a flat repository. `signed_by` is the keyring path (or inline key
@@ -1919,7 +1940,7 @@ class DpkgBackend:
 	def sync(self, verify=True):
 		need_root()
 		os.makedirs(TREE_DIR, exist_ok=True)
-		a = capture(["dpkg", "--print-architecture"]).stdout.strip()
+		a = native_arch()
 		sources = read_sources()
 		if not sources:
 			eerror("No sources found in /etc/apt/sources.list[.d]. "
@@ -4063,8 +4084,7 @@ def recover_ancestors(conf, targets, verifier=None, deadline=None):
 	# Keying the whole path by name:architecture is the same piece of work
 	# the dpkg backend declined for the same reason, and is recorded there:
 	# detect and degrade rather than half-support.
-	arch = capture(["dpkg", "--print-architecture"], env=parse_env()).stdout
-	arch = arch.strip() or "all"
+	arch = native_arch("all")
 	verifier = verifier if verifier is not None else \
 	          Verifier(timeout=ANCESTOR_TIMEOUT)
 	if deadline is None:
@@ -4910,9 +4930,7 @@ def show_info(backend_flag):
 
 	row("dpkg", version_of("dpkg", "--version"))
 	row("apt-get", version_of("apt-get", "--version"))
-	arch = capture(["dpkg", "--print-architecture"],
-	               env=parse_env()).stdout.strip() if shutil.which("dpkg") \
-	    else "unknown"
+	arch = native_arch()
 	foreign = capture(["dpkg", "--print-foreign-architectures"],
 	                  env=parse_env()).stdout.split() \
 	    if shutil.which("dpkg") else []
