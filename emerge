@@ -1642,8 +1642,17 @@ class Verifier:
     and continue, so turning this on cannot break a setup that worked before
     -- it only ever adds a guarantee where one is available."""
 
-	def __init__(self, enabled=True):
+	def __init__(self, enabled=True, timeout=60):
 		self.wanted = enabled
+		# Per *socket operation*, not per transfer, so a slow-but-moving
+		# download is unaffected and only a stalled connection trips it.
+		# --sync keeps the 60s default; ancestor recovery asks for less,
+		# because it makes far more of these requests and none of them is
+		# what the user asked the command to do.
+		self.timeout = timeout
+		# Set by a caller that noticed a request stall rather than fail, so
+		# the rest of a pass can stop asking. Nothing in --sync reads it.
+		self.stalled = False
 		self.enabled = enabled and bool(shutil.which("gpgv"))
 		if enabled and not self.enabled:
 			ewarn("gpgv not found: repository signatures will NOT be checked "
@@ -1738,7 +1747,7 @@ class Verifier:
 		text = None
 		# InRelease (inline signature) first, then detached Release+Release.gpg
 		try:
-			raw = fetch(stem + "InRelease")
+			raw = fetch(stem + "InRelease", timeout=self.timeout)
 			if self._gpgv(ring, self._tmpfile(raw, ".InRelease")):
 				text = clearsigned_payload(raw.decode("utf-8", "replace"))
 			else:
@@ -1749,8 +1758,8 @@ class Verifier:
 			pass
 		if text is None:
 			try:
-				rel = fetch(stem + "Release")
-				sig = fetch(stem + "Release.gpg")
+				rel = fetch(stem + "Release", timeout=self.timeout)
+				sig = fetch(stem + "Release.gpg", timeout=self.timeout)
 				rel_path = self._tmpfile(rel, ".Release")
 				if not self._gpgv(ring, self._tmpfile(sig, ".gpg"), rel_path):
 					raise RuntimeError(
@@ -3637,6 +3646,23 @@ def ancestor_for(conf, path):
 # of that trade, given a wrong ancestor makes a *wrong merge* rather than a
 # visible failure.
 
+# A network that refuses a connection fails at once; one that drops the
+# packets does not, and urllib's default leaves each request sitting for a
+# minute. That is per request, and recovery makes a lot of them: a fetch
+# tries InRelease and then detached Release plus Release.gpg, for every
+# source, for every package -- and the timestamp is part of the snapshot
+# URL, so the Verifier's per-source cache does not span two packages. A
+# twenty-package review behind a black-holing firewall is hours of a
+# command whose actual job is reviewing config files.
+#
+# So: a shorter socket timeout, and a ceiling on the whole pass. The
+# ceiling is what really bounds it, since the timeout only bounds one
+# request. Both are generous against the measured cost -- 0.1s for a
+# Release, 0.7s for a 10 MB index -- because the point is to catch a
+# network that is not answering, not to hurry one that is.
+ANCESTOR_TIMEOUT = 15            # seconds, per socket operation
+ANCESTOR_BUDGET  = 120           # seconds, for the whole recovery pass
+
 SNAPSHOT_URL     = "https://snapshot.debian.org/archive"
 SNAPSHOT_ARCHIVES = ("debian", "debian-security", "debian-ports")
 DPKG_LOG         = "/var/log/dpkg.log"
@@ -3798,9 +3824,19 @@ def _apt_downloaded_deb(name, version, into):
     indexes, which is the same guarantee the snapshot path builds by hand."""
 	if not shutil.which("apt-get"):
 		return None
-	r = subprocess.run(["apt-get", "download", "-qq", f"{name}={version}"],
-	                   cwd=into, stdout=subprocess.DEVNULL,
-	                   stderr=subprocess.DEVNULL, env=parse_env())
+	try:
+		# apt carries its own timeouts and retries, which are tuned for a
+		# command someone asked to run rather than for an optional lookup
+		# inside one: Acquire::http::Timeout alone is 120s by default, and
+		# apt will retry. Bound it here to the same budget the rest of the
+		# pass gets, and take a timeout as "not available from apt".
+		r = subprocess.run(["apt-get", "download", "-qq",
+		                    f"{name}={version}"],
+		                   cwd=into, stdout=subprocess.DEVNULL,
+		                   stderr=subprocess.DEVNULL, env=parse_env(),
+		                   timeout=ANCESTOR_BUDGET)
+	except subprocess.TimeoutExpired:
+		return None
 	if r.returncode != 0:
 		return None
 	for f in sorted(os.listdir(into)):
@@ -3817,7 +3853,8 @@ def _index_stanza(text, name, version, arch):
 			return stanza
 	return None
 
-def _snapshot_deb(verifier, name, version, arch, when, into):
+def _snapshot_deb(verifier, name, version, arch, when, into,
+                  deadline=None):
 	"""The .deb from snapshot.debian.org, through the chain --sync uses.
 
     Every link is the machine's own: the suites and keyrings come from its
@@ -3834,10 +3871,13 @@ def _snapshot_deb(verifier, name, version, arch, when, into):
 		      "not fetching one")
 		return None
 	for base, suite, comps, signed_by in read_sources():
+		if deadline is not None and time.monotonic() > deadline:
+			return None
 		archive = base.rstrip("/").rsplit("/", 1)[-1]
 		if archive not in SNAPSHOT_ARCHIVES or suite.endswith("/"):
 			continue                       # not on snapshot, or a flat repo
 		snap = f"{SNAPSHOT_URL}/{archive}/{when}"
+		started = time.monotonic()
 		try:
 			text = verifier.release(snap, suite, signed_by)
 		except RuntimeError as e:
@@ -3856,6 +3896,18 @@ def _snapshot_deb(verifier, name, version, arch, when, into):
 		except (urllib.error.URLError, OSError):
 			continue
 		if not text:
+			# A request that *stalls* is different from one that fails, and
+			# the difference is worth acting on: a refused connection or a
+			# 404 costs nothing and the next source is worth trying, while
+			# a network that accepts and never answers will do the same to
+			# every source and every package after this one. Measured
+			# rather than caught by exception type, because socket.timeout
+			# only became TimeoutError in 3.10 and this runs on 3.9.
+			if time.monotonic() - started >= verifier.timeout:
+				verifier.stalled = True
+				ewarn("  the network is not answering; giving up on "
+				      "fetching ancestors for this run")
+				return None
 			continue
 		hashes = release_hashes(text)
 		for comp in comps:
@@ -3871,7 +3923,8 @@ def _snapshot_deb(verifier, name, version, arch, when, into):
 					# Aborting the whole review over one oversized index
 					# would let any source take the command down with it.
 					raw = fetch(f"{snap}/dists/{suite}/{relpath}",
-					            limit=MAX_INDEX_BYTES)
+					            limit=MAX_INDEX_BYTES,
+					            timeout=ANCESTOR_TIMEOUT)
 				except (urllib.error.URLError, OSError, ValueError,
 				        RuntimeError):
 					break
@@ -3892,7 +3945,8 @@ def _snapshot_deb(verifier, name, version, arch, when, into):
 				try:
 					size = int(stanza.get("Size", MAX_DEB_BYTES))
 					deb = fetch(f"{snap}/{stanza['Filename']}",
-					            limit=min(size, MAX_DEB_BYTES))
+					            limit=min(size, MAX_DEB_BYTES),
+					            timeout=ANCESTOR_TIMEOUT)
 				except (urllib.error.URLError, OSError, ValueError, KeyError,
 				        RuntimeError):
 					break
@@ -3937,14 +3991,21 @@ def _conffiles_from_deb(deb, paths, into):
 			out[p] = got
 	return out
 
-def recover_ancestors(conf, targets, verifier=None):
+def recover_ancestors(conf, targets, verifier=None, deadline=None):
 	"""Archive the previously shipped version of files that have none.
 
     Best effort throughout: anything that does not work leaves the file to a
     2-way review, which is what it would have had anyway. The one thing that
     is *not* tolerated is a file that fails its hash against the signed
     index -- that is a failure rather than an inability, and it stops the
-    run the way a bad index does in --sync."""
+    run the way a bad index does in --sync.
+
+    `deadline` is an absolute `time.monotonic()` value; the pass gives up
+    on whatever is left once it is past. It is a parameter rather than an
+    interval so a test can hand over one already spent, without patching
+    the clock -- `time` is the same module object the test process uses,
+    and this file has three leaked patches in its history to show for
+    that kind of shortcut."""
 	pending = [t for t in targets if ancestor_for(conf, t)[0] is None]
 	if not pending:
 		return 0
@@ -3960,10 +4021,17 @@ def recover_ancestors(conf, targets, verifier=None):
 	      f"looking for the version each was shipped with")
 	arch = capture(["dpkg", "--print-architecture"], env=parse_env()).stdout
 	arch = arch.strip() or "all"
-	verifier = verifier if verifier is not None else Verifier()
+	verifier = verifier if verifier is not None else \
+	          Verifier(timeout=ANCESTOR_TIMEOUT)
+	if deadline is None:
+		deadline = time.monotonic() + ANCESTOR_BUDGET
 	history = package_histories(list(by_pkg))
 	found = 0
 	for pkg, paths in sorted(by_pkg.items()):
+		if time.monotonic() > deadline:
+			ewarn(f"  giving up after {ANCESTOR_BUDGET}s; the rest get a "
+			      f"2-way review")
+			break
 		version, when = _previous(history[pkg])
 		if not version:
 			continue
@@ -3973,8 +4041,9 @@ def recover_ancestors(conf, targets, verifier=None):
 			if deb is None:
 				deb = _apt_downloaded_deb(pkg, version, td)
 				where = "archive"
-			if deb is None:
-				deb = _snapshot_deb(verifier, pkg, version, arch, when, td)
+			if deb is None and not verifier.stalled:
+				deb = _snapshot_deb(verifier, pkg, version, arch, when,
+				                    td, deadline)
 				where = "snapshot.debian.org"
 			if deb is None:
 				ewarn(f"  {pkg} {version}: not found; "

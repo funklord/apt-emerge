@@ -733,6 +733,49 @@ stubbed tests insufficient: bypassing `check_index` left every end-to-end
 test passing. A tampered `.deb` and a tampered index both stop the run; an
 untrusted signature recovers nothing and says why.
 
+### Bounding it, for the network that does not answer
+
+A refused connection fails at once; one whose packets are dropped does
+not, and urllib's default leaves each request sitting for a minute. That
+is *per request*, and recovery makes a lot of them: a verify tries
+InRelease and then detached Release, for every source, for every package
+— and since the timestamp is part of the snapshot URL, the `Verifier`'s
+per-source cache does not span two packages. Left alone, an eight-file
+review behind a black-holing firewall is over an hour of a command whose
+actual job is reviewing config files.
+
+Three bounds, and the third is what makes it bearable rather than merely
+finite:
+
+- **A shorter socket timeout** for recovery (`ANCESTOR_TIMEOUT`, 15s)
+  than `--sync` keeps (60s). It is per socket *operation*, so a slow but
+  moving download is unaffected and only a stalled connection trips it.
+  The `Verifier` takes it as a constructor argument, because it makes the
+  first request and therefore the one that hangs.
+- **A ceiling on the whole pass** (`ANCESTOR_BUDGET`, 120s), since the
+  timeout only ever bounds one request. `apt-get download` gets it too:
+  apt's own `Acquire::http::Timeout` is 120s *and* it retries, which is
+  tuned for a command someone asked to run rather than a lookup inside
+  one.
+- **Noticing the difference between a stall and a miss.** A 404 costs
+  nothing and the next source is worth trying; a socket that accepts and
+  never answers will do the same to every source and every package
+  behind it. When a source's verify both fails *and* takes at least the
+  timeout, the run stops asking. Detected by measuring rather than by
+  exception type, because `socket.timeout` only became `TimeoutError` in
+  3.10 and this runs on 3.9.
+
+Measured against a listener that accepts connections and never replies,
+eight files: **unbounded → 120.2s with the budget alone → 30.1s** with
+the stall check, and it says why rather than going quiet. The working
+path is unchanged — `/etc/nanorc` still recovers in about three seconds.
+
+The budget is a parameter rather than an interval so a test can hand over
+one already spent without patching the clock. `time` is the same module
+object the test process uses, and this file has three leaked patches in
+its history to show for that kind of shortcut — one of them added while
+writing *these* tests, and caught by the sentinel rather than by review.
+
 ### What a self-audit of the recovery found
 
 Asked "what else did you miss", and worth recording because the answer was

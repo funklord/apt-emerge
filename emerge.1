@@ -338,7 +338,11 @@ recovered file is trusted no further than the archive keys reach. Set
 .I recover-ancestor
 to
 .B no
-to keep a config review off the network.
+to keep a config review off the network. Requests it makes are bounded:
+a shorter socket timeout than
+.B --sync
+uses, a ceiling on the whole pass, and a check that gives up on the
+network once a source accepts a connection without answering it.
 .PP
 Where no ancestor can be had, the merged and edit choices are still
 offered: with no ancestor a change cannot be attributed to either side, so

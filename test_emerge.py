@@ -992,10 +992,84 @@ class TestAncestorRecovery(unittest.TestCase):
 		    stdout="amd64\n", returncode=0)
 		self.mod.einfo = self.mod.ewarn = lambda msg: None
 		self.mod.Verifier = lambda *a, **k: types.SimpleNamespace(
-		    enabled=False)
+		    enabled=False, stalled=False, timeout=15)
 		self.mod.recover_ancestors({"archive-dir": "/nonexistent"},
 		                           ["/etc/a", "/etc/b"])
 		self.assertEqual(len(passes), 1, "one pass, not one per package")
+
+	def _recovery_stubs(self):
+		"""Everything recovery touches except the part under test."""
+		self.mod.owners_of = lambda paths, chunk=500: {
+		    p: f"pkg{i}" for i, p in enumerate(paths)}
+		self.mod.ancestor_for = lambda conf, path: (None, None)
+		self.mod._cached_deb = lambda *a: None
+		self.mod._apt_downloaded_deb = lambda *a, **k: None
+		self.mod.capture = lambda cmd, env=None: types.SimpleNamespace(
+		    stdout="amd64\n", returncode=0)
+		self.mod.package_histories = lambda names, lines=None: {
+		    n: [("20260101T000000Z", "1.0"), ("20260201T000000Z", "1.1")]
+		    for n in names}
+		self.warnings = []
+		self.mod.einfo = lambda msg: None
+		self.mod.ewarn = self.warnings.append
+
+	def test_a_spent_budget_gives_up_instead_of_working_through_them(self):
+		"""A network that drops packets rather than refusing leaves every
+        request sitting for the socket timeout, and recovery makes a lot of
+        them -- three per source per package, since the timestamp is in the
+        snapshot URL and the per-source cache cannot span two packages. The
+        per-request timeout bounds one request; only this bounds the pass."""
+		self._recovery_stubs()
+		tried = []
+		self.mod._snapshot_deb = lambda *a, **k: tried.append(a[1])
+		self.mod.recover_ancestors({"archive-dir": "/nonexistent"},
+		                           ["/etc/a", "/etc/b", "/etc/c"],
+		                           deadline=time.monotonic() - 1)
+		self.assertEqual(tried, [], "nothing should be attempted")
+		self.assertTrue(any("giving up" in w for w in self.warnings),
+		                self.warnings)
+
+	def test_a_stall_stops_the_remaining_packages_asking_too(self):
+		"""Noticing the stall in one package is only half of it: without
+        this, every package behind it repeats the same wait and the pass
+        spends its whole budget instead of one request's worth. Measured
+        against a socket that accepts and never answers: 120s becomes 30s."""
+		self._recovery_stubs()
+		tried = []
+		self.mod._snapshot_deb = lambda *a, **k: tried.append(a[1])
+		self.mod.recover_ancestors(
+		    {"archive-dir": "/nonexistent"}, ["/etc/a", "/etc/b"],
+		    verifier=types.SimpleNamespace(enabled=True, stalled=True,
+		                                   timeout=15))
+		self.assertEqual(tried, [])
+
+	def test_the_deadline_reaches_the_thing_that_does_the_waiting(self):
+		"""Passing it into recover_ancestors is not enough -- the requests
+        are made further down, and a budget the fetching code never sees
+        bounds nothing."""
+		self._recovery_stubs()
+		seen = []
+		self.mod._snapshot_deb = lambda *a, **k: seen.append(a[-1])
+		# In the future, because monotonic() counts from boot: a small
+		# constant is a deadline already spent, and the first version of
+		# this test asserted against one, which the give-up path answered
+		# by never calling the function at all.
+		when = time.monotonic() + 1000
+		self.mod.recover_ancestors({"archive-dir": "/nonexistent"},
+		                           ["/etc/a"], deadline=when)
+		self.assertEqual(seen, [when])
+
+	def test_a_source_is_dropped_once_the_budget_is_gone(self):
+		self.mod.read_sources = lambda: [
+		    ("http://deb.debian.org/debian", "trixie", ["main"], None)]
+		fetched = []
+		self.mod.fetch = lambda url, timeout=60, limit=None: \
+		    fetched.append(url)
+		v = types.SimpleNamespace(enabled=True, stalled=False, timeout=15)
+		self.assertIsNone(self.mod._snapshot_deb(
+		    v, "bash", "1.0", "amd64", "20260410T120436Z", "/tmp",
+		    deadline=time.monotonic() - 1))
+		self.assertEqual(fetched, [])
 
 	def test_a_diversion_is_not_read_as_a_package_name(self):
 		"""dpkg-query answers a diverted path with
@@ -1046,6 +1120,20 @@ class TestAncestorRecovery(unittest.TestCase):
 		self.assertTrue(got and got.endswith("bash_5.2.37-2+b8_amd64.deb"))
 		self.assertIn("bash=5.2.37-2+b8", seen[0])
 
+	def test_an_apt_download_that_hangs_is_given_up_on(self):
+		"""apt's own timeouts are tuned for a command someone asked to run:
+        Acquire::http::Timeout alone is 120s, and it retries. Inside an
+        optional lookup that is the same unbounded wait by another road."""
+		d = tempfile.mkdtemp(prefix="emerge-aptdl-")
+		self.addCleanup(shutil.rmtree, d, True)
+		passed = {}
+		def fake_run(cmd, **kw):
+			passed.update(kw)
+			raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+		self.patch_run(fake_run)
+		self.assertIsNone(self.mod._apt_downloaded_deb("bash", "1.0", d))
+		self.assertTrue(passed.get("timeout"), "no timeout was asked for")
+
 	def test_a_failed_apt_download_is_not_used_even_if_it_left_a_file(self):
 		"""An interrupted download exits non-zero having written part of a
         .deb. Taking the file anyway hands dpkg-deb a truncated archive --
@@ -1082,6 +1170,8 @@ class TestSnapshotChain(unittest.TestCase):
 		mod = self.mod
 		class V:
 			enabled = True
+			stalled = False
+			timeout = 15
 			def release(self, base, suite, signed_by=None):
 				return "SHA256:\n x 1 main/binary-amd64/Packages\n"
 			def check_index(self, base, suite, signed_by, relpath, raw):
@@ -1138,6 +1228,88 @@ class TestSnapshotChain(unittest.TestCase):
 		self.assertIsNone(self.mod._snapshot_deb(v, "bash", "1.0", "amd64",
 		                                         "20260410T120436Z", "/tmp"))
 		self.assertEqual(self.fetched, [])
+
+	def test_recovery_asks_for_a_shorter_socket_timeout_than_sync(self):
+		"""Every request recovery makes, including the Release the Verifier
+        fetches -- which is the first one, and the one that hangs when the
+        network is not answering."""
+		timeouts = []
+		def fake(url, timeout=60, limit=None):
+			timeouts.append(timeout)
+			return self.index.encode() if url.endswith("Packages") else b"deb"
+		self.mod.fetch = fake
+		d = tempfile.mkdtemp(prefix="emerge-snap-")
+		self.addCleanup(shutil.rmtree, d, True)
+		self.mod._snapshot_deb(self._verifier(), "bash", "1.0", "amd64",
+		                       "20260410T120436Z", d)
+		self.assertTrue(timeouts, "nothing was fetched")
+		self.assertTrue(all(t == self.mod.ANCESTOR_TIMEOUT for t in timeouts),
+		                timeouts)
+		self.assertLess(self.mod.ANCESTOR_TIMEOUT, 60)
+
+	def test_the_verifier_passes_its_timeout_down_to_the_fetch(self):
+		"""The Verifier makes the request recovery cannot reach directly,
+        and it defaults to sync's 60s -- so the constructor argument is the
+        only way the shorter one gets there at all."""
+		timeouts = []
+		self.mod.fetch = lambda url, timeout=60, limit=None: (
+		    timeouts.append(timeout), b"")[1]
+		v = self.mod.Verifier(True, timeout=7)
+		self.addCleanup(v.close)
+		# Set rather than patched into being true: `enabled` depends on
+		# whether the machine has gpgv, and patching shutil.which to
+		# arrange that is how the previous attempt leaked a stdlib
+		# function into every test that followed.
+		v.enabled = True
+		v.keyring = lambda signed_by=None: "/dev/null"
+		v._gpgv = lambda *a: False
+		try:
+			v.release("http://x/debian", "trixie")
+		except RuntimeError:
+			pass
+		self.assertTrue(timeouts and all(t == 7 for t in timeouts), timeouts)
+		self.assertEqual(self.mod.Verifier(False).timeout, 60,
+		                 "sync's default must not change")
+
+	def test_a_stalled_source_stops_the_run_asking_at_all(self):
+		"""A refused connection or a 404 costs nothing and the next source
+        is worth trying. A network that accepts and never answers will do
+        the same to every source and every package behind this one, so the
+        budget alone means two minutes of silence in a review. Noticing
+        turns that into one wait.
+
+        The threshold is `>= verifier.timeout`, so a zero timeout makes
+        every answer a stall -- which is what pins the wiring without
+        making the suite wait for a real one."""
+		self.mod.read_sources = lambda: [
+		    ("http://deb.debian.org/debian", "trixie", ["main"], None),
+		    ("http://deb.debian.org/debian", "trixie-updates", ["main"],
+		     None)]
+		v = self._verifier()
+		asked = []
+		v.timeout = 0
+		v.release = lambda base, suite, signed_by=None: asked.append(suite)
+		self.mod.fetch = self._fetch(lambda u: b"")
+		self.assertIsNone(self.mod._snapshot_deb(
+		    v, "bash", "1.0", "amd64", "20260410T120436Z", "/tmp"))
+		self.assertTrue(v.stalled)
+		self.assertEqual(asked, ["trixie"], "the second source was tried")
+
+	def test_a_source_that_simply_has_nothing_is_not_a_stall(self):
+		"""The other half: a fast miss must leave the run willing to ask
+        the next source, or one 404 turns off recovery for everything."""
+		self.mod.read_sources = lambda: [
+		    ("http://deb.debian.org/debian", "trixie", ["main"], None),
+		    ("http://deb.debian.org/debian", "trixie-updates", ["main"],
+		     None)]
+		v = self._verifier()
+		asked = []
+		v.release = lambda base, suite, signed_by=None: asked.append(suite)
+		self.mod.fetch = self._fetch(lambda u: b"")
+		self.mod._snapshot_deb(v, "bash", "1.0", "amd64",
+		                       "20260410T120436Z", "/tmp")
+		self.assertFalse(v.stalled)
+		self.assertEqual(asked, ["trixie", "trixie-updates"])
 
 	def test_an_oversized_index_is_skipped_not_fatal(self):
 		"""fetch and decompress_bounded raise RuntimeError for their size
