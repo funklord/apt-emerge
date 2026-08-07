@@ -4333,7 +4333,7 @@ def _retire(conf, target, pending):
     Tolerant of failure on purpose. `_accept` calls this *after* writing the
     merged file into `/etc`, so raising here ends the review with the change
     already applied, the parked copy still in place, every later file
-    unreviewed and no summary of what was decided — the same shape a
+    unreviewed and no summary of what was decided -- the same shape a
     mergetool template with no placeholders once produced, and the reason
     that one is guarded.
 

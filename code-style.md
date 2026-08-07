@@ -171,6 +171,17 @@ Unicode.
 **This project is excepted** and does not enable the check: it prints status
 ticks, and that output lives in the source as string literals.
 
+**The exception is what let one through.** `ascii_only` is all-or-nothing,
+so two ticks in `f`-strings switched the check off for the whole file --
+and an em dash reached a comment, where the rule plainly forbids one. Found
+by grepping for it rather than by any gate, and fixed; the two ticks are
+the only non-ASCII left, which is the state the exception was granted for.
+
+The narrower check the project actually wants is ASCII in comments with
+Unicode allowed in string literals -- a distinction `tokenize` makes for
+free. That is a change to the shared tool and therefore to seven trees, so
+it is raised here rather than made.
+
 ## The commit-msg hook
 
 The commit-msg hook is `tools/hooks/commit-msg`, installed with `make hooks`.
