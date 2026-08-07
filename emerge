@@ -3774,12 +3774,14 @@ def package_histories(names, lines=None):
 			got.append((when, version))
 	return out
 
-def package_history(name, lines=None):
-	"""[(when, version)] for one package. See `package_histories`."""
-	return package_histories([name], lines)[name]
-
 def _previous(events, installed=None):
 	"""The version before the current one, and when it was installed.
+
+    The timestamp is when the *old* version was installed, not when it was
+    replaced, and the difference is the whole thing working: at the moment
+    of the upgrade the archive already holds the new version, so a snapshot
+    taken then does not contain the one being looked for. Found by trying
+    it the wrong way round first.
 
     `installed` is the version dpkg says is on the system now. When it is
     given, the log's own last entry must agree with it, and the answer is
@@ -3800,17 +3802,6 @@ def _previous(events, installed=None):
 	if installed is not None and events[-1][1] != installed:
 		return None, None
 	return events[-2][1], events[-2][0]
-
-def previous_version(name, lines=None):
-	"""(version, when it was installed) for the version this machine ran
-    before the current one, or (None, None).
-
-    The timestamp is when the *old* version was installed, not when it was
-    replaced, and the difference is the whole thing working: at the moment
-    of the upgrade the archive already holds the new version, so a snapshot
-    taken then does not contain the one being looked for. Found by trying
-    it the wrong way round first."""
-	return _previous(package_history(name, lines))
 
 def owners_of(paths, chunk=500):
 	"""{path: package} from `dpkg-query -S`, batched.

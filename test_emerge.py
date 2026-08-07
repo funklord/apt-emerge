@@ -879,6 +879,16 @@ class TestAncestorRecovery(unittest.TestCase):
 	def setUp(self):
 		self.mod = load()
 
+	def hist(self, name, lines=None):
+		"""One package's history, through the batched reader the program
+        itself uses. There used to be a `package_history` wrapper in the
+        shipped file for this, and a `previous_version` beside it -- both
+        reachable only from here once the caller was batched, and the
+        second was a trap as well as dead weight: it called `_previous`
+        without `installed`, so anyone reaching for the obvious-looking
+        entry point would have skipped the agreement check."""
+		return self.mod.package_histories([name], lines)[name]
+
 	def patch_run(self, fn):
 		"""Patch subprocess.run and shutil.which for one test.
 
@@ -896,7 +906,7 @@ class TestAncestorRecovery(unittest.TestCase):
 		self.mod.shutil.which = lambda n: "/usr/bin/" + n
 
 	def test_the_ancestor_is_the_version_before_the_current_one(self):
-		v, when = self.mod.previous_version("bash", self.LOG)
+		v, when = self.mod._previous(self.hist("bash", self.LOG))
 		self.assertEqual(v, "5.2.37-2+b8")
 
 	def test_the_timestamp_is_when_the_old_version_was_installed(self):
@@ -905,7 +915,7 @@ class TestAncestorRecovery(unittest.TestCase):
         not contain the one being looked for -- verified against the real
         snapshot.debian.org, which answered "not in trixie/main" for a
         package that plainly had been."""
-		_, when = self.mod.previous_version("bash", self.LOG)
+		_, when = self.mod._previous(self.hist("bash", self.LOG))
 		self.assertTrue(when.startswith("20260410"), when)
 
 	def test_a_reinstall_is_not_a_version_change(self):
@@ -913,7 +923,7 @@ class TestAncestorRecovery(unittest.TestCase):
         change, it makes a package its own ancestor -- and an ancestor
         identical to the new version silently discards the update, which is
         a bug this subsystem has already shipped once by another route."""
-		hist = self.mod.package_history("bash", self.LOG)
+		hist = self.hist("bash", self.LOG)
 		self.assertEqual([v for _, v in hist],
 		                 ["5.2.37-2+b8", "5.2.37-2+b9"])
 
@@ -928,14 +938,14 @@ class TestAncestorRecovery(unittest.TestCase):
 
         A missing ancestor is safe; a wrong one is not, so disagreement
         means give up."""
-		events = self.mod.package_history("bash", self.LOG)
+		events = self.hist("bash", self.LOG)
 		self.assertEqual(self.mod._previous(events, "5.2.37-2+b9")[0],
 		                 "5.2.37-2+b8", "the agreeing case must still work")
 		self.assertEqual(self.mod._previous(events, "6.0-1"), (None, None))
 
 	def test_an_unknown_installed_version_does_not_veto(self):
 		"""Not knowing is different from disagreeing."""
-		events = self.mod.package_history("bash", self.LOG)
+		events = self.hist("bash", self.LOG)
 		self.assertEqual(self.mod._previous(events, None)[0], "5.2.37-2+b8")
 
 	def test_recovery_skips_a_package_whose_log_is_behind(self):
@@ -950,11 +960,11 @@ class TestAncestorRecovery(unittest.TestCase):
 		self.assertEqual(tried, [])
 
 	def test_a_package_installed_once_has_no_ancestor(self):
-		self.assertEqual(self.mod.previous_version("nano", self.LOG),
+		self.assertEqual(self.mod._previous(self.hist("nano", self.LOG)),
 		                 (None, None))
 
 	def test_an_unknown_package_has_no_ancestor(self):
-		self.assertEqual(self.mod.previous_version("nosuch", self.LOG),
+		self.assertEqual(self.mod._previous(self.hist("nosuch", self.LOG)),
 		                 (None, None))
 
 	def test_the_stamp_is_utc_not_the_local_clock(self):
@@ -982,7 +992,7 @@ class TestAncestorRecovery(unittest.TestCase):
 		with gzip.open(os.path.join(d, "dpkg.log.2.gz"), "wt") as f:
 			f.write("2026-04-15 13:37:29 install p:amd64 <none> 1\n")
 		self.mod.DPKG_LOG = os.path.join(d, "dpkg.log")
-		self.assertEqual([v for _, v in self.mod.package_history("p")],
+		self.assertEqual([v for _, v in self.hist("p")],
 		                 ["1", "2", "3"])
 
 	def test_owners_of_reads_one_batched_dpkg_query(self):
@@ -1122,10 +1132,10 @@ class TestAncestorRecovery(unittest.TestCase):
 		       "2026-02-01 00:00:00 upgrade libfoo:amd64 1.0 1.1\n",
 		       "2026-02-01 00:00:01 upgrade libfoo:i386 1.0 1.1\n"]
 		self.assertEqual([v for _, v in
-		                  self.mod.package_history("libfoo", log)],
+		                  self.hist("libfoo", log)],
 		                 ["1.0", "1.1"])
 		self.assertEqual(self.mod._previous(
-		    self.mod.package_history("libfoo", log), "1.1")[0], "1.0")
+		    self.hist("libfoo", log), "1.1")[0], "1.0")
 
 	def test_two_architectures_that_diverge_yield_no_ancestor(self):
 		"""Where they are genuinely at different versions, the log's last
@@ -1135,7 +1145,7 @@ class TestAncestorRecovery(unittest.TestCase):
 		log = ["2026-01-01 00:00:00 upgrade libfoo:i386 0.9 1.0\n",
 		       "2026-02-01 00:00:00 upgrade libfoo:amd64 1.0 1.1\n"]
 		self.assertEqual(self.mod._previous(
-		    self.mod.package_history("libfoo", log), "1.0"), (None, None))
+		    self.hist("libfoo", log), "1.0"), (None, None))
 
 	def test_a_foreign_arch_package_is_not_found_in_the_native_index(self):
 		"""The documented limitation, pinned so it degrades the safe way. A
