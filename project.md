@@ -1222,6 +1222,25 @@ GNOME session. The record:
   hiding it is the whole of "apt-less" from the program's side, and a local
   HTTP server covers sync over http. What is left is confidence rather than
   coverage: nobody has run it on a machine that genuinely lacks apt.
+
+  **Config merging now has been run there**, which is narrower than the
+  backend but is the part with a network fetch in it. In a `debian:trixie`
+  container with `apt-get` moved aside after the install, the installed
+  package's `--dispatch-conf` recovered `/etc/bash.bashrc`'s ancestor from
+  snapshot.debian.org through the verified chain, 3-way auto-merged it,
+  kept a local edit *and* took the update's change, left no conflict
+  markers, and retired the parked file.
+
+  Three of that harness's own checks were wrong before any of it meant
+  anything, which is the more useful half of the record. `command -v
+  apt-get` reported the file still present after it had been moved,
+  because the shell answers from its hash table — the "apt-less" premise
+  was unverified until `shutil.which` was asked instead. A comparison of
+  the recovered ancestor against the on-disk file asserted something that
+  needn't be true, since one is `+b8`'s and the other `+b9`'s. And a probe
+  for a `Backend:` row found nothing because `--info` names the backend in
+  its banner instead. **A harness lies in the same ways the program does**,
+  and this one lied three times in one run.
 - ~~**Config merging** against real package upgrades that ship conffile
   changes.~~ Done — and it did not need a real box after all, which is worth
   remembering before deferring something else as hardware-only. Two `.debs`
