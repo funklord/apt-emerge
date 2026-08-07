@@ -664,38 +664,74 @@ in the safe direction.** Driving the review over a pipe has Python's
 run reports "mergetool did not produce a result" — indistinguishable from
 the bug being unfixed. Same trap as the colour test, and the same fix.
 
-### Where a first-contact ancestor could come from
+### Recovering the ancestor nobody archived
 
 The archive is written by `archive_settled()` after an install emerge
-itself performed, so a file parked by an upgrade that ran before emerge
-was installed has no ancestor. `merge2` makes that survivable rather than
-a dead end; recovering the real ancestor would make it a proper 3-way
-merge, and the ancestor is a specific, nameable file: the conffile as
-shipped by the version installed *before* the upgrade.
+performed, so a file parked by an upgrade that ran before emerge was
+installed has no ancestor. `merge2` makes that survivable; `recover_
+ancestors()` makes it unnecessary, because the ancestor is a specific,
+nameable file — the conffile as shipped by the version installed *before*
+the upgrade — and it can be fetched.
 
-**The local apt cache is not the source, and this was measured before
-being believed.** Of 789 version-changing upgrades in this box's
-`dpkg.log`, the superseded `.deb` was still in `/var/cache/apt/archives`
-for **25** of them — 3%. apt keeps the `.deb` of the version it installed,
-not the one it replaced. An earlier note here called that route "possible
-but unreliable", which was too kind by an order of magnitude.
+**Settled by the owner: fetch by default, through the full gpgv chain.**
 
-What *is* reliable is the pair of facts either side of it:
+**Where it comes from, cheapest first, and the ordering was measured
+rather than assumed:**
 
-- **Which version to look for is recorded locally.** `/var/log/dpkg.log`
-  logs `upgrade <pkg>:<arch> <old> <new>`, rotated but present, and
-  `/var/log/apt/history.log` carries the same. No network needed to learn
-  the version.
-- **The `.deb` itself is on snapshot.debian.org**, which keeps every
-  version ever published, with an HTTP API that maps package plus version
-  to files and hashes. Extracting one conffile from it needs `dpkg-deb`,
-  which the dpkg backend already requires.
+- **The local apt cache: 25 of 789 upgrades, 3%.** apt keeps the `.deb`
+  of the version it *installed*, not the one it replaced, so the obvious
+  source is almost always empty. An earlier note here called this
+  "possible but unreliable", which was too kind by an order of magnitude.
+- **Still in an enabled repo: 15 of 100.** Common on stable, where a
+  security update supersedes a version `main` still carries. `apt-get
+  download` fetches it and apt verifies it against its own signed indexes,
+  which is the same guarantee the next path builds by hand.
+- **snapshot.debian.org: everything else,** and therefore the main path
+  rather than a fallback. It keeps every version ever published.
 
-That makes it a feature to build rather than a fix to apply, and one with
-a policy question in it rather than only code: it is the first thing in
-this program that would reach the network during a *config review*, and
-snapshot.debian.org is a trust anchor the archive keyring does not cover.
-**Raised with the owner rather than decided in passing.**
+**The chain is the machine's own, link by link.** `read_sources()` gives
+the suites and the keyrings each source pins; the snapshot tree at a
+timestamp is laid out exactly like the live archive, so `Verifier.release`
+and `check_index` — the same code `--sync` uses — verify the Release
+against those keys and the index against that Release. The `.deb` is then
+checked against the SHA256 in that verified index. **Snapshot is trusted
+for transport and nothing else**, which is the point: a hash served
+alongside the file it describes vouches for nothing.
+
+An ancestor that cannot be verified is not used, and refusing costs only a
+2-way review. That is much the cheaper side of the trade, because a wrong
+ancestor does not fail visibly — it silently decides which side of a merge
+wins.
+
+**The timestamp is when the old version was *installed*, not when it was
+replaced**, and getting that backwards is how the first attempt failed:
+at the moment of the upgrade the archive already holds the new version, so
+the chain verified perfectly and reported that `bash=5.2.37-2+b8` was
+never in trixie/main. `/var/log/dpkg.log` records both, rotations
+included. It is local time with no zone, so it is converted through
+`mktime`, which applies the offset in force *then* rather than today's.
+
+Two parsing traps, both pinned by tests:
+
+- **A reinstall is logged as `upgrade pkg 1.0 1.0`.** Counted as a version
+  change it makes a package its own ancestor — and an ancestor identical
+  to the new version discards the update silently, which is the same
+  failure the archive-timing bug produced by another route.
+- **Rotations are not in lexical order.** `dpkg.log.2.gz` is older than
+  `dpkg.log.1`, which is older than `dpkg.log`.
+
+**Verified against the live archive**, not only fixtures: `/etc/bash.bashrc`
+and `/etc/nanorc` both recover their real shipped ancestors through the
+signed chain, byte-identical to the files on disk, in about 3 seconds each
+— dominated by the ~10 MB `Packages` index, which is the price of a real
+chain and is why the result is archived rather than re-fetched. A file no
+package owns (`/etc/sysctl.conf` here) is skipped rather than guessed at.
+
+`AncestorRecoveryEndToEnd` covers all four links with real gpg and a real
+`.deb`, and it exists in that shape because mutation testing found the
+stubbed tests insufficient: bypassing `check_index` left every end-to-end
+test passing. A tampered `.deb` and a tampered index both stop the run; an
+untrusted signature quietly recovers nothing.
 
 **A conffile is bytes, and not necessarily UTF-8 ones.** `read_lines` and
 `_write` pair `encoding="utf-8", errors="surrogateescape"` so a byte that

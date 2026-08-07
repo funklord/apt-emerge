@@ -86,6 +86,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -3262,6 +3263,12 @@ DEFAULT_CONF = {
     "automerge":            "yes",   # apply conflict-free 3-way merges
     "replace-unmodified":   "yes",   # you never touched it -> take theirs
     "replace-wscomments":   "yes",   # only comments/whitespace differ
+	# Fetch the previously shipped version of a file that has no archived
+	# ancestor, so the first review after installing this program is a real
+	# 3-way merge rather than a marked-up 2-way one. On by default because
+	# the ancestor is what makes the merge worth having; set to no on a box
+	# that must not reach the network during a config review.
+    "recover-ancestor":     "yes",
     "mergetool":            "",      # e.g. "meld {mine} {base} {theirs} -o {output}"
 	# Portage's own default, verbatim, in dispatch-conf's positional form.
 	# It is a default rather than an empty string because a review with no
@@ -3609,6 +3616,323 @@ def ancestor_for(conf, path):
 		return lines, "ucf cache"
 	return None, None
 
+# -- recovering an ancestor nobody archived ---------------------------------
+#
+# The archive is written by installs this program performed, so a conffile
+# parked by an upgrade that ran before it was installed has no ancestor and
+# the review falls back to merge2. The real ancestor is a specific, nameable
+# file -- the conffile as shipped by the version installed *before* the
+# upgrade -- and three things can produce it, cheapest first.
+#
+# Measured on the development box rather than assumed, because the obvious
+# answer is the wrong one: of 789 version-changing upgrades in dpkg.log the
+# superseded .deb was still in /var/cache/apt/archives for 25 of them (3%),
+# because apt keeps the .deb of the version it *installed*, not the one it
+# replaced. A further 15 in 100 were still fetchable from an enabled repo.
+# The rest exist only on snapshot.debian.org, which is why the network path
+# is the main one and not a fallback.
+#
+# An ancestor that cannot be verified is not used. It is optional data, so
+# refusing it costs a 2-way review and nothing else -- much the cheaper side
+# of that trade, given a wrong ancestor makes a *wrong merge* rather than a
+# visible failure.
+
+SNAPSHOT_URL     = "https://snapshot.debian.org/archive"
+SNAPSHOT_ARCHIVES = ("debian", "debian-security", "debian-ports")
+DPKG_LOG         = "/var/log/dpkg.log"
+APT_CACHE_DIR    = "/var/cache/apt/archives"
+MAX_DEB_BYTES    = 512 * 1024 * 1024
+
+def dpkg_log_lines():
+	"""Every dpkg.log line this machine still has, oldest first.
+
+    Rotations included: dpkg.log.5.gz is older than dpkg.log.1, which is
+    older than dpkg.log. Sorting by the rotation number descending is what
+    puts them in time order, and time order is what makes the last entry for
+    a package its current version."""
+	base = os.path.dirname(DPKG_LOG)
+	stem = os.path.basename(DPKG_LOG)
+	try:
+		names = os.listdir(base)
+	except OSError:
+		return
+	rotated = []
+	for name in names:
+		if name == stem:
+			continue
+		if not name.startswith(stem + "."):
+			continue
+		tail = name[len(stem) + 1:].removesuffix(".gz")
+		if tail.isdigit():
+			rotated.append((int(tail), name))
+	for _, name in sorted(rotated, reverse=True) + [(0, stem)]:
+		path = os.path.join(base, name)
+		try:
+			if name.endswith(".gz"):
+				with gzip.open(path, "rt", encoding="utf-8",
+				               errors="replace") as f:
+					yield from f
+			else:
+				with open(path, encoding="utf-8", errors="replace") as f:
+					yield from f
+		except OSError:
+			continue
+
+def _log_stamp(date, clock):
+	"""dpkg.log's local timestamp as snapshot.debian.org spells it.
+
+    dpkg writes local time with no zone, and snapshot indexes UTC, so the
+    two differ by the offset in force *then* -- which is not today's offset
+    across a DST boundary. mktime reads it back with the same rules dpkg
+    wrote it under, which is the only conversion that gets that right."""
+	try:
+		local = time.mktime(time.strptime(f"{date} {clock}",
+		                                  "%Y-%m-%d %H:%M:%S"))
+	except ValueError:
+		return None
+	return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(local))
+
+def package_history(name, lines=None):
+	"""[(when, version)] -- every version of `name` this machine has had,
+    oldest first, from dpkg's own log.
+
+    A same-version entry is dropped: dpkg logs a reinstall as
+    `upgrade pkg 1.0 1.0`, and counting that as a change would make a
+    package its own ancestor."""
+	out = []
+	for line in dpkg_log_lines() if lines is None else lines:
+		f = line.split()
+		if len(f) < 6 or f[2] not in ("install", "upgrade"):
+			continue
+		if f[3].split(":")[0] != name:
+			continue
+		version = f[-1]
+		if version == "<none>":
+			continue
+		if out and out[-1][1] == version:
+			continue
+		when = _log_stamp(f[0], f[1])
+		if when:
+			out.append((when, version))
+	return out
+
+def previous_version(name, lines=None):
+	"""(version, when it was installed) for the version this machine ran
+    before the current one, or (None, None).
+
+    The timestamp is when the *old* version was installed, not when it was
+    replaced, and the difference is the whole thing working: at the moment
+    of the upgrade the archive already holds the new version, so a snapshot
+    taken then does not contain the one being looked for. Found by trying
+    it the wrong way round first."""
+	events = package_history(name, lines)
+	if len(events) < 2:
+		return None, None
+	return events[-2][1], events[-2][0]
+
+def owners_of(paths):
+	"""{path: package} from one batched `dpkg-query -S`.
+
+    Batched for the reason recorded elsewhere in this file: one fork per
+    file was measured 163x slower on 200 packages, and a review can easily
+    span that many."""
+	out = {}
+	if not paths:
+		return out
+	r = capture(["dpkg-query", "-S"] + list(paths), env=parse_env())
+	for line in r.stdout.splitlines():
+		pkgs, _, path = line.partition(": ")
+		if not path:
+			continue
+		# "pkg:arch, other: /path" -- diversions and multiarch both show up
+		name = pkgs.split(",")[0].split(":")[0].strip()
+		if name:
+			out[path.strip()] = name
+	return out
+
+def _cached_deb(name, version, arch):
+	"""The .deb apt kept, if it kept this one. Free, and usually absent."""
+	esc = version.replace(":", "%3a")
+	for a in (arch, "all"):
+		path = os.path.join(APT_CACHE_DIR, f"{name}_{esc}_{a}.deb")
+		if os.path.isfile(path):
+			return path
+	return None
+
+def _apt_downloaded_deb(name, version, into):
+	"""The version still in an enabled repo, fetched by apt.
+
+    Nothing more is needed to trust it: apt checks it against its own signed
+    indexes, which is the same guarantee the snapshot path builds by hand."""
+	if not shutil.which("apt-get"):
+		return None
+	r = subprocess.run(["apt-get", "download", "-qq", f"{name}={version}"],
+	                   cwd=into, stdout=subprocess.DEVNULL,
+	                   stderr=subprocess.DEVNULL, env=parse_env())
+	if r.returncode != 0:
+		return None
+	for f in sorted(os.listdir(into)):
+		if f.startswith(name + "_") and f.endswith(".deb"):
+			return os.path.join(into, f)
+	return None
+
+def _index_stanza(text, name, version, arch):
+	"""The one stanza in a Packages index naming this exact build."""
+	for stanza in parse_stanzas(text):
+		if stanza.get("Package") == name \
+		   and stanza.get("Version") == version \
+		   and stanza.get("Architecture") in (arch, "all"):
+			return stanza
+	return None
+
+def _snapshot_deb(verifier, name, version, arch, when, into):
+	"""The .deb from snapshot.debian.org, through the chain --sync uses.
+
+    Every link is the machine's own: the suites and keyrings come from its
+    sources.list, so the signed Release is checked against the keys that
+    source pins, the index against that Release, and the .deb against that
+    index. Nothing here trusts snapshot for anything but transport -- which
+    matters, since it is not covered by the archive keyring and a hash it
+    served alongside a file it served vouches for nothing.
+
+    The timestamped tree is laid out exactly like the live archive, so the
+    only new thing is the base URL."""
+	if not verifier.enabled:
+		ewarn("cannot verify a recovered ancestor without gpgv; "
+		      "not fetching one")
+		return None
+	for base, suite, comps, signed_by in read_sources():
+		archive = base.rstrip("/").rsplit("/", 1)[-1]
+		if archive not in SNAPSHOT_ARCHIVES or suite.endswith("/"):
+			continue                       # not on snapshot, or a flat repo
+		snap = f"{SNAPSHOT_URL}/{archive}/{when}"
+		try:
+			text = verifier.release(snap, suite, signed_by)
+		except (RuntimeError, urllib.error.URLError, OSError):
+			continue
+		if not text:
+			continue
+		hashes = release_hashes(text)
+		for comp in comps:
+			for ext in (".xz", ".gz", ""):
+				relpath = f"{comp}/binary-{arch}/Packages{ext}"
+				if relpath not in hashes:
+					continue
+				try:
+					raw = fetch(f"{snap}/dists/{suite}/{relpath}",
+					            limit=MAX_INDEX_BYTES)
+					if not verifier.check_index(snap, suite, signed_by,
+					                            relpath, raw):
+						break
+					index = decompress_bounded(raw, ext)
+				except (urllib.error.URLError, OSError, ValueError):
+					break
+				stanza = _index_stanza(index.decode("utf-8", "replace"),
+				                       name, version, arch)
+				if stanza is None:
+					break                  # right index, wrong version
+				try:
+					size = int(stanza.get("Size", MAX_DEB_BYTES))
+					deb = fetch(f"{snap}/{stanza['Filename']}",
+					            limit=min(size, MAX_DEB_BYTES))
+				except (urllib.error.URLError, OSError, ValueError, KeyError):
+					break
+				got = hashlib.sha256(deb).hexdigest()
+				want = stanza.get("SHA256")
+				if want and got != want:
+					raise RuntimeError(
+					    f"{name}={version}: SHA256 mismatch against the "
+					    f"signed index\n  expected {want}\n  got      {got}")
+				path = os.path.join(into, f"{name}_{arch}.deb")
+				with open(path, "wb") as f:
+					f.write(deb)
+				return path
+	return None
+
+def _conffiles_from_deb(deb, paths, into):
+	"""{path: extracted file} for the named members of a .deb.
+
+    Named members rather than the whole package: a conffile review wants a
+    handful of files out of /etc, and unpacking the rest of, say, a kernel
+    to reach them is work nobody asked for."""
+	members = ["." + p for p in paths]
+	try:
+		tar = subprocess.run(["dpkg-deb", "--fsys-tarfile", deb],
+		                     stdout=subprocess.PIPE,
+		                     stderr=subprocess.DEVNULL)
+		if tar.returncode != 0:
+			return {}
+		# tar's status is ignored on purpose: it is non-zero when a named
+		# member is absent, which is ordinary -- a package's conffile list
+		# changes between versions -- and the files that *were* extracted
+		# are still there and still correct.
+		subprocess.run(["tar", "-x", "-C", into] + members,
+		               input=tar.stdout, stdout=subprocess.DEVNULL,
+		               stderr=subprocess.DEVNULL)
+	except OSError:
+		return {}
+	out = {}
+	for p in paths:
+		got = os.path.join(into, "." + p)
+		if os.path.isfile(got):
+			out[p] = got
+	return out
+
+def recover_ancestors(conf, targets, verifier=None):
+	"""Archive the previously shipped version of files that have none.
+
+    Best effort throughout: anything that does not work leaves the file to a
+    2-way review, which is what it would have had anyway. The one thing that
+    is *not* tolerated is a file that fails its hash against the signed
+    index -- that is a failure rather than an inability, and it stops the
+    run the way a bad index does in --sync."""
+	pending = [t for t in targets if ancestor_for(conf, t)[0] is None]
+	if not pending:
+		return 0
+	owners = owners_of(pending)
+	by_pkg = {}
+	for path in pending:
+		pkg = owners.get(path)
+		if pkg:
+			by_pkg.setdefault(pkg, []).append(path)
+	if not by_pkg:
+		return 0
+	einfo(f"{len(pending)} file(s) have no archived ancestor; "
+	      f"looking for the version each was shipped with")
+	arch = capture(["dpkg", "--print-architecture"], env=parse_env()).stdout
+	arch = arch.strip() or "all"
+	verifier = verifier if verifier is not None else Verifier()
+	found = 0
+	for pkg, paths in sorted(by_pkg.items()):
+		version, when = previous_version(pkg)
+		if not version:
+			continue
+		with tempfile.TemporaryDirectory(prefix="emerge-ancestor-") as td:
+			deb = _cached_deb(pkg, version, arch)
+			where = "apt cache"
+			if deb is None:
+				deb = _apt_downloaded_deb(pkg, version, td)
+				where = "archive"
+			if deb is None:
+				deb = _snapshot_deb(verifier, pkg, version, arch, when, td)
+				where = "snapshot.debian.org"
+			if deb is None:
+				ewarn(f"  {pkg} {version}: not found; "
+				      f"those files get a 2-way review")
+				continue
+			got = _conffiles_from_deb(deb, paths, td)
+			for path, src in got.items():
+				try:
+					_store_ancestor(conf, path, src)
+					found += 1
+				except OSError as e:
+					ewarn(f"  cannot archive {path}: "
+					      f"{e.strerror or e}")
+		if got:
+			einfo(f"  {pkg} {version} ({where}): "
+			      f"{len(got)} file(s) recovered")
+	return found
+
 # -- scanning ---------------------------------------------------------------
 
 def protected_dirs(conf):
@@ -3835,6 +4159,20 @@ def dispatch_conf(opts):
 		einfo("Nothing to merge; all config files are up to date.")
 		return
 	print(f"{BGREEN(' * ')}{len(pend)} config file(s) awaiting review.\n")
+	if conf_yes(conf, "recover-ancestor"):
+		# Before the loop, so one .deb answers for every file it ships and
+		# the review is not interrupted by a download between two questions.
+		try:
+			recover_ancestors(conf, [t for t, _ in pend])
+		except RuntimeError as e:
+			# A hash that does not match the signed index is a failure, not
+			# an inability, and is the one thing here that stops the run --
+			# the same rule --sync applies to an index.
+			eblock(str(e))
+			sys.exit(1)
+		except (urllib.error.URLError, OSError) as e:
+			ewarn(f"could not look for missing ancestors: {e}")
+		print()
 	auto = skipped = 0
 
 	for target, pending in pend:
@@ -4095,12 +4433,17 @@ whichever comes first. --help, --version and --info answer and exit.
                  {CONF_FILE_ALT}), keys:
                  archive-dir, config-protect, config-protect-mask,
                  frozen-files, automerge, replace-unmodified,
-                 replace-wscomments, and mergetool -- e.g.
+                 replace-wscomments, recover-ancestor, and mergetool
+                 -- e.g.
                  mergetool="meld {{mine}} {{base}} {{theirs}} -o {{output}}"
                  or dispatch-conf's own positional form
                  merge="sdiff --suppress-common-lines --output='%s' '%s' '%s'"
                  That sdiff line is the default, so the mergetool option
                  works with no configuration at all; mergetool= overrides it.
+                 A file with no archived ancestor has the version it was
+                 shipped with fetched (apt cache, an enabled repo, or
+                 snapshot.debian.org, verified against the keys your
+                 sources pin); recover-ancestor=no turns that off.
 
    --search (-s) Searches for matches of the supplied string in the synced
                  tree. The search string is a case-insensitive regular

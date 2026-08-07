@@ -30,6 +30,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import types
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1819,6 +1820,209 @@ class SignatureVerificationEndToEnd(unittest.TestCase):
 		self.m = self.load()
 		with self.assertRaises(SystemExit):
 			self.sync()
+
+
+@unittest.skipUnless(HAVE_GPG, "gpg/gpgv unavailable")
+@unittest.skipUnless(shutil.which("dpkg-deb"), "dpkg-deb unavailable")
+class AncestorRecoveryEndToEnd(unittest.TestCase):
+	"""Recovering the previously shipped config file, whole chain, no fakes.
+
+    The unit tests stub the verifier and the fetch, which covers the
+    decisions but never the chain itself -- and the chain is four links that
+    each fail silently in the same direction: a signature that was never
+    checked, an index that was never matched to it, a .deb that was never
+    matched to the index, and a conffile that was never actually extracted.
+    Each of those alone still ends with a plausible file in the archive and
+    a review that looks like it worked.
+
+    So this signs a real Release with a real key, serves a snapshot-shaped
+    tree, and asserts the ancestor that lands in the archive is the one out
+    of the .deb -- then tampers with the .deb and asserts the run stops."""
+
+	SUITE, ARCH = "trixie", "amd64"
+
+	def setUp(self):
+		self.dir = tempfile.mkdtemp(prefix="emerge-anc-itest-")
+		self.addCleanup(shutil.rmtree, self.dir, True)
+		self.gnupg = os.path.join(self.dir, "gnupg")
+		os.makedirs(self.gnupg, mode=0o700)
+		self.trusted = os.path.join(self.dir, "trusted.gpg.d")
+		self.archive_dir = os.path.join(self.dir, "config-archive")
+		self.snap = os.path.join(self.dir, "snapshot")
+		self.stamp = "20260410T120436Z"
+		self.root = os.path.join(self.snap, "debian", self.stamp)
+		os.makedirs(self.trusted)
+		os.makedirs(os.path.join(self.root, "pool"))
+		self.env = {**os.environ, "GNUPGHOME": self.gnupg, "PATH": SBIN_PATH}
+
+	def gpg(self, *args):
+		return subprocess.run(["gpg", "--batch", "--pinentry-mode",
+		                       "loopback", "--passphrase", ""] + list(args),
+		                      capture_output=True, text=True, env=self.env)
+
+	def make_deb(self, content):
+		"""A real .deb carrying one conffile -- the ancestor to recover."""
+		d = os.path.join(self.dir, "build")
+		shutil.rmtree(d, ignore_errors=True)
+		os.makedirs(os.path.join(d, "DEBIAN"))
+		os.makedirs(os.path.join(d, "etc"))
+		with open(os.path.join(d, "DEBIAN", "control"), "w") as f:
+			f.write("Package: emtest\nVersion: 1.0\nArchitecture: amd64\n"
+			        "Maintainer: t <t@t>\nDescription: fixture\n")
+		with open(os.path.join(d, "DEBIAN", "conffiles"), "w") as f:
+			f.write("/etc/emtest.conf\n")
+		with open(os.path.join(d, "etc", "emtest.conf"), "w") as f:
+			f.write(content)
+		out = os.path.join(self.root, "pool", "emtest_1.0_amd64.deb")
+		r = subprocess.run(["dpkg-deb", "--build", "-Znone", d, out],
+		                   capture_output=True, text=True, env=self.env)
+		self.assertEqual(r.returncode, 0, r.stderr)
+		return out
+
+	def publish(self, deb, tamper=False, tamper_index=False):
+		"""dists/<suite>/... signed, with the .deb's real hash in the index.
+
+        Signed first and tampered after, so the tampered case differs from
+        the good one only in the bytes of the .deb -- which is the property
+        under test."""
+		with open(deb, "rb") as f:
+			raw = f.read()
+		index = (f"Package: emtest\nVersion: 1.0\nArchitecture: amd64\n"
+		         f"Filename: pool/emtest_1.0_amd64.deb\n"
+		         f"Size: {len(raw)}\n"
+		         f"SHA256: {hashlib.sha256(raw).hexdigest()}\n\n").encode()
+		rel = os.path.join(self.root, "dists", self.SUITE)
+		os.makedirs(os.path.join(rel, "main", f"binary-{self.ARCH}"))
+		ipath = os.path.join(rel, "main", f"binary-{self.ARCH}", "Packages")
+		with open(ipath, "wb") as f:
+			f.write(index)
+		release = (f"Suite: {self.SUITE}\nComponents: main\nSHA256:\n"
+		           f" {hashlib.sha256(index).hexdigest()} {len(index)} "
+		           f"main/binary-{self.ARCH}/Packages\n")
+		src = os.path.join(self.dir, "Release.in")
+		with open(src, "w") as f:
+			f.write(release)
+		r = self.gpg("--clearsign", "-o", os.path.join(rel, "InRelease"), src)
+		self.assertEqual(r.returncode, 0, r.stderr)
+		if tamper_index:
+			# The signature stays valid and covers a hash the index no
+			# longer has: the case a stubbed verifier cannot reach.
+			with open(ipath, "wb") as f:
+				f.write(index.replace(b"Version: 1.0", b"Version: 9.9"))
+		if tamper:
+			with open(deb, "r+b") as f:
+				f.seek(len(raw) - 1)
+				f.write(bytes([raw[-1] ^ 0xff]))
+
+	def load(self, etc):
+		loader = importlib.machinery.SourceFileLoader("emerge_anc_itest",
+		                                              SCRIPT)
+		spec = importlib.util.spec_from_loader(loader.name, loader)
+		m = importlib.util.module_from_spec(spec)
+		loader.exec_module(m)
+		m.TRUSTED_DIR = self.trusted
+		m.TRUSTED_LEGACY = os.path.join(self.dir, "nonexistent.gpg")
+		m.SNAPSHOT_URL = "file://" + self.snap
+		m.APT_CACHE_DIR = os.path.join(self.dir, "empty-cache")
+		m.read_sources = lambda: [("http://deb.debian.org/debian",
+		                           self.SUITE, ["main"], None)]
+		# The two local lookups are what this test is not about: no .deb in
+		# the cache, and apt is not asked. What remains is the network path.
+		m._apt_downloaded_deb = lambda *a, **k: None
+		m.previous_version = lambda name, lines=None: ("1.0", self.stamp)
+		m.owners_of = lambda paths: {p: "emtest" for p in paths}
+		m.capture = lambda cmd, env=None: types.SimpleNamespace(
+		    stdout=self.ARCH + "\n", returncode=0)
+		m.need_root = lambda: None
+		m.print = lambda *a, **k: None
+		m.einfo = m.ewarn = lambda msg: None
+		return m
+
+	def conf(self):
+		return {**dict.fromkeys(("config-protect-mask", "frozen-files"), ""),
+		        "archive-dir": self.archive_dir, "recover-ancestor": "yes",
+		        "config-protect": "/etc"}
+
+	def test_the_ancestor_comes_back_out_of_a_signed_chain(self):
+		deb = self.make_deb("shipped = yes\n")
+		r = self.gpg("--quick-generate-key", "Emerge Archive <a@t>",
+		             "ed25519", "sign", "0")
+		self.assertEqual(r.returncode, 0, r.stderr)
+		r = self.gpg("--armor", "--export", "Emerge Archive")
+		with open(os.path.join(self.trusted, "archive.asc"), "w") as f:
+			f.write(r.stdout)
+		self.publish(deb)
+
+		m = self.load(self.dir)
+		got = m.recover_ancestors(self.conf(), ["/etc/emtest.conf"])
+		self.assertEqual(got, 1)
+		stored = m.archive_path(self.conf(), "/etc/emtest.conf")
+		self.assertTrue(os.path.isfile(stored), "nothing was archived")
+		with open(stored) as f:
+			self.assertEqual(f.read(), "shipped = yes\n",
+			                 "the archived ancestor is not the shipped file")
+
+	def test_a_tampered_deb_stops_the_run(self):
+		"""The whole point of the chain. A .deb whose bytes do not match the
+        signed index must not become an ancestor -- an ancestor decides
+        which side of a merge wins, silently, in /etc."""
+		deb = self.make_deb("shipped = yes\n")
+		r = self.gpg("--quick-generate-key", "Emerge Archive <a@t>",
+		             "ed25519", "sign", "0")
+		self.assertEqual(r.returncode, 0, r.stderr)
+		r = self.gpg("--armor", "--export", "Emerge Archive")
+		with open(os.path.join(self.trusted, "archive.asc"), "w") as f:
+			f.write(r.stdout)
+		self.publish(deb, tamper=True)
+
+		m = self.load(self.dir)
+		with self.assertRaises(RuntimeError) as e:
+			m.recover_ancestors(self.conf(), ["/etc/emtest.conf"])
+		self.assertIn("SHA256 mismatch", str(e.exception))
+		self.assertFalse(os.path.exists(
+		    m.archive_path(self.conf(), "/etc/emtest.conf")))
+
+	def _trusted_key(self):
+		r = self.gpg("--quick-generate-key", "Emerge Archive <a@t>",
+		             "ed25519", "sign", "0")
+		self.assertEqual(r.returncode, 0, r.stderr)
+		r = self.gpg("--armor", "--export", "Emerge Archive")
+		with open(os.path.join(self.trusted, "archive.asc"), "w") as f:
+			f.write(r.stdout)
+
+	def test_an_index_that_does_not_match_the_release_recovers_nothing(self):
+		"""A valid signature over a Release the index no longer matches --
+        the middle link, and the one a stubbed verifier cannot test. Found
+        by mutation: bypassing check_index left every end-to-end test here
+        passing.
+
+        Fatal rather than quiet, which is the same rule --sync applies to
+        an index: a hash that does not match is a failure, where a Release
+        that cannot be fetched at all is only an inability."""
+		deb = self.make_deb("shipped = yes\n")
+		self._trusted_key()
+		self.publish(deb, tamper_index=True)
+		m = self.load(self.dir)
+		with self.assertRaises(RuntimeError) as e:
+			m.recover_ancestors(self.conf(), ["/etc/emtest.conf"])
+		self.assertIn("does not match the signed Release", str(e.exception))
+		self.assertFalse(os.path.exists(
+		    m.archive_path(self.conf(), "/etc/emtest.conf")))
+
+	def test_an_untrusted_signature_recovers_nothing(self):
+		"""Signed by a key the machine does not trust. The Release does not
+        verify, so the index is never used and no ancestor appears -- the
+        quiet direction, which is why it is asserted rather than assumed."""
+		deb = self.make_deb("shipped = yes\n")
+		r = self.gpg("--quick-generate-key", "Somebody Else <b@t>",
+		             "ed25519", "sign", "0")
+		self.assertEqual(r.returncode, 0, r.stderr)
+		self.publish(deb)                      # signed, but nothing trusts it
+		m = self.load(self.dir)
+		self.assertEqual(m.recover_ancestors(self.conf(),
+		                                     ["/etc/emtest.conf"]), 0)
+		self.assertFalse(os.path.exists(
+		    m.archive_path(self.conf(), "/etc/emtest.conf")))
 
 
 class TestEveryCapabilityIsPresent(unittest.TestCase):

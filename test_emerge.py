@@ -859,6 +859,191 @@ class TestMerge2(unittest.TestCase):
 			self.assertTrue(line.endswith("\n"), out)
 
 
+class TestAncestorRecovery(unittest.TestCase):
+	"""Finding the version a config file was shipped with, when nothing
+    archived it.
+
+    The parsing half is where the bugs are, and one of them was found the
+    expensive way: asking snapshot.debian.org for the moment of the upgrade
+    returns an archive that already holds the *new* version, so the whole
+    chain verified perfectly and found nothing."""
+
+	LOG = [
+	    "2026-04-10 12:04:36 upgrade bash:amd64 5.2.37-2+b7 5.2.37-2+b8\n",
+	    "2026-04-10 12:04:37 status installed bash:amd64 5.2.37-2+b8\n",
+	    "2026-05-01 09:00:00 upgrade bash:amd64 5.2.37-2+b8 5.2.37-2+b8\n",
+	    "2026-06-15 13:37:29 upgrade bash:amd64 5.2.37-2+b8 5.2.37-2+b9\n",
+	    "2026-06-15 13:37:30 upgrade nano:amd64 8.4-1 8.5-1\n",
+	]
+
+	def setUp(self):
+		self.mod = load()
+
+	def test_the_ancestor_is_the_version_before_the_current_one(self):
+		v, when = self.mod.previous_version("bash", self.LOG)
+		self.assertEqual(v, "5.2.37-2+b8")
+
+	def test_the_timestamp_is_when_the_old_version_was_installed(self):
+		"""Not when it was replaced. At the moment of the upgrade the
+        archive already holds the new version, so a snapshot taken then does
+        not contain the one being looked for -- verified against the real
+        snapshot.debian.org, which answered "not in trixie/main" for a
+        package that plainly had been."""
+		_, when = self.mod.previous_version("bash", self.LOG)
+		self.assertTrue(when.startswith("20260410"), when)
+
+	def test_a_reinstall_is_not_a_version_change(self):
+		"""dpkg logs a reinstall as `upgrade pkg 1.0 1.0`. Counted as a
+        change, it makes a package its own ancestor -- and an ancestor
+        identical to the new version silently discards the update, which is
+        a bug this subsystem has already shipped once by another route."""
+		hist = self.mod.package_history("bash", self.LOG)
+		self.assertEqual([v for _, v in hist],
+		                 ["5.2.37-2+b8", "5.2.37-2+b9"])
+
+	def test_a_package_installed_once_has_no_ancestor(self):
+		self.assertEqual(self.mod.previous_version("nano", self.LOG),
+		                 (None, None))
+
+	def test_an_unknown_package_has_no_ancestor(self):
+		self.assertEqual(self.mod.previous_version("nosuch", self.LOG),
+		                 (None, None))
+
+	def test_the_stamp_is_utc_not_the_local_clock(self):
+		"""dpkg writes local time with no zone and snapshot indexes UTC."""
+		os.environ["TZ"] = "Europe/Stockholm"       # UTC+2 in June
+		time.tzset()
+		self.addCleanup(time.tzset)
+		self.addCleanup(os.environ.pop, "TZ", None)
+		self.assertEqual(self.mod._log_stamp("2026-06-15", "13:37:29"),
+		                 "20260615T113729Z")
+
+	def test_rotated_logs_are_read_oldest_first(self):
+		d = tempfile.mkdtemp(prefix="emerge-dpkglog-")
+		self.addCleanup(shutil.rmtree, d, True)
+		with open(os.path.join(d, "dpkg.log"), "w") as f:
+			f.write("2026-06-15 13:37:29 upgrade p:amd64 2 3\n")
+		with open(os.path.join(d, "dpkg.log.1"), "w") as f:
+			f.write("2026-05-15 13:37:29 upgrade p:amd64 1 2\n")
+		with gzip.open(os.path.join(d, "dpkg.log.2.gz"), "wt") as f:
+			f.write("2026-04-15 13:37:29 install p:amd64 <none> 1\n")
+		self.mod.DPKG_LOG = os.path.join(d, "dpkg.log")
+		self.assertEqual([v for _, v in self.mod.package_history("p")],
+		                 ["1", "2", "3"])
+
+	def test_owners_of_reads_one_batched_dpkg_query(self):
+		calls = []
+		def fake(cmd, env=None):
+			calls.append(cmd)
+			return types.SimpleNamespace(
+			    stdout="bash: /etc/bash.bashrc\n"
+			           "nano, nano-tiny: /etc/nanorc\n", returncode=0)
+		self.mod.capture = fake
+		got = self.mod.owners_of(["/etc/bash.bashrc", "/etc/nanorc"])
+		self.assertEqual(got, {"/etc/bash.bashrc": "bash",
+		                       "/etc/nanorc": "nano"})
+		self.assertEqual(len(calls), 1, "one call, not one per file")
+
+	def test_a_cached_deb_is_found_through_the_epoch_escape(self):
+		d = tempfile.mkdtemp(prefix="emerge-aptcache-")
+		self.addCleanup(shutil.rmtree, d, True)
+		open(os.path.join(d, "tzdata_4%3a1.2-3_all.deb"), "w").close()
+		self.mod.APT_CACHE_DIR = d
+		self.assertTrue(self.mod._cached_deb("tzdata", "4:1.2-3", "amd64"))
+		self.assertIsNone(self.mod._cached_deb("tzdata", "4:1.2-4", "amd64"))
+
+
+class TestSnapshotChain(unittest.TestCase):
+	"""The fetched .deb is trusted only as far as the machine's own keys
+    reach: signed Release, index checked against it, .deb checked against
+    the index. Snapshot is trusted for transport and nothing else."""
+
+	def setUp(self):
+		self.mod = load()
+		self.warnings = []
+		self.mod.ewarn = self.warnings.append     # not onto the run's output
+		self.mod.read_sources = lambda: [
+		    ("http://deb.debian.org/debian", "trixie", ["main"], None)]
+		self.index = ("Package: bash\nVersion: 1.0\nArchitecture: amd64\n"
+		              "Filename: pool/main/b/bash/bash_1.0_amd64.deb\n"
+		              "Size: 3\nSHA256: %s\n\n"
+		              % hashlib.sha256(b"deb").hexdigest())
+		self.fetched = []
+
+	def _verifier(self, ok=True):
+		mod = self.mod
+		class V:
+			enabled = True
+			def release(self, base, suite, signed_by=None):
+				return "SHA256:\n x 1 main/binary-amd64/Packages\n"
+			def check_index(self, base, suite, signed_by, relpath, raw):
+				return ok
+		return V()
+
+	def _fetch(self, body):
+		def fake(url, timeout=60, limit=None):
+			self.fetched.append(url)
+			return body(url)
+		return fake
+
+	def test_the_deb_is_taken_when_every_link_holds(self):
+		self.mod.fetch = self._fetch(
+		    lambda u: self.index.encode() if u.endswith("Packages")
+		    else b"deb")
+		d = tempfile.mkdtemp(prefix="emerge-snap-")
+		self.addCleanup(shutil.rmtree, d, True)
+		got = self.mod._snapshot_deb(self._verifier(), "bash", "1.0",
+		                             "amd64", "20260410T120436Z", d)
+		self.assertTrue(got and os.path.isfile(got))
+		self.assertTrue(any("snapshot.debian.org" in u and "20260410" in u
+		                    for u in self.fetched), self.fetched)
+
+	def test_a_deb_that_fails_its_hash_stops_the_run(self):
+		"""A mismatch is a failure, not an inability -- the rule --sync
+        applies to an index. Quietly falling back to a 2-way review would
+        hide the one event this chain exists to detect."""
+		self.mod.fetch = self._fetch(
+		    lambda u: self.index.encode() if u.endswith("Packages")
+		    else b"tampered")
+		d = tempfile.mkdtemp(prefix="emerge-snap-")
+		self.addCleanup(shutil.rmtree, d, True)
+		with self.assertRaises(RuntimeError) as e:
+			self.mod._snapshot_deb(self._verifier(), "bash", "1.0", "amd64",
+			                       "20260410T120436Z", d)
+		self.assertIn("SHA256 mismatch", str(e.exception))
+
+	def test_an_index_that_does_not_verify_is_not_used(self):
+		self.mod.fetch = self._fetch(lambda u: self.index.encode())
+		d = tempfile.mkdtemp(prefix="emerge-snap-")
+		self.addCleanup(shutil.rmtree, d, True)
+		self.assertIsNone(
+		    self.mod._snapshot_deb(self._verifier(ok=False), "bash", "1.0",
+		                           "amd64", "20260410T120436Z", d))
+
+	def test_nothing_is_fetched_without_gpgv(self):
+		"""An ancestor that cannot be verified is not used. It is optional
+        data, so refusing costs a 2-way review -- much cheaper than a wrong
+        ancestor, which makes a wrong merge rather than a visible error."""
+		self.mod.fetch = self._fetch(lambda u: b"")
+		v = self._verifier()
+		v.enabled = False
+		self.assertIsNone(self.mod._snapshot_deb(v, "bash", "1.0", "amd64",
+		                                         "20260410T120436Z", "/tmp"))
+		self.assertEqual(self.fetched, [])
+
+	def test_repositories_snapshot_does_not_carry_are_skipped(self):
+		"""Third-party sources -- docker, a PPA -- are not on snapshot, and
+        asking it for them is a request that can only 404."""
+		self.mod.read_sources = lambda: [
+		    ("https://download.docker.com/linux/debian", "trixie",
+		     ["stable"], None)]
+		self.mod.fetch = self._fetch(lambda u: b"")
+		self.assertIsNone(self.mod._snapshot_deb(
+		    self._verifier(), "docker-ce", "1.0", "amd64",
+		    "20260410T120436Z", "/tmp"))
+		self.assertEqual(self.fetched, [])
+
+
 class TestSignificant(unittest.TestCase):
 	def test_strips_comments_and_blank_lines(self):
 		lines = L("# comment", "", "  ", "key = value", "; ini comment",
@@ -4395,6 +4580,12 @@ class TestDispatchConf(unittest.TestCase):
 		self.conf = dict(self.mod.DEFAULT_CONF)
 		self.conf["config-protect"] = self.etc
 		self.conf["archive-dir"] = os.path.join(self.dir, "archive")
+		# Off here, and covered by TestAncestorRecovery instead. Left on,
+		# every one of these tests would fork dpkg-query and read the host's
+		# /var/log/dpkg.log -- which is slow (measured: 0.2s to 4.2s for
+		# this class) and, worse, makes the result depend on what the
+		# machine running the suite happens to have installed.
+		self.conf["recover-ancestor"] = "no"
 		self.mod.load_conf = lambda: self.conf
 		self.mod.need_root = lambda: None
 		self.mod.color_diff = lambda *a, **k: None

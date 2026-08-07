@@ -325,10 +325,25 @@ The first review after installing
 .B emerge
 has no archived ancestor yet, since the archive is written by installs
 .B emerge
-itself performed. The merged and edit choices are still offered there: with
-no ancestor a change cannot be attributed to either side, so every
-difference is marked up as a conflict, but the runs the two files share are
-still shared and only the differences are put to you. The external
+itself performed. It looks for one: the version each file was shipped with
+is named in
+.IR /var/log/dpkg.log ,
+and the package is taken from the local apt cache, from an enabled
+repository, or from
+.B snapshot.debian.org
+\(em verified as
+.B --sync
+verifies an index, against the keyrings your own sources pin, so a
+recovered file is trusted no further than the archive keys reach. Set
+.I recover-ancestor
+to
+.B no
+to keep a config review off the network.
+.PP
+Where no ancestor can be had, the merged and edit choices are still
+offered: with no ancestor a change cannot be attributed to either side, so
+every difference is marked up as a conflict, but the runs the two files
+share are still shared and only the differences are put to you. The external
 .I mergetool
 is for someone who prefers their own tool, not a requirement for merging.
 Reachable as
@@ -400,7 +415,7 @@ Editor used by
 .I /etc/emerge/dispatch-conf.conf
 Config-merging settings. Keys: archive-dir, config-protect,
 config-protect-mask, frozen-files, automerge, replace-unmodified,
-replace-wscomments, mergetool, merge, diff.
+replace-wscomments, recover-ancestor, mergetool, merge, diff.
 .I merge
 defaults to Portage's own
 .BR sdiff (1)
