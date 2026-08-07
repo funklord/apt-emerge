@@ -98,6 +98,17 @@ Files you never touched, comment-only differences and conflict-free merges
 apply automatically; only genuine conflicts are put to you. Also reachable
 as `etc-update`, or by symlinking the script to either name.
 
+For a file parked before `emerge` was ever installed there is no archived
+ancestor, so it goes looking for one: the version each file was shipped
+with is named in `/var/log/dpkg.log`, and the package comes from the local
+apt cache, from an enabled repository, or from `snapshot.debian.org` —
+verified against the same keyrings your own sources pin, so a recovered
+file is trusted no further than the archive keys reach. Set
+`recover-ancestor = no` in `/etc/emerge/dispatch-conf.conf` to keep a
+review off the network. Where no ancestor can be had the merge is still
+offered, marked up two-way rather than resolved, so the choice is never
+just keep-everything or take-everything.
+
 **It tells you when an upgrade touches your running desktop.** The set is
 derived from the live session — the processes that *are* your session and
 the code they have loaded — rather than a hardcoded list:
