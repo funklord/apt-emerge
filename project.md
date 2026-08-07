@@ -2207,3 +2207,64 @@ have been `.IP` — invisible in the source, obvious in `man`.
 Finally the series was checked to be **bisectable**: every commit in the
 range compiles and passes the unit suite on its own, so a future bisect
 through it will not lie.
+
+Then a session with no feature list either, which began by rewriting the
+log and ended by settling everything that was waiting on a decision.
+**Development is paused as of 2026-08-07**, not finished: what remains is
+in the backlog above, and none of it is blocked on understanding.
+
+**The log became the artifact.** All 110 commits were rewritten to the
+kernel format — see "The log, and its format" — and the interesting part
+is that a bulk rewrite of *prose* needs the same discipline as a bulk
+rewrite of code and has a weaker proof available. Trees were taken verbatim
+so no content could change; the rewrapper refused to write unless each
+body's token stream and paragraph count survived; 858 properties were
+compared afterwards. It also found a sentence that a mechanical rename had
+eaten — the one recording what the old variable name *was*.
+
+**A bug that existed only for a person.** `USE_COLOR` is
+`sys.stdout.isatty()` read once at import, and every automated way of
+running the suite pipes stdout: CI, `make`, an editor, `dh_auto_test`. So a
+test asserting on output passed in every one of them and failed for
+whoever typed the command in a terminal, taking `make deb` down with it.
+Six places turned colour off by hand and the sixth forgot. That is the
+familiar shape — one property, several writers — arriving through a door
+nothing was watching, because **the condition it needed was the one no
+automated check can create**. `make check-tty` and a CI step exist now for
+exactly that reason.
+
+**And the lesson underneath it is about method, not code.** Asked three
+times whether `make deb` was broken, this session answered "green here" —
+six times, in six conditions, every one of them piped. The evidence was
+real and the conclusion was wrong, because the whole family of checks
+shared a blind spot with the bug. Worse, four of this session's own checks
+were vacuous when first run: a pty test that piped inside `script`, a
+mutation run started from the wrong directory, a colour comparison against
+a line that carries no colour, and an exit status read after a pipe. Every
+one *looked* like evidence. **When a check and the thing it checks share an
+assumption, agreement between them means nothing** — and the way to find
+that out is to make the check fail on purpose before believing it.
+
+The rest was closing gaps rather than finding them:
+
+- **Colour is configurable now**, `NO_COLOR` and Portage's `NOCOLOR`, which
+  disagree about the string `0` and cannot be implemented in terms of each
+  other.
+- **The world file is locked** for its read-modify-write, and the seed
+  turned out to be the one world write that was never atomic.
+- **The documentation caught up**: the README points at the manual and says
+  outright that the single-file install carries none; `code-style.md`
+  regained a naming rule it had lost, and the Debian-packaging exception it
+  had kept locally went up into the shared source — corrected, because
+  measuring it showed deb822 *accepts* a tab and the reason had been wrong
+  — and then out to all six sibling projects.
+- **Three questions that were waiting on the owner are settled**, all three
+  in favour of what the code already did, with the rejected options written
+  down beside them.
+
+Verified before stopping: 3.9, 3.11 and 3.13; the C locale; ResourceWarning
+as an error; a `debian:trixie` container as root with
+`EMERGE_TESTS_REQUIRE_ALL=1`; the package job through install, `argv[0]`
+dispatch, man pages and lintian; and the suite under a pty. The skip counts
+are the five documented ones plus the opt-in marker, so nothing new went
+dark on the old interpreters.
