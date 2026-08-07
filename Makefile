@@ -13,12 +13,21 @@ PACKAGE     = apt-emerge
 PYTHON     ?= python3
 
 # Where build products land. Settable so an isolated build can be kept from
-# clobbering a plain one. BUILD_DIR is the canonical name across these
-# projects -- it was BUILD_DIR here, which is a BSD-make convention that only
-# one sibling uses, and the two are not quite synonyms anyway: this holds a
-# whole build tree of .deb, .changes and .buildinfo, not object files. There
-# is nothing here that compiles to an object file at all.
-BUILD_DIR  ?= dist
+# clobbering a plain one.
+#
+# BUILD_DIR is the canonical name across these projects. It was OBJDIR here,
+# which is a BSD-make convention only one sibling used, and the two are not
+# quite synonyms anyway: this holds a whole build tree of .deb, .changes and
+# .buildinfo, not object files. Nothing here compiles to an object file at
+# all. (The sentence above used to say the name had been BUILD_DIR, because
+# the rename rewrote the word it was contrasting against.)
+#
+# `build`, not `dist`. Every other private project defaults this to `build`
+# and this was the last one that did not, which made `make clean` and every
+# instruction in the README a special case for one tree. `dist` is also the
+# wrong word for it: a dist directory conventionally holds something ready
+# to ship, and this holds whatever the last local build produced.
+BUILD_DIR  ?= build
 
 prefix     ?= /usr
 bindir     ?= $(prefix)/bin
@@ -55,7 +64,7 @@ help:
 	@echo '              colours its output and every other run does not'
 	@echo '  style       the indentation and whitespace gate'
 	@echo '  install     install into $$(DESTDIR)$$(prefix)'
-	@echo '  deb         build a binary package into dist/'
+	@echo '  deb         build a binary package into $$(BUILD_DIR)'
 	@echo '  clean       remove build products'
 
 # -- tests -------------------------------------------------------------------
@@ -177,7 +186,9 @@ uninstall:
 # -- package -----------------------------------------------------------------
 
 # dpkg-buildpackage writes its products to the parent directory, which is
-# outside the tree and not ours to litter. Collect them into dist/ instead.
+# outside the tree and not ours to litter -- with these projects side by side
+# in one directory, that is a sibling's tree. Collect them into BUILD_DIR
+# instead.
 deb: version-check
 	dpkg-buildpackage --build=binary --no-sign
 	mkdir -p $(BUILD_DIR)

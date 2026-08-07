@@ -1512,8 +1512,11 @@ rather than failing. All seven copies were shipped that way.
 ## Packaging
 
 `make deb` builds `$(BUILD_DIR)/apt-emerge_<version>_all.deb`, where
-`BUILD_DIR` defaults to `dist/` and is settable so an isolated build cannot
-clobber a plain one. The variable was `OBJDIR` until 2026-08-05; `BUILD_DIR`
+`BUILD_DIR` defaults to `build/` and is settable so an isolated build cannot
+clobber a plain one. It defaulted to `dist/` until the cross-project pass
+that found this was the last tree not defaulting to `build`, which made
+`make clean` and every README instruction a special case for one project.
+The variable was `OBJDIR` until 2026-08-05; `BUILD_DIR`
 is the canonical spelling across these projects, and the two are not
 synonyms in any case — this holds a build tree of `.deb`, `.changes` and
 `.buildinfo`, and nothing here compiles to an object file at all.

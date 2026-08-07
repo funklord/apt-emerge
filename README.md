@@ -23,7 +23,7 @@ Build a package and install it the normal way:
 
 ```sh
 make deb
-sudo apt install ./dist/apt-emerge_*_all.deb
+sudo apt install ./build/apt-emerge_*_all.deb
 ```
 
 That gives you `emerge`, the `dispatch-conf` and `etc-update` aliases, and
