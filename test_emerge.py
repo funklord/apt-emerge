@@ -4432,7 +4432,10 @@ class TestDispatchConf(unittest.TestCase):
         middle of a review, with earlier files already retired and no
         summary of what had been decided."""
 		errs = self.errors()
-		self.conf["mergetool"] = "meld"
+		# An installed program on purpose: the not-installed check runs
+		# first, so `meld` on a box without meld would pass this test
+		# without the template guard ever being reached.
+		self.conf["mergetool"] = "sdiff"
 		t = self.park("app.conf", "mine\n", "theirs\n")
 		self.dispatch("5", "s")                    # must not raise
 		self.assertEqual(self.content(t), "mine\n")
@@ -4451,21 +4454,33 @@ class TestDispatchConf(unittest.TestCase):
 
 	def test_an_unknown_named_placeholder_is_refused(self):
 		errs = self.errors()
-		self.conf["mergetool"] = "meld {mine} {nosuchkey}"
+		self.conf["mergetool"] = "sdiff {mine} {nosuchkey}"   # installed: see above
 		t = self.park("app.conf", "mine\n", "theirs\n")
 		self.dispatch("5", "s")
 		self.assertTrue(self.parked_exists(t))
 		self.assertTrue(any("cannot use the configured mergetool" in e
 		                    for e in errs), errs)
 
-	def test_a_mergetool_that_exits_non_zero_is_reported(self):
+	def test_a_mergetool_that_reports_trouble_is_reported(self):
 		errs = self.errors()
-		self.conf["mergetool"] = "false {output}"
+		self.conf["mergetool"] = "sh -c 'exit 2' -- {output}"
 		t = self.park("app.conf", "mine\n", "theirs\n")
 		self.dispatch("5", "s")
 		self.assertEqual(self.content(t), "mine\n")
 		self.assertTrue(any("did not produce a result" in e for e in errs),
 		                errs)
+
+	def test_a_merge_that_exits_1_is_still_a_merge(self):
+		"""sdiff is from the diff family, where 1 means "the files differed"
+        -- which they always did, that being why the file is under review.
+        Requiring 0 threw away every successful sdiff merge and reported it
+        as no result, with the merged text already written."""
+		self.conf["mergetool"] = "sh -c 'cp \"$1\" \"$2\"; exit 1' -- " \
+		                         "{theirs} {output}"
+		t = self.park("app.conf", "mine\n", "theirs\n")
+		self.dispatch("5")
+		self.assertEqual(self.content(t), "theirs\n")
+		self.assertFalse(self.parked_exists(t))
 
 	def test_no_mergetool_configured_says_so_rather_than_running_nothing(self):
 		errs = self.errors()
@@ -4474,6 +4489,49 @@ class TestDispatchConf(unittest.TestCase):
 		self.dispatch("5", "s")
 		self.assertTrue(any("no mergetool configured" in e for e in errs), errs)
 		self.assertTrue(self.parked_exists(t))
+
+	def test_the_menu_names_the_tool_option_5_will_launch(self):
+		"""Option 5 used to read "launch mergetool" whatever the state, and
+        answer "no mergetool configured" only once it had been pressed. On a
+        review with no archived ancestor that is the *only* entry which
+        merges anything -- 3 and 4 need an ancestor -- so the review
+        dead-ended on a menu item the program already knew could not run."""
+		tool = self.mod.mergetool_program(self.mod.DEFAULT_CONF)
+		self.park("app.conf", "mine\n", "theirs\n")
+		out = self.dispatch("s")
+		self.assertIn(f"launch mergetool ({tool})", out)
+
+	def test_a_two_way_review_points_at_the_answer_it_still_has(self):
+		"""With no ancestor, 3 and 4 are absent and the menu reads as a
+        choice between discarding your edits and discarding the update.
+        The third answer is option 5, and nothing said so."""
+		warns = []
+		self.mod.ewarn = warns.append
+		self.park("app.conf", "mine\n", "theirs\n")     # no ancestor
+		self.dispatch("s")
+		self.assertTrue(any("option 5" in w for w in warns), warns)
+
+	def test_the_menu_says_when_no_tool_is_configured_at_all(self):
+		self.conf["mergetool"] = self.conf["merge"] = ""
+		self.park("app.conf", "mine\n", "theirs\n")
+		out = self.dispatch("s")
+		self.assertIn("none configured", out)
+
+	def test_an_uninstalled_mergetool_is_named_before_it_is_run(self):
+		"""A missing program is a shell exit of 127, which the result check
+        reports as "did not produce a result" -- the symptom, with the cause
+        hidden. Say which tool, and say it in the menu too."""
+		errs = self.errors()
+		self.conf["mergetool"] = "nosuchmergetool-xyzzy {mine} {output}"
+		t = self.park("app.conf", "mine\n", "theirs\n")
+		out = self.dispatch("5", "s")
+		self.assertIn("not installed", out)
+		self.assertTrue(any("nosuchmergetool-xyzzy" in e and "not installed"
+		                    in e for e in errs), errs)
+		self.assertFalse(any("did not produce a result" in e for e in errs),
+		                 errs)
+		self.assertTrue(self.parked_exists(t))
+		self.assertEqual(self.content(t), "mine\n")
 
 	# -- the automatic paths -------------------------------------------------
 
@@ -5137,10 +5195,54 @@ class TestRunMergetool(unittest.TestCase):
 		                       "/b", "/m", "/t", "/o")
 		self.assertTrue(self.cmds[0].startswith("A "))
 
-	def test_failure_is_reported(self):
-		self.patch_call(lambda cmd, shell=False: 1)
+	def test_trouble_is_reported(self):
+		self.patch_call(lambda cmd, shell=False: 2)
 		self.assertFalse(self.mod.run_mergetool(
 		    self.conf(mergetool="x {mine}"), "/b", "/m", "/t", "/o"))
+
+	def test_the_diff_familys_1_means_differed_not_failed(self):
+		"""Every file dispatch-conf reviews differs, so sdiff exits 1 on
+        every successful merge it performs. Measured: 1 is a completed
+        merge, 2 is quit / EOF / bad arguments, and 2 empties the output."""
+		self.patch_call(lambda cmd, shell=False: 1)
+		self.assertTrue(self.mod.run_mergetool(
+		    self.conf(mergetool="x {mine}"), "/b", "/m", "/t", "/o"))
+
+	# -- the shipped default -------------------------------------------------
+
+	def test_the_default_template_is_a_usable_command(self):
+		"""The default has to survive the same substitution a user's does,
+        or option 5 fails on a machine nobody has configured -- which is
+        every machine, since there is no config file until someone writes
+        one."""
+		self.assertTrue(self.mod.run_mergetool(
+		    dict(self.mod.DEFAULT_CONF), "/b", "/mine", "/theirs", "/out"))
+		self.assertEqual(self.cmds[0],
+		                 "sdiff --suppress-common-lines "
+		                 "--output='/out' '/mine' '/theirs'")
+
+	def test_the_default_mergetool_is_installed_wherever_this_runs(self):
+		"""sdiff is from diffutils, which is Essential on Debian. That is
+        the whole reason the default is sdiff rather than a nicer tool:
+        meld and kdiff3 would be a default that is absent by default."""
+		tool = self.mod.mergetool_program(self.mod.DEFAULT_CONF)
+		self.assertEqual(tool, "sdiff")
+		self.assertIsNotNone(shutil.which(tool),
+		                     f"the default mergetool {tool!r} is not installed")
+
+	def test_mergetool_program_reads_the_first_word(self):
+		self.assertIsNone(self.mod.mergetool_program(self.conf()))
+		self.assertEqual(self.mod.mergetool_program(
+		    self.conf(mergetool="meld {mine} {theirs}")), "meld")
+		self.assertEqual(self.mod.mergetool_program(
+		    self.conf(merge="sdiff --output='%s' '%s' '%s'")), "sdiff")
+
+	def test_mergetool_program_does_not_raise_on_an_unreadable_template(self):
+		"""It only names the tool for the menu, so a template it cannot
+        parse must fall back to offering it, not to hiding it behind a
+        crash."""
+		self.assertIsNone(self.mod.mergetool_program(
+		    self.conf(mergetool="meld '{mine}")))
 
 
 class TestConfigWrite(unittest.TestCase):

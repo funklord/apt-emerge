@@ -388,7 +388,14 @@ Editor used by
 .I /etc/emerge/dispatch-conf.conf
 Config-merging settings. Keys: archive-dir, config-protect,
 config-protect-mask, frozen-files, automerge, replace-unmodified,
-replace-wscomments, mergetool, merge, diff. Also read from
+replace-wscomments, mergetool, merge, diff.
+.I merge
+defaults to Portage's own
+.BR sdiff (1)
+line, so the review's mergetool option works before anyone writes this
+file;
+.I mergetool
+overrides it. Also read from
 .I /etc/dispatch-conf.conf
 for dispatch-conf compatibility, which
 .I /etc/emerge/dispatch-conf.conf

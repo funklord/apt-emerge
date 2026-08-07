@@ -582,6 +582,65 @@ Debian already parks updated conffiles as `.dpkg-dist`/`.ucf-dist` (== Portage's
 - Scope: dpkg conffiles + ucf-managed files only. Files a maintainer script
   writes into `/etc` are NOT protected (would need pre/post snapshots).
 
+### The mergetool worked for nobody, and the review said so too late
+
+Reported from a real review: a file with no archived ancestor announced
+*"2-way review only"*, and pressing **5** answered *"no mergetool
+configured"*. Both messages were true and the combination was a dead end —
+with no ancestor there is no merged version, so 3 and 4 are not offered and
+5 is the only entry that merges anything at all. It was also the only one
+that could not run. What was left was keep-your-edits or take-the-update,
+which is the choice dispatch-conf exists to avoid having to make.
+
+Three separate defects, and the third is the one that would have made the
+other two fixes worthless:
+
+- **`merge` now defaults to Portage's own line**, verbatim: `sdiff
+  --suppress-common-lines --output='%s' '%s' '%s'`. It was an empty string,
+  so the mergetool worked only for someone who had written a config file
+  that nothing creates, and `--help` had been printing this exact line as an
+  *example* the whole time. `sdiff` is from diffutils, which is
+  `Essential: yes` — verified present in a bare `debian:trixie` image before
+  anything is installed, which is what makes it a usable default where meld
+  or kdiff3 would be a default that is absent by default. `mergetool=`
+  still overrides it, so a configured tool is unaffected.
+- **The menu names the tool and says when it is missing.** "launch
+  mergetool" was printed identically whether one was configured, missing, or
+  ready — the program knew the answer and made the user press the key to
+  find out. Pressing it with an uninstalled tool is a shell exit of 127,
+  which the result check reported as "did not produce a result": the
+  symptom, with the cause hidden.
+- **`run_mergetool` required exit 0, and sdiff returns 1.** It belongs to
+  the diff family, whose convention is 0 = no differences, 1 = differences,
+  2 = trouble — so a *successful* merge of two files that differ exits 1,
+  and every file under review differs, that being why it is under review.
+  The test is `< 2` now.
+
+  Measured rather than read off the manual, because the safety of the
+  looser test rests on what 2 actually covers: a completed merge is 1 with
+  the file written; `q` at sdiff's prompt is 2 **and it empties the
+  output**; EOF on stdin is 2; bad arguments are 2 with no file at all. A
+  tool that returns 1 for something else — kdiff3 on cancel — is caught by
+  the seed check, since a cancelled tool leaves the output as it found it.
+
+The 2-way warning now also says where the third answer went, rather than
+leaving the reader to infer it from an option that is missing.
+
+**Getting this in front of real sdiff took a pty, and the pipe version lied
+in the safe direction.** Driving the review over a pipe has Python's
+`input()` buffer the whole of stdin, so sdiff reads EOF, exits 2, and the
+run reports "mergetool did not produce a result" — indistinguishable from
+the bug being unfixed. Same trap as the colour test, and the same fix.
+
+**Still 2-way on first contact, and that part is not a defect.** The
+archive is written by `archive_settled()` after an install emerge itself
+performed, so a file parked by an upgrade that ran before emerge was
+installed has no ancestor and cannot have one. Recovering it from the
+previous version's `.deb` in `/var/cache/apt/archives` is possible in
+principle and unreliable in practice — the old `.deb` is only there if
+nothing cleaned the cache since — so it would be a feature to build, not a
+fix to apply.
+
 **A conffile is bytes, and not necessarily UTF-8 ones.** `read_lines` and
 `_write` pair `encoding="utf-8", errors="surrogateescape"` so a byte that
 does not decode survives the round trip exactly. They used to read with

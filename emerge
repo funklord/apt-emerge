@@ -3263,7 +3263,15 @@ DEFAULT_CONF = {
     "replace-unmodified":   "yes",   # you never touched it -> take theirs
     "replace-wscomments":   "yes",   # only comments/whitespace differ
     "mergetool":            "",      # e.g. "meld {mine} {base} {theirs} -o {output}"
-    "merge":                "",      # dispatch-conf compat: "cmd '%s' '%s' '%s'"
+	# Portage's own default, verbatim, in dispatch-conf's positional form.
+	# It is a default rather than an empty string because a review with no
+	# archived ancestor offers exactly one way to actually merge the file --
+	# the mergetool -- so an unconfigured one turned that review into a
+	# choice between discarding your edits and discarding the update.
+	# sdiff is from diffutils, which is Essential on Debian, so unlike meld
+	# or kdiff3 it is on every machine this runs on.
+    "merge":                "sdiff --suppress-common-lines "
+                            "--output='%s' '%s' '%s'",
     "diff":                 "",      # external diff for display; empty = built-in
 }
 
@@ -3594,6 +3602,24 @@ def pending_notice(conf):
 
 # -- the review workflow ----------------------------------------------------
 
+def mergetool_program(conf):
+	"""The program a mergetool template runs, or None if none is configured.
+
+    Best-effort by design: a template is a shell command line, so one that
+    is a pipeline or carries a leading VAR=x assignment has no single
+    program to name. The first word is the right answer for every template
+    anyone writes, and the only thing this is used for is naming the tool in
+    the menu and saying when it is not installed -- so a template it cannot
+    read is offered anyway rather than hidden."""
+	tmpl = conf["mergetool"] or conf["merge"]
+	if not tmpl:
+		return None
+	try:
+		words = shlex.split(tmpl)
+	except ValueError:                             # unbalanced quotes
+		return None
+	return words[0] if words else None
+
 def run_mergetool(conf, base, mine, theirs, output):
 	"""Hand off to a user-configured tool. Supports named placeholders and
     dispatch-conf's positional '%s' order (output, mine, theirs)."""
@@ -3624,7 +3650,21 @@ def run_mergetool(conf, base, mine, theirs, output):
 		eerror("  expected either {output}/{mine}/{theirs}/{base}, or "
 		       "dispatch-conf's three positional '%s'.")
 		return False
-	return subprocess.call(cmd, shell=True) == 0
+	# 2, not 0, and the difference is the whole feature working or not.
+	# sdiff belongs to the diff family, whose convention is 0 = no
+	# differences, 1 = differences, 2 = trouble -- so a *successful* sdiff
+	# merge of two files that differ exits 1, and every file dispatch-conf
+	# reviews differs, that being why it is being reviewed. Testing for 0
+	# discarded every sdiff merge with "mergetool did not produce a
+	# result", having written a perfectly good one.
+	#
+	# Measured rather than reasoned from the manual: a completed merge is
+	# 1 with the file written; quitting sdiff with `q` is 2 and it empties
+	# the output; EOF on stdin is 2; bad arguments are 2 with no file at
+	# all. A tool that returns 1 for something else -- kdiff3 does, on
+	# cancel -- is caught by the caller's seed check, since a cancelled
+	# tool leaves the output as it found it.
+	return subprocess.call(cmd, shell=True) < 2
 
 def _fsync_dir(path):
 	"""Make a rename durable. The file's own fsync does not cover the
@@ -3796,6 +3836,12 @@ def dispatch_conf(opts):
 		if base is None:
 			ewarn("no archived ancestor yet -- 2-way review only "
 			      "(3-way merging starts from the next upgrade)")
+			# Without an ancestor there is no merged version to offer, so
+			# 3 and 4 are absent and the menu reads as keep-or-replace.
+			# Say where the third answer is rather than leaving the reader
+			# to infer it from an option that is missing.
+			ewarn("no merged version to offer, so 3 and 4 are not listed; "
+			      "option 5 merges the two by hand")
 		elif conflicts:
 			ewarn(f"3-way merge against {src}: "
 			      f"{RED(str(conflicts))} conflict(s) need a decision")
@@ -3814,7 +3860,21 @@ def dispatch_conf(opts):
 				                   if conflicts else ""))
 				opts_txt.append(f"  {GREEN('4)')} edit the merged version "
 				                f"($EDITOR)")
-			opts_txt.append(f"  {GREEN('5)')} launch mergetool")
+			# Name the tool, and say when it is not there. A bare "launch
+			# mergetool" that answers "no mergetool configured" is a menu
+			# entry advertising something the program already knows it
+			# cannot do -- and on a 2-way review it is the only entry that
+			# merges anything, so the review dead-ends on it.
+			tool = mergetool_program(conf)
+			if tool is None:
+				opts_txt.append(f"  {GREEN('5)')} launch mergetool "
+				                f"({RED('none configured')}; set mergetool= "
+				                f"in {CONF_FILE})")
+			elif shutil.which(tool) is None:
+				opts_txt.append(f"  {GREEN('5)')} launch mergetool "
+				                f"({tool}: {RED('not installed')})")
+			else:
+				opts_txt.append(f"  {GREEN('5)')} launch mergetool ({tool})")
 			opts_txt.append(f"  {GREEN('6)')} show the diff again")
 			opts_txt.append(f"  {GREEN('s)')} skip this file")
 			opts_txt.append(f"  {GREEN('q)')} quit")
@@ -3852,6 +3912,15 @@ def dispatch_conf(opts):
 			elif choice == "5":
 				if not (conf["mergetool"] or conf["merge"]):
 					eerror("no mergetool configured; set mergetool= in "
+					       f"{CONF_FILE}")
+					continue
+				tool = mergetool_program(conf)
+				if tool is not None and shutil.which(tool) is None:
+					# Otherwise this is a shell exit of 127 reported as
+					# "did not produce a result", which describes the
+					# symptom and hides the cause.
+					eerror(f"the configured mergetool '{tool}' is not "
+					       f"installed; install it or set mergetool= in "
 					       f"{CONF_FILE}")
 					continue
 				with tempfile.TemporaryDirectory() as td:
@@ -3977,6 +4046,8 @@ whichever comes first. --help, --version and --info answer and exit.
                  mergetool="meld {{mine}} {{base}} {{theirs}} -o {{output}}"
                  or dispatch-conf's own positional form
                  merge="sdiff --suppress-common-lines --output='%s' '%s' '%s'"
+                 That sdiff line is the default, so the mergetool option
+                 works with no configuration at all; mergetool= overrides it.
 
    --search (-s) Searches for matches of the supplied string in the synced
                  tree. The search string is a case-insensitive regular
