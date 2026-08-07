@@ -4652,8 +4652,8 @@ whichever comes first. --help, --version and --info answer and exit.
                  {CONF_FILE_ALT}), keys:
                  archive-dir, config-protect, config-protect-mask,
                  frozen-files, automerge, replace-unmodified,
-                 replace-wscomments, recover-ancestor, and mergetool
-                 -- e.g.
+                 replace-wscomments, recover-ancestor, mergetool, merge
+                 and diff. For example
                  mergetool="meld {{mine}} {{base}} {{theirs}} -o {{output}}"
                  or dispatch-conf's own positional form
                  merge="sdiff --suppress-common-lines --output='%s' '%s' '%s'"

@@ -3833,6 +3833,40 @@ class TestPackaging(unittest.TestCase):
 		return {opt for line in tagged
 		        for opt in re.findall(r"--[a-z][a-z-]*", line)}
 
+	def _key_list(self, text, start, end):
+		"""The sentence that enumerates the config keys, and only it.
+
+        Scoped rather than searched over the whole document for the reason
+        the option scrape is: `diff` and `merge` are ordinary words, so "is
+        the string present" would pass for a key nobody had listed."""
+		i = text.find(start)
+		self.assertNotEqual(i, -1, f"key list not found: {start!r}")
+		j = text.find(end, i)
+		self.assertNotEqual(j, -1, f"key list has no end: {end!r}")
+		return text[i:j]
+
+	def test_every_config_key_is_listed_in_the_man_page(self):
+		"""Options are held to the man page in both directions; the config
+        keys were held to nothing, and a man page cannot point at
+        DEFAULT_CONF the way project.md now does. Both lists had gone
+        behind it -- the page missing recover-ancestor, --help missing that
+        and `diff` besides."""
+		listed = self._key_list(self.read("emerge.1"),
+		                        "Config-merging settings. Keys:", ".\n")
+		missing = sorted(k for k in em.DEFAULT_CONF if k not in listed)
+		self.assertEqual(missing, [],
+		                 f"in DEFAULT_CONF but not listed in emerge.1: "
+		                 f"{missing}")
+
+	def test_every_config_key_is_listed_in_help(self):
+		"""--help is what you have on a box you only copied the script to,
+        so the list there has to be the whole list too."""
+		listed = self._key_list(em.HELP, "keys:", "For example")
+		missing = sorted(k for k in em.DEFAULT_CONF if k not in listed)
+		self.assertEqual(missing, [],
+		                 f"in DEFAULT_CONF but not listed in --help: "
+		                 f"{missing}")
+
 	def test_every_option_in_help_has_its_own_man_page_entry(self):
 		documented = set(re.findall(r"^ {3}(--[a-z][a-z-]*)", em.HELP, re.M))
 		self.assertGreater(len(documented), 15, "option scrape found too few")
