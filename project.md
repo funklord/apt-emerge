@@ -1366,10 +1366,12 @@ Beyond the two backends, `test_integration.py` also covers:
 `unmerge_candidates` and `merge` aftermath, `print_unmerge_list`, the
 signature-verification code, and session detection.
 
-Three suites are **differential or property-based** rather than hand-written
-expectations, because a hand-authored case encodes what its author believed
-the reference does — so when the author misreads it, the code and the test
-are wrong together and agree forever. Keep them that way:
+Several suites are **differential or property-based** rather than
+hand-written expectations, because a hand-authored case encodes what its
+author believed the reference does — so when the author misreads it, the
+code and the test are wrong together and agree forever. Keep them that way,
+and add to them rather than counting them: this sentence said "three" while
+a fourth sat below it, having been added without anyone looking up.
 
 - `ndu_solve` is checked against **brute force** on random package graphs
   small enough to enumerate. Three invariants: a returned plan never moves an
@@ -1383,6 +1385,11 @@ are wrong together and agree forever. Keep them that way:
   fuzz over generated versions, because the table encodes what its author
   believed policy says and dpkg encodes what it is. 4,000 random pairs
   during development, no disagreement; 120 per run in the suite.
+- `merge2` has one invariant and it is the whole claim a merge makes:
+  resolving every conflict to the left reproduces your file exactly, and to
+  the right reproduces the new one exactly. Nothing dropped, nothing
+  invented, whatever alignment difflib picks. See the config-merging
+  section for why it exists.
 - `merge3` implements `diff3 -m`'s **rules**, and those four are
   property-tested on random inputs: one-sided change taken from that side,
   identical change taken once, unchanged region kept, real divergence

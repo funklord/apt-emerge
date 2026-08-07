@@ -161,7 +161,10 @@ case only encodes what its author believed:
   `dpkg --compare-versions` and must agree.
 - `merge3` is held to the four rules it documents, property-tested over tens
   of thousands of random inputs, and its clean merges are compared against
-  real `diff3`.
+  real `diff3`. `merge2`, the two-way form used when no ancestor can be
+  had, is held to the one invariant that matters: resolving every conflict
+  to one side reproduces that side exactly, so nothing is dropped and
+  nothing invented.
 - The `--no-dep-upgrade` solver is checked against brute force on random
   package graphs small enough to enumerate: a plan may never move an
   installed package, it must satisfy every dependency it pulls in, and a
@@ -192,8 +195,13 @@ covered:
   a foreign architecture has been added (`dpkg --add-architecture i386`) and
   a package is installed for both, it sees only one of them. It says so
   rather than working from half a view, and refuses an unmerge it cannot
-  disambiguate — but use the apt backend on such a system. The apt backend is
-  unaffected, since apt does the resolving there.
+  disambiguate — but use the apt backend on such a system. Resolving is
+  unaffected there, since apt does it. Config merging is not a backend
+  feature and *is* affected on both: recovering a shipped config file looks
+  in the native architecture's index, so a package installed only for a
+  foreign one gets a two-way review instead of an ancestor. It degrades
+  rather than guessing — the ancestor is never taken from a same-named
+  package of another architecture.
 - `emerge -C` means slightly different things on the two backends, because
   the underlying tools do. `apt-get remove` takes everything depending on the
   target with it, so the apt backend shows you that whole list and asks;
