@@ -1929,7 +1929,13 @@ class AncestorRecoveryEndToEnd(unittest.TestCase):
 		# The two local lookups are what this test is not about: no .deb in
 		# the cache, and apt is not asked. What remains is the network path.
 		m._apt_downloaded_deb = lambda *a, **k: None
-		m.previous_version = lambda name, lines=None: ("1.0", self.stamp)
+		# Stubbed at the seam recovery actually uses -- the batched history
+		# -- rather than at previous_version, which it stopped calling when
+		# the per-package log scan was replaced by a single pass. These
+		# three tests caught that themselves, by recovering nothing.
+		m.package_histories = lambda names, lines=None: {
+		    n: [(self.stamp, "1.0"), ("20260615T133729Z", "1.1")]
+		    for n in names}
 		m.owners_of = lambda paths: {p: "emtest" for p in paths}
 		m.capture = lambda cmd, env=None: types.SimpleNamespace(
 		    stdout=self.ARCH + "\n", returncode=0)

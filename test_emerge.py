@@ -879,6 +879,22 @@ class TestAncestorRecovery(unittest.TestCase):
 	def setUp(self):
 		self.mod = load()
 
+	def patch_run(self, fn):
+		"""Patch subprocess.run and shutil.which for one test.
+
+        The originals are captured *before* the patch, not read back
+        afterwards: `subprocess` is the same module object the script
+        imports, so reading it inside addCleanup restores the patch over
+        itself and leaks it into every test that follows, in every file.
+        Written the wrong way first, which took out 84 tests and was named
+        by the module sentinel rather than by anything nearer."""
+		original_run = self.mod.subprocess.run
+		original_which = self.mod.shutil.which
+		self.addCleanup(setattr, self.mod.subprocess, "run", original_run)
+		self.addCleanup(setattr, self.mod.shutil, "which", original_which)
+		self.mod.subprocess.run = fn
+		self.mod.shutil.which = lambda n: "/usr/bin/" + n
+
 	def test_the_ancestor_is_the_version_before_the_current_one(self):
 		v, when = self.mod.previous_version("bash", self.LOG)
 		self.assertEqual(v, "5.2.37-2+b8")
@@ -944,6 +960,67 @@ class TestAncestorRecovery(unittest.TestCase):
 		                       "/etc/nanorc": "nano"})
 		self.assertEqual(len(calls), 1, "one call, not one per file")
 
+	def test_every_package_is_read_in_one_pass_over_the_log(self):
+		"""The log is 33,000 lines on the development box and a review can
+        span twenty packages. Scanning it once per package is the same
+        per-item mistake this file has paid for twice already."""
+		passes = []
+		real = self.mod.dpkg_log_lines
+		def counted():
+			passes.append(1)
+			return iter(self.LOG)
+		self.mod.dpkg_log_lines = counted
+		got = self.mod.package_histories(["bash", "nano"])
+		self.assertEqual(len(passes), 1, "one pass, not one per package")
+		self.assertEqual([v for _, v in got["bash"]],
+		                 ["5.2.37-2+b8", "5.2.37-2+b9"])
+		self.assertEqual([v for _, v in got["nano"]], ["8.5-1"])
+
+	def test_a_recovery_run_reads_the_log_once_for_all_packages(self):
+		"""The one above pins the batched reader; this pins that recovery
+        uses it. Without this, reverting the caller to a call per package
+        passed everything -- the seam was tested, its use was not."""
+		passes = []
+		self.mod.dpkg_log_lines = lambda: (passes.append(1), iter(self.LOG))[1]
+		self.mod.owners_of = lambda paths, chunk=500: {
+		    "/etc/a": "bash", "/etc/b": "nano"}
+		self.mod.ancestor_for = lambda conf, path: (None, None)
+		self.mod._cached_deb = lambda *a: None
+		self.mod._apt_downloaded_deb = lambda *a, **k: None
+		self.mod._snapshot_deb = lambda *a, **k: None
+		self.mod.capture = lambda cmd, env=None: types.SimpleNamespace(
+		    stdout="amd64\n", returncode=0)
+		self.mod.einfo = self.mod.ewarn = lambda msg: None
+		self.mod.Verifier = lambda *a, **k: types.SimpleNamespace(
+		    enabled=False)
+		self.mod.recover_ancestors({"archive-dir": "/nonexistent"},
+		                           ["/etc/a", "/etc/b"])
+		self.assertEqual(len(passes), 1, "one pass, not one per package")
+
+	def test_a_diversion_is_not_read_as_a_package_name(self):
+		"""dpkg-query answers a diverted path with
+        `diversion by util-linux-extra from: /sbin/mkfs.bfs` and names no
+        owner at all. Split on the colon it becomes the package "diversion
+        by util-linux-extra from", and the reply also carries the
+        diverted-to path, which nobody asked about."""
+		self.mod.capture = lambda cmd, env=None: types.SimpleNamespace(
+		    stdout="diversion by util-linux-extra from: /sbin/mkfs.bfs\n"
+		           "diversion by util-linux-extra to: /sbin/mkfs.bfs.moved\n"
+		           "bash: /etc/bash.bashrc\n", returncode=0)
+		got = self.mod.owners_of(["/sbin/mkfs.bfs", "/etc/bash.bashrc"])
+		self.assertEqual(got, {"/etc/bash.bashrc": "bash"})
+
+	def test_the_query_is_chunked_so_the_argument_list_cannot_overflow(self):
+		"""Same reason conffiles_of is chunked, and the failure is the whole
+        call rather than a slow one."""
+		sizes = []
+		def fake(cmd, env=None):
+			sizes.append(len(cmd) - 2)
+			return types.SimpleNamespace(stdout="", returncode=0)
+		self.mod.capture = fake
+		self.mod.owners_of([f"/etc/f{i}" for i in range(1100)], chunk=500)
+		self.assertEqual(sizes, [500, 500, 100])
+
 	def test_a_cached_deb_is_found_through_the_epoch_escape(self):
 		d = tempfile.mkdtemp(prefix="emerge-aptcache-")
 		self.addCleanup(shutil.rmtree, d, True)
@@ -951,6 +1028,37 @@ class TestAncestorRecovery(unittest.TestCase):
 		self.mod.APT_CACHE_DIR = d
 		self.assertTrue(self.mod._cached_deb("tzdata", "4:1.2-3", "amd64"))
 		self.assertIsNone(self.mod._cached_deb("tzdata", "4:1.2-4", "amd64"))
+
+	def test_the_apt_download_path_asks_for_the_exact_version(self):
+		"""The middle source, and the one nothing ran until it was looked
+        for -- the same shape as --fetchonly, which twenty-one mentions in
+        the suite never once executed."""
+		d = tempfile.mkdtemp(prefix="emerge-aptdl-")
+		self.addCleanup(shutil.rmtree, d, True)
+		seen = []
+		def fake_run(cmd, **kw):
+			seen.append(cmd)
+			open(os.path.join(kw["cwd"], "bash_5.2.37-2+b8_amd64.deb"),
+			     "w").close()
+			return types.SimpleNamespace(returncode=0)
+		self.patch_run(fake_run)
+		got = self.mod._apt_downloaded_deb("bash", "5.2.37-2+b8", d)
+		self.assertTrue(got and got.endswith("bash_5.2.37-2+b8_amd64.deb"))
+		self.assertIn("bash=5.2.37-2+b8", seen[0])
+
+	def test_a_failed_apt_download_is_not_used_even_if_it_left_a_file(self):
+		"""An interrupted download exits non-zero having written part of a
+        .deb. Taking the file anyway hands dpkg-deb a truncated archive --
+        which degrades to a 2-way review rather than corrupting anything,
+        but for a reason nobody could find. Written without the leftover
+        file first, where the assertion held whatever the code did."""
+		d = tempfile.mkdtemp(prefix="emerge-aptdl-")
+		self.addCleanup(shutil.rmtree, d, True)
+		def fake_run(cmd, **kw):
+			open(os.path.join(kw["cwd"], "bash_9.9_amd64.deb"), "w").close()
+			return types.SimpleNamespace(returncode=1)
+		self.patch_run(fake_run)
+		self.assertIsNone(self.mod._apt_downloaded_deb("bash", "9.9", d))
 
 
 class TestSnapshotChain(unittest.TestCase):
@@ -1030,6 +1138,36 @@ class TestSnapshotChain(unittest.TestCase):
 		self.assertIsNone(self.mod._snapshot_deb(v, "bash", "1.0", "amd64",
 		                                         "20260410T120436Z", "/tmp"))
 		self.assertEqual(self.fetched, [])
+
+	def test_an_oversized_index_is_skipped_not_fatal(self):
+		"""fetch and decompress_bounded raise RuntimeError for their size
+        ceilings, which is a mirror spending this process's memory rather
+        than a broken chain. Uncaught it took the whole review down with it
+        -- so any source could abort a command whose job is reviewing
+        config files, over data that is only an optimisation."""
+		def body(url):
+			if url.endswith("Packages"):
+				raise RuntimeError("larger than 536870912 bytes; refusing")
+			return b"deb"
+		self.mod.fetch = self._fetch(body)
+		self.assertIsNone(self.mod._snapshot_deb(
+		    self._verifier(), "bash", "1.0", "amd64",
+		    "20260410T120436Z", "/tmp"))
+
+	def test_a_release_that_does_not_verify_is_skipped_and_said_out_loud(self):
+		"""Not fatal: an archive key rotated since the snapshot fails
+        exactly as a forgery does, and an old ancestor must not be able to
+        block the review. Not silent either, because the other cause is a
+        forgery."""
+		v = self._verifier()
+		def boom(base, suite, signed_by=None):
+			raise RuntimeError("InRelease signature verification FAILED")
+		v.release = boom
+		self.mod.fetch = self._fetch(lambda u: b"")
+		self.assertIsNone(self.mod._snapshot_deb(
+		    v, "bash", "1.0", "amd64", "20260410T120436Z", "/tmp"))
+		self.assertTrue(any("did not verify" in w for w in self.warnings),
+		                self.warnings)
 
 	def test_repositories_snapshot_does_not_carry_are_skipped(self):
 		"""Third-party sources -- docker, a PPA -- are not on snapshot, and
@@ -4761,6 +4899,22 @@ class TestDispatchConf(unittest.TestCase):
 		self.dispatch("5", "s")
 		self.assertTrue(any("no mergetool configured" in e for e in errs), errs)
 		self.assertTrue(self.parked_exists(t))
+
+	def test_nothing_is_fetched_for_a_file_the_review_never_asks_about(self):
+		"""A frozen file and one whose update is byte-identical are both
+        resolved without ever consulting an ancestor. Fetching ten
+        megabytes to answer a question nobody asks is how a default gets
+        turned off."""
+		asked = []
+		self.mod.recover_ancestors = lambda conf, targets, verifier=None: \
+		    asked.extend(targets)
+		self.conf["recover-ancestor"] = "yes"
+		self.conf["frozen-files"] = os.path.join(self.etc, "frozen.conf")
+		self.park("frozen.conf", "mine\n", "theirs\n")
+		self.park("same.conf", "same\n", "same\n")
+		self.park("real.conf", "mine\n", "theirs\n")
+		self.dispatch("s")
+		self.assertEqual(asked, [os.path.join(self.etc, "real.conf")])
 
 	def test_the_menu_names_the_tool_option_5_will_launch(self):
 		"""Option 5 used to read "launch mergetool" whatever the state, and

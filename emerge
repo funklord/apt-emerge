@@ -3692,29 +3692,49 @@ def _log_stamp(date, clock):
 		return None
 	return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(local))
 
-def package_history(name, lines=None):
-	"""[(when, version)] -- every version of `name` this machine has had,
-    oldest first, from dpkg's own log.
+def package_histories(names, lines=None):
+	"""{name: [(when, version)]} -- every version of each named package this
+    machine has had, oldest first, from dpkg's own log.
+
+    One pass for all of them rather than one pass each: the log is 33,000
+    lines on the development box and a review can easily span twenty
+    packages, which is the same per-item mistake this file has already paid
+    for twice (a fork per search result, then a fork per package in
+    `archive_settled`).
 
     A same-version entry is dropped: dpkg logs a reinstall as
     `upgrade pkg 1.0 1.0`, and counting that as a change would make a
     package its own ancestor."""
-	out = []
+	want = set(names)
+	out = {n: [] for n in want}
+	if not want:
+		return out
 	for line in dpkg_log_lines() if lines is None else lines:
 		f = line.split()
 		if len(f) < 6 or f[2] not in ("install", "upgrade"):
 			continue
-		if f[3].split(":")[0] != name:
+		name = f[3].split(":")[0]
+		if name not in want:
 			continue
 		version = f[-1]
 		if version == "<none>":
 			continue
-		if out and out[-1][1] == version:
+		got = out[name]
+		if got and got[-1][1] == version:
 			continue
 		when = _log_stamp(f[0], f[1])
 		if when:
-			out.append((when, version))
+			got.append((when, version))
 	return out
+
+def package_history(name, lines=None):
+	"""[(when, version)] for one package. See `package_histories`."""
+	return package_histories([name], lines)[name]
+
+def _previous(events):
+	if len(events) < 2:
+		return None, None
+	return events[-2][1], events[-2][0]
 
 def previous_version(name, lines=None):
 	"""(version, when it was installed) for the version this machine ran
@@ -3725,29 +3745,41 @@ def previous_version(name, lines=None):
     of the upgrade the archive already holds the new version, so a snapshot
     taken then does not contain the one being looked for. Found by trying
     it the wrong way round first."""
-	events = package_history(name, lines)
-	if len(events) < 2:
-		return None, None
-	return events[-2][1], events[-2][0]
+	return _previous(package_history(name, lines))
 
-def owners_of(paths):
-	"""{path: package} from one batched `dpkg-query -S`.
+def owners_of(paths, chunk=500):
+	"""{path: package} from `dpkg-query -S`, batched.
 
     Batched for the reason recorded elsewhere in this file: one fork per
-    file was measured 163x slower on 200 packages, and a review can easily
-    span that many."""
+    file was measured 163x slower on 200 packages. Chunked for the reason
+    `conffiles_of` is -- a review can name more files than an argument list
+    holds, and the failure is the whole call, not a slow one.
+
+    Two shapes of output are refused rather than parsed. A diverted file
+    answers `diversion by util-linux-extra from: /sbin/mkfs.bfs` and names
+    no owner at all, which the obvious split turns into the package
+    "diversion by util-linux-extra from"; and the reply carries the
+    diverted-*to* path as well, which nobody asked about. Both are dropped,
+    so a diverted conffile gets a 2-way review rather than an ancestor
+    fetched for the wrong package."""
 	out = {}
-	if not paths:
-		return out
-	r = capture(["dpkg-query", "-S"] + list(paths), env=parse_env())
-	for line in r.stdout.splitlines():
-		pkgs, _, path = line.partition(": ")
-		if not path:
-			continue
-		# "pkg:arch, other: /path" -- diversions and multiarch both show up
-		name = pkgs.split(",")[0].split(":")[0].strip()
-		if name:
-			out[path.strip()] = name
+	paths = list(paths)
+	for i in range(0, len(paths), chunk):
+		batch = paths[i:i + chunk]
+		wanted = set(batch)
+		r = capture(["dpkg-query", "-S"] + batch, env=parse_env())
+		for line in r.stdout.splitlines():
+			if line.startswith("diversion by ") or \
+			   line.startswith("local diversion "):
+				continue
+			pkgs, _, path = line.partition(": ")
+			path = path.strip()
+			if path not in wanted:
+				continue
+			# "pkg:arch, other: /path" -- multiarch and shared files both
+			name = pkgs.split(",")[0].split(":")[0].strip()
+			if name:
+				out[path] = name
 	return out
 
 def _cached_deb(name, version, arch):
@@ -3808,7 +3840,20 @@ def _snapshot_deb(verifier, name, version, arch, when, into):
 		snap = f"{SNAPSHOT_URL}/{archive}/{when}"
 		try:
 			text = verifier.release(snap, suite, signed_by)
-		except (RuntimeError, urllib.error.URLError, OSError):
+		except RuntimeError as e:
+			# Not fatal, and not silent either. --sync stops here, but this
+			# is optional data on a command whose job is reviewing config
+			# files, and the commonest cause is a key rotated since the
+			# snapshot rather than anything sinister: an archive key the
+			# machine no longer carries fails exactly as a forgery does,
+			# and refusing to run the review over that would make an old
+			# ancestor able to block the whole command. So skip the source
+			# -- and say so, because the other cause is a forgery.
+			ewarn(f"  {e}")
+			ewarn(f"  not taking an ancestor from {suite}: its signature "
+			      f"did not verify")
+			continue
+		except (urllib.error.URLError, OSError):
 			continue
 		if not text:
 			continue
@@ -3819,13 +3864,26 @@ def _snapshot_deb(verifier, name, version, arch, when, into):
 				if relpath not in hashes:
 					continue
 				try:
+					# RuntimeError is caught here and not around the check
+					# below on purpose: fetch and decompress_bounded raise
+					# it for their *size ceilings*, which is a mirror
+					# spending this process's memory, not a broken chain.
+					# Aborting the whole review over one oversized index
+					# would let any source take the command down with it.
 					raw = fetch(f"{snap}/dists/{suite}/{relpath}",
 					            limit=MAX_INDEX_BYTES)
-					if not verifier.check_index(snap, suite, signed_by,
-					                            relpath, raw):
-						break
+				except (urllib.error.URLError, OSError, ValueError,
+				        RuntimeError):
+					break
+				# Outside the guard: a hash that disagrees with a Release
+				# that *did* verify is tampering rather than a limit, and
+				# stops the run the way it stops --sync.
+				if not verifier.check_index(snap, suite, signed_by,
+				                            relpath, raw):
+					break
+				try:
 					index = decompress_bounded(raw, ext)
-				except (urllib.error.URLError, OSError, ValueError):
+				except (RuntimeError, ValueError, OSError):
 					break
 				stanza = _index_stanza(index.decode("utf-8", "replace"),
 				                       name, version, arch)
@@ -3835,7 +3893,8 @@ def _snapshot_deb(verifier, name, version, arch, when, into):
 					size = int(stanza.get("Size", MAX_DEB_BYTES))
 					deb = fetch(f"{snap}/{stanza['Filename']}",
 					            limit=min(size, MAX_DEB_BYTES))
-				except (urllib.error.URLError, OSError, ValueError, KeyError):
+				except (urllib.error.URLError, OSError, ValueError, KeyError,
+				        RuntimeError):
 					break
 				got = hashlib.sha256(deb).hexdigest()
 				want = stanza.get("SHA256")
@@ -3902,9 +3961,10 @@ def recover_ancestors(conf, targets, verifier=None):
 	arch = capture(["dpkg", "--print-architecture"], env=parse_env()).stdout
 	arch = arch.strip() or "all"
 	verifier = verifier if verifier is not None else Verifier()
+	history = package_histories(list(by_pkg))
 	found = 0
 	for pkg, paths in sorted(by_pkg.items()):
-		version, when = previous_version(pkg)
+		version, when = _previous(history[pkg])
 		if not version:
 			continue
 		with tempfile.TemporaryDirectory(prefix="emerge-ancestor-") as td:
@@ -4162,8 +4222,22 @@ def dispatch_conf(opts):
 	if conf_yes(conf, "recover-ancestor"):
 		# Before the loop, so one .deb answers for every file it ships and
 		# the review is not interrupted by a download between two questions.
+		#
+		# Only for files the review will actually put a question about: a
+		# frozen file and one whose update is byte-identical are both
+		# resolved below without ever consulting an ancestor, and fetching
+		# ten megabytes to answer a question nobody asks is the sort of
+		# waste that gets a default turned off.
+		want = []
+		for target, pending in pend:
+			if target in frozen:
+				continue
+			mine, theirs = read_lines(target), read_lines(pending)
+			if mine is None or theirs is None or mine == theirs:
+				continue
+			want.append(target)
 		try:
-			recover_ancestors(conf, [t for t, _ in pend])
+			recover_ancestors(conf, want)
 		except RuntimeError as e:
 			# A hash that does not match the signed index is a failure, not
 			# an inability, and is the one thing here that stops the run --

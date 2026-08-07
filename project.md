@@ -731,7 +731,54 @@ package owns (`/etc/sysctl.conf` here) is skipped rather than guessed at.
 `.deb`, and it exists in that shape because mutation testing found the
 stubbed tests insufficient: bypassing `check_index` left every end-to-end
 test passing. A tampered `.deb` and a tampered index both stop the run; an
-untrusted signature quietly recovers nothing.
+untrusted signature recovers nothing and says why.
+
+### What a self-audit of the recovery found
+
+Asked "what else did you miss", and worth recording because the answer was
+seven things and none of them was the part anybody was looking at:
+
+- **`owners_of` did not chunk**, while its sibling `conffiles_of` does and
+  carries a test for exactly that. A review naming more files than an
+  argument list holds fails as a whole, not slowly.
+- **A diverted file was parsed into a package name.** `dpkg-query -S`
+  answers `diversion by util-linux-extra from: /sbin/mkfs.bfs` and names
+  no owner, which the obvious split turns into a package called "diversion
+  by util-linux-extra from" — and the reply carries the diverted-*to* path
+  as well, which nobody asked about. Both are dropped now.
+- **A size ceiling took the whole review down.** `fetch` and
+  `decompress_bounded` raise `RuntimeError` for their own limits, which was
+  not in the caught set, so any mirror serving an oversized index could
+  abort a command whose job is reviewing config files. The guard now covers
+  the limits and deliberately does *not* cover `check_index`, where a
+  mismatch really is tampering and really should stop.
+- **A Release that failed to verify was skipped in complete silence.** It
+  stays non-fatal — an archive key rotated since the snapshot fails exactly
+  as a forgery does, and an old ancestor must not be able to block the
+  review — but silence was the wrong half of that trade.
+- **The log was re-read per package.** 33,000 lines on this box, once for
+  each package in the review: the same per-item mistake this file has paid
+  for twice. One pass now.
+- **Ancestors were fetched for files nobody would be asked about.** A
+  frozen file and a byte-identical update are both resolved without one, so
+  that was ten megabytes spent per file to answer a question that never
+  gets put.
+- **`_apt_downloaded_deb` had no test at all** — the middle of three
+  sources, the same shape as `--fetchonly` before anyone looked.
+
+Two of the fixes were themselves caught by their own tests rather than by
+review, which is the part worth keeping:
+
+- Batching the log lookup **bypassed the seam three end-to-end tests
+  stubbed** (`previous_version`), and they reported it by recovering
+  nothing. They stub `package_histories` now, which is what the code
+  actually calls.
+- The first `_apt_downloaded_deb` test patched `subprocess.run` and
+  captured the "original" *after* patching, so cleanup restored the patch
+  over itself and leaked it into everything that followed — 84 failures in
+  files that had nothing to do with it. That is the exact hazard
+  `TestRunMergetool`'s setUp documents, and the module sentinel named it in
+  the run that caused it, which is the whole reason the sentinel exists.
 
 **A conffile is bytes, and not necessarily UTF-8 ones.** `read_lines` and
 `_write` pair `encoding="utf-8", errors="surrogateescape"` so a byte that
