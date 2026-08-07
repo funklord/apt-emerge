@@ -26,6 +26,14 @@ indent_names = ["Makefile"]
 # deliberately, so adding a document does not require touching this.
 floor = 8
 
+# ASCII outside string literals. This project used to leave the check off
+# altogether, because it prints two status ticks and they live in the
+# source as f-strings -- so the only way to allow those was to allow an em
+# dash in a comment as well, and one duly arrived. The gate distinguishes
+# the two for Python now, which is what the rule always said: a tick a
+# program prints is output, not prose.
+ascii_only = true
+
 # `exclude` used to be set here, naming dist, .pytest_cache and .claude on
 # top of the defaults -- because the git and plain-walk discovery paths
 # disagreed about them. Those three are in the shipped defaults now, so

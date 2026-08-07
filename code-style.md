@@ -168,19 +168,18 @@ software handles. Documentation may use typographic punctuation; so may
 user-facing text in UI software, and anything that genuinely requires
 Unicode.
 
-**This project is excepted** and does not enable the check: it prints status
-ticks, and that output lives in the source as string literals.
+**This project enables the check**, and did not used to. `ascii_only` was
+all-or-nothing: the program prints two status ticks which live in the
+source as `f`-strings, so the only way to allow those was to allow an em
+dash in a comment as well -- and one duly arrived, found by grepping for
+non-ASCII rather than by any gate.
 
-**The exception is what let one through.** `ascii_only` is all-or-nothing,
-so two ticks in `f`-strings switched the check off for the whole file --
-and an em dash reached a comment, where the rule plainly forbids one. Found
-by grepping for it rather than by any gate, and fixed; the two ticks are
-the only non-ASCII left, which is the state the exception was granted for.
-
-The narrower check the project actually wants is ASCII in comments with
-Unicode allowed in string literals -- a distinction `tokenize` makes for
-free. That is a change to the shared tool and therefore to seven trees, so
-it is raised here rather than made.
+The gate distinguishes the two for Python now, which is what the rule
+always said: a tick a program prints is output, not prose. Inside a string
+literal Unicode passes; anywhere else -- comments, identifiers -- it does
+not. Other languages keep the whole-file byte check, having no tokenizer
+in the gate, and a Python file that will not tokenise falls back to it too,
+because a file nobody can parse is not a file that has been cleared.
 
 ## The commit-msg hook
 
