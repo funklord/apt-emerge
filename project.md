@@ -202,7 +202,9 @@ as a rule: `wc -l` is right there.)
   translated apt output; unmerge/depclean delegate to apt; source builds
   (`resolve_source`/`build`) — `apt-get source` + `dpkg-buildpackage`, products
   to PKGDIR, `+local1` changelog bump so `@world` won't clobber local builds.
-- **Config-merge subsystem** (~1790–2190): dispatch-conf. See its section.
+- **Config-merge subsystem** (~1790–2190): dispatch-conf, and after it the
+  ancestor recovery that feeds it (`dpkg.log` parsing, the three sources for
+  a `.deb`, the snapshot chain). See its section.
 - **`HELP`, `LONG_FLAGS`, `pick_backend`, `main`, `_finish_merge`**
   (~2195–end): arg parsing (Portage-style bundled short flags), action
   dispatch, `NduWall` handling with the interactive escape hatch, `argv[0]`
@@ -294,10 +296,14 @@ is unaffected. Half-supporting it is the one answer nobody wanted.
   this program's own failures rather than from Portage's list, which is
   mostly compilers and USE flags: the backend in use, dpkg and apt versions,
   the architecture **and any foreign ones**, the locale, whether `gpgv` and
-  `lzma` are present, how many source entries are enabled, and what the
-  graphical session looks like from here. Every one of those has cost
-  somebody a misdiagnosis in the notes above. Like `--version` and `--help`
-  it answers and exits, constructing no backend and writing nothing.
+  `lzma` are present, how many source entries are enabled, what decides a
+  config review (the archive's size, whether ancestor recovery is on, how
+  many files are pending, whether `/var/log/dpkg.log` exists), and what the
+  graphical session looks like from here. Every one has cost somebody a
+  misdiagnosis in the notes below. `show_info` is the authority on the
+  current list rather than this paragraph, which has already fallen a row
+  behind once. Like `--version` and `--help` it answers and exits,
+  constructing no backend and writing nothing.
 
   Reading `--backend=` in argv order was a wart the two of them shared:
   `emerge --info --backend=dpkg` reported the apt backend and
@@ -574,10 +580,12 @@ Debian already parks updated conffiles as `.dpkg-dist`/`.ucf-dist` (== Portage's
 - `dispatch_conf()` — auto-applies unmodified / wscomments-only / conflict-free
   3-way; interactive only for real conflicts (keep/replace/merged/$EDITOR/
   mergetool/skip/quit).
-- Configurable via `/etc/emerge/dispatch-conf.conf` with Gentoo key names
-  (archive-dir, config-protect{,-mask}, frozen-files, automerge,
-  replace-unmodified, replace-wscomments, mergetool). `mergetool=` supports
-  `{base}{mine}{theirs}{output}` and dispatch-conf's positional `'%s' '%s' '%s'`.
+- Configurable via `/etc/emerge/dispatch-conf.conf` with Gentoo key names --
+  `DEFAULT_CONF` is the list, and was already ahead of the copy that used to
+  be here. `mergetool=` supports `{base}{mine}{theirs}{output}`;
+  `merge=` takes dispatch-conf's positional `'%s' '%s' '%s'` and defaults to
+  Portage's own `sdiff` line; `recover-ancestor=` turns off the fetch
+  described below.
 - Reachable as `--dispatch-conf`, `--etc-update`, or by symlinking the script.
 - Scope: dpkg conffiles + ucf-managed files only. Files a maintainer script
   writes into `/etc` are NOT protected (would need pre/post snapshots).
@@ -1359,12 +1367,16 @@ Beyond the two backends, `test_integration.py` also covers:
   parsing → backend selection → resolve → fetch → SHA256 → install → world
   file finally runs as one path.
 
-`python3 -m unittest test_emerge` — the unit half, stdlib only. Covers
-`vercmp`, `meets`, `parse_depends`, `parse_stanzas`, `merge3`, `_significant`,
-`_dep_ok`, `ndu_solve`, `_wall_from_merges`, `_with_arg`, `_AptIndex.has`,
-`_policy_batch`, `stream_apt`, `run_mergetool`, `_write`, the apt backend's
-`unmerge_candidates` and `merge` aftermath, `print_unmerge_list`, the
-signature-verification code, and session detection.
+`python3 -m unittest test_emerge` — the unit half, stdlib only. It covers
+the parsers and comparators (`vercmp`, `meets`, `parse_depends`,
+`parse_stanzas`), the solver, both merges, the config-review loop and
+ancestor recovery, the signature-verification decisions, the apt backend's
+plan and aftermath, and session detection.
+
+A name list used to stand here and had fallen four functions behind within
+a session of the last one being added. The class names in `test_emerge.py`
+say what is covered, they cannot go stale, and `grep '^class Test'` is
+right there -- the same reason there are no line counts in this file.
 
 Several suites are **differential or property-based** rather than
 hand-written expectations, because a hand-authored case encodes what its
