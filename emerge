@@ -4058,6 +4058,24 @@ def recover_ancestors(conf, targets, verifier=None, deadline=None):
 		return 0
 	einfo(f"{len(pending)} file(s) have no archived ancestor; "
 	      f"looking for the version each was shipped with")
+	# Native architecture only, and deliberately so. Both places a .deb is
+	# looked for are keyed by it -- the cache filename, and the
+	# binary-<arch> index on snapshot -- so a package installed *only* for
+	# a foreign architecture is not found and its config files get a 2-way
+	# review. That is the safe end of the failure: no ancestor rather than
+	# somebody else's.
+	#
+	# The ordinary multiarch case is unaffected, which is why this is a
+	# limitation and not a bug. A library installed for two architectures
+	# carries the same version in both, and dpkg logs them as separate
+	# lines that the same-version rule in package_histories collapses back
+	# into one history -- checked, not assumed. Where the two genuinely
+	# diverge, the log's last entry stops matching what dpkg reports and
+	# the agreement check in _previous refuses the answer.
+	#
+	# Keying the whole path by name:architecture is the same piece of work
+	# the dpkg backend declined for the same reason, and is recorded there:
+	# detect and degrade rather than half-support.
 	arch = capture(["dpkg", "--print-architecture"], env=parse_env()).stdout
 	arch = arch.strip() or "all"
 	verifier = verifier if verifier is not None else \

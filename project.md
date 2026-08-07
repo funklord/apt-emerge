@@ -733,6 +733,41 @@ stubbed tests insufficient: bypassing `check_index` left every end-to-end
 test passing. A tampered `.deb` and a tampered index both stop the run; an
 untrusted signature recovers nothing and says why.
 
+### Recovery is native-architecture, and that is a limitation
+
+Both places a `.deb` is looked for are keyed by the native architecture:
+the cache filename, and the `binary-<arch>` index on snapshot. A package
+installed **only** for a foreign architecture is therefore not found, and
+its config files get a 2-way review. That is the safe end of the failure
+— no ancestor rather than somebody else's — but it is silent, so it is
+written down here rather than left to be rediscovered.
+
+**The ordinary multiarch case is unaffected, which is what makes this a
+limitation rather than a bug**, and it was checked rather than assumed:
+
+- A library installed for two architectures carries the same version in
+  both. dpkg logs them as separate lines (`libfoo:amd64`, `libfoo:i386`)
+  and the same-version rule in `package_histories` collapses them back
+  into one history, so the ancestor comes out right.
+- Where the two genuinely diverge, the log's last entry stops matching
+  what dpkg reports and the agreement check in `_previous` refuses the
+  answer. `installed_state()` is keyed by name alone, so which of the two
+  it reports is not something to rely on — and here that does not matter,
+  because either way the answer is "give up".
+- `Architecture: all` is listed in every `binary-<arch>` index, so an
+  arch-independent package — which is most of what carries interesting
+  conffiles — is unaffected either way.
+
+All four are pinned by tests, so a later attempt to "fix" this cannot
+quietly start producing a *wrong* ancestor instead of none.
+
+Keying the whole path by `name:architecture` is the same piece of work
+the dpkg backend declined, for the same reason and recorded in its own
+section: **detect and degrade rather than half-support.** Unlike there,
+this one reaches the apt backend too, since `--dispatch-conf` is
+backend-independent — a desktop with i386 enabled is exactly where it
+would show up.
+
 ### Bounding it, for the network that does not answer
 
 A refused connection fails at once; one whose packets are dropped does

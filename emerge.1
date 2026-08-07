@@ -338,7 +338,12 @@ recovered file is trusted no further than the archive keys reach. Set
 .I recover-ancestor
 to
 .B no
-to keep a config review off the network. Requests it makes are bounded:
+to keep a config review off the network. Recovery is native-architecture
+only: a package installed solely for a foreign architecture is not found,
+and its config files get a two-way review rather than an ancestor taken
+from a same-named package of another architecture. A package installed for
+two architectures is unaffected, carrying the same version in both.
+Requests it makes are bounded:
 a shorter socket timeout than
 .B --sync
 uses, a ceiling on the whole pass, and a check that gives up on the

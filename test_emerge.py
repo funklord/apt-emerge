@@ -1109,6 +1109,56 @@ class TestAncestorRecovery(unittest.TestCase):
 		    deadline=time.monotonic() - 1))
 		self.assertEqual(fetched, [])
 
+	# -- multiarch, which recovery does not do ------------------------------
+
+	def test_two_architectures_in_lockstep_are_one_history(self):
+		"""dpkg logs `libfoo:amd64` and `libfoo:i386` as separate lines, and
+        a library installed for both carries the same version in each. The
+        same-version rule collapses them back into one history, so the
+        ordinary multiarch case is unaffected -- which is what makes
+        native-only recovery a limitation rather than a bug."""
+		log = ["2026-01-01 00:00:00 upgrade libfoo:amd64 0.9 1.0\n",
+		       "2026-01-01 00:00:01 upgrade libfoo:i386 0.9 1.0\n",
+		       "2026-02-01 00:00:00 upgrade libfoo:amd64 1.0 1.1\n",
+		       "2026-02-01 00:00:01 upgrade libfoo:i386 1.0 1.1\n"]
+		self.assertEqual([v for _, v in
+		                  self.mod.package_history("libfoo", log)],
+		                 ["1.0", "1.1"])
+		self.assertEqual(self.mod._previous(
+		    self.mod.package_history("libfoo", log), "1.1")[0], "1.0")
+
+	def test_two_architectures_that_diverge_yield_no_ancestor(self):
+		"""Where they are genuinely at different versions, the log's last
+        entry stops matching what dpkg reports and the answer is refused
+        rather than guessed -- installed_state is keyed by name alone, so
+        which of the two it reports is not something to rely on."""
+		log = ["2026-01-01 00:00:00 upgrade libfoo:i386 0.9 1.0\n",
+		       "2026-02-01 00:00:00 upgrade libfoo:amd64 1.0 1.1\n"]
+		self.assertEqual(self.mod._previous(
+		    self.mod.package_history("libfoo", log), "1.0"), (None, None))
+
+	def test_a_foreign_arch_package_is_not_found_in_the_native_index(self):
+		"""The documented limitation, pinned so it degrades the safe way. A
+        package installed only for a foreign architecture is absent from
+        binary-<native>, so no ancestor is produced and the file gets a
+        2-way review -- rather than an ancestor taken from a same-named
+        package of another architecture."""
+		index = ("Package: libfoo\nVersion: 1.0\nArchitecture: i386\n"
+		         "Filename: pool/f.deb\nSize: 3\nSHA256: x\n\n")
+		self.assertIsNone(
+		    self.mod._index_stanza(index, "libfoo", "1.0", "amd64"))
+		self.assertIsNotNone(
+		    self.mod._index_stanza(index, "libfoo", "1.0", "i386"))
+
+	def test_an_arch_all_package_is_still_found(self):
+		"""The counterpart, and the reason the test above is about foreign
+        architectures rather than about anything that is not the native
+        one: Architecture: all is listed in every binary-<arch> index."""
+		index = ("Package: libfoo\nVersion: 1.0\nArchitecture: all\n"
+		         "Filename: pool/f.deb\nSize: 3\nSHA256: x\n\n")
+		self.assertIsNotNone(
+		    self.mod._index_stanza(index, "libfoo", "1.0", "amd64"))
+
 	def test_a_diversion_is_not_read_as_a_package_name(self):
 		"""dpkg-query answers a diverted path with
         `diversion by util-linux-extra from: /sbin/mkfs.bfs` and names no
