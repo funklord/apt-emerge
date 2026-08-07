@@ -3757,8 +3757,26 @@ def package_history(name, lines=None):
 	"""[(when, version)] for one package. See `package_histories`."""
 	return package_histories([name], lines)[name]
 
-def _previous(events):
+def _previous(events, installed=None):
+	"""The version before the current one, and when it was installed.
+
+    `installed` is the version dpkg says is on the system now. When it is
+    given, the log's own last entry must agree with it, and the answer is
+    (None, None) when it does not.
+
+    That check is the difference between a missing ancestor and a wrong
+    one, and only the first is safe. This walks a *log* to conclude
+    something about the *system*, and the two can disagree: /var/log on a
+    volatile filesystem -- ordinary on the embedded boxes the dpkg backend
+    exists for -- keeps only what happened since boot, and a restored or
+    rebuilt /var/lib/dpkg brings its own history. A bare debian image has
+    no dpkg.log at all, which is safe precisely because it yields nothing.
+    Where the log is merely *behind*, the entry before its last is not the
+    ancestor of anything, and an ancestor that is wrong does not fail
+    visibly: it silently decides which side of a merge wins."""
 	if len(events) < 2:
+		return None, None
+	if installed is not None and events[-1][1] != installed:
 		return None, None
 	return events[-2][1], events[-2][0]
 
@@ -4026,13 +4044,17 @@ def recover_ancestors(conf, targets, verifier=None, deadline=None):
 	if deadline is None:
 		deadline = time.monotonic() + ANCESTOR_BUDGET
 	history = package_histories(list(by_pkg))
+	try:
+		installed = {n: st.get("Version") for n, st in installed_state().items()}
+	except OSError:
+		installed = {}
 	found = 0
 	for pkg, paths in sorted(by_pkg.items()):
 		if time.monotonic() > deadline:
 			ewarn(f"  giving up after {ANCESTOR_BUDGET}s; the rest get a "
 			      f"2-way review")
 			break
-		version, when = _previous(history[pkg])
+		version, when = _previous(history[pkg], installed.get(pkg))
 		if not version:
 			continue
 		with tempfile.TemporaryDirectory(prefix="emerge-ancestor-") as td:

@@ -776,6 +776,41 @@ object the test process uses, and this file has three leaked patches in
 its history to show for that kind of shortcut — one of them added while
 writing *these* tests, and caught by the sentinel rather than by review.
 
+### The log is evidence about the log, not about the system
+
+`previous_version` walks `dpkg.log` to conclude something about the
+machine, and the two can disagree. Where they do, the entry before the
+log's last one is the ancestor of nothing — and that failure is silent,
+because a wrong ancestor does not error: it decides which side of a merge
+wins.
+
+So the log's own last entry must match the version dpkg currently
+reports, and recovery gives up on that package when it does not. **A
+missing ancestor is safe; a wrong one is not**, and only the first was
+ever on offer here.
+
+The disagreement is not hypothetical. `/var/log` on a volatile filesystem
+keeps only what happened since boot, which is ordinary on exactly the
+embedded boxes the dpkg backend exists for; a restored or rebuilt
+`/var/lib/dpkg` brings a history the log never saw. A bare `debian:trixie`
+image has **no `/var/log/dpkg.log` at all** — checked, and safe precisely
+because it yields nothing rather than something plausible.
+
+Not knowing is treated differently from disagreeing: an installed version
+that cannot be determined does not veto the answer.
+
+### The wiring from recovery to review had no test
+
+Every test called `recover_ancestors` directly, so the path from what it
+archives to what the review actually merges against was never walked.
+That is the shape this file already names twice — a helper nothing wires
+up — so it gets its own test: park a file, have recovery archive the
+version both sides began from, and assert the review auto-merges
+three-way rather than conflicting over the whole difference.
+
+Mutation checked by making the review ignore `ancestor_for` entirely,
+which the new test catches along with four older ones.
+
 ### What a self-audit of the recovery found
 
 Asked "what else did you miss", and worth recording because the answer was

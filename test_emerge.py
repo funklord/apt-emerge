@@ -917,6 +917,38 @@ class TestAncestorRecovery(unittest.TestCase):
 		self.assertEqual([v for _, v in hist],
 		                 ["5.2.37-2+b8", "5.2.37-2+b9"])
 
+	def test_a_log_that_disagrees_with_dpkg_yields_no_ancestor(self):
+		"""This walks a *log* to conclude something about the *system*, and
+        the two can disagree -- /var/log on a volatile filesystem is
+        ordinary on the embedded boxes the dpkg backend exists for, and a
+        restored /var/lib/dpkg brings its own history. Where the log is
+        behind, the entry before its last is the ancestor of nothing, and a
+        wrong ancestor does not fail visibly: it decides which side of a
+        merge wins, silently.
+
+        A missing ancestor is safe; a wrong one is not, so disagreement
+        means give up."""
+		events = self.mod.package_history("bash", self.LOG)
+		self.assertEqual(self.mod._previous(events, "5.2.37-2+b9")[0],
+		                 "5.2.37-2+b8", "the agreeing case must still work")
+		self.assertEqual(self.mod._previous(events, "6.0-1"), (None, None))
+
+	def test_an_unknown_installed_version_does_not_veto(self):
+		"""Not knowing is different from disagreeing."""
+		events = self.mod.package_history("bash", self.LOG)
+		self.assertEqual(self.mod._previous(events, None)[0], "5.2.37-2+b8")
+
+	def test_recovery_skips_a_package_whose_log_is_behind(self):
+		"""And the check has to be wired in, not merely available."""
+		self._recovery_stubs()
+		self.mod.installed_state = lambda: {
+		    "pkg0": {"Version": "9.9-1"}}          # log says 1.1 is current
+		tried = []
+		self.mod._snapshot_deb = lambda *a, **k: tried.append(a[1])
+		self.mod.recover_ancestors({"archive-dir": "/nonexistent"},
+		                           ["/etc/a"])
+		self.assertEqual(tried, [])
+
 	def test_a_package_installed_once_has_no_ancestor(self):
 		self.assertEqual(self.mod.previous_version("nano", self.LOG),
 		                 (None, None))
@@ -927,10 +959,16 @@ class TestAncestorRecovery(unittest.TestCase):
 
 	def test_the_stamp_is_utc_not_the_local_clock(self):
 		"""dpkg writes local time with no zone and snapshot indexes UTC."""
+		# Restored, not removed: popping would delete a TZ the environment
+		# already had, for every test after this one. Unset here today,
+		# which is exactly why the wrong version would have looked right.
+		had = os.environ.get("TZ")
+		self.addCleanup(time.tzset)
+		self.addCleanup(
+		    lambda: os.environ.__setitem__("TZ", had) if had is not None
+		    else os.environ.pop("TZ", None))
 		os.environ["TZ"] = "Europe/Stockholm"       # UTC+2 in June
 		time.tzset()
-		self.addCleanup(time.tzset)
-		self.addCleanup(os.environ.pop, "TZ", None)
 		self.assertEqual(self.mod._log_stamp("2026-06-15", "13:37:29"),
 		                 "20260615T113729Z")
 
@@ -5071,6 +5109,35 @@ class TestDispatchConf(unittest.TestCase):
 		self.dispatch("5", "s")
 		self.assertTrue(any("no mergetool configured" in e for e in errs), errs)
 		self.assertTrue(self.parked_exists(t))
+
+	def test_a_recovered_ancestor_turns_the_review_three_way(self):
+		"""The whole point of recovery, and nothing covered it: every test
+        called recover_ancestors directly, so the path from what it
+        archives to what the review merges against was never walked. This
+        program has shipped two bugs of exactly that shape -- a helper
+        nothing wires up -- which is why the wiring gets its own test.
+
+        Two-way would conflict over the whole difference; three-way takes
+        each side's change and asks nothing."""
+		self.conf["recover-ancestor"] = "yes"
+		target = self.park("app.conf",
+		                   "mine = yes\nshared = 1\nkeep = old\n",
+		                   "mine = no\nshared = 1\nkeep = new\n")
+		# What recovery would have archived: the version both sides began
+		# from. Only `keep` moved on their side, only `mine` on ours.
+		def fake_recover(conf, targets, verifier=None, deadline=None):
+			for t in targets:
+				a = self.mod.archive_path(conf, t)
+				os.makedirs(os.path.dirname(a), exist_ok=True)
+				with open(a, "w") as f:
+					f.write("mine = no\nshared = 1\nkeep = old\n")
+			return len(targets)
+		self.mod.recover_ancestors = fake_recover
+		out = self.dispatch()
+		self.assertIn("auto-merged", out)
+		self.assertEqual(self.content(target),
+		                 "mine = yes\nshared = 1\nkeep = new\n")
+		self.assertFalse(self.parked_exists(target))
 
 	def test_nothing_is_fetched_for_a_file_the_review_never_asks_about(self):
 		"""A frozen file and one whose update is byte-identical are both
