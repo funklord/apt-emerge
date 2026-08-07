@@ -235,9 +235,33 @@ test: check-unit check-integration
 veryclean: clean
 	rm -rf $(BUILD_DIR)
 
+# **`distclean` no longer sweeps the tree for editor droppings.** `*~`,
+# `*.swp` and `*.orig` are not build output: they belong to somebody's
+# editor, and a `.orig` belongs to a merge they may be in the middle of.
+# The sweep was also unbounded -- `find .` walks `.git`, and it was measured
+# deleting files in there. `git clean -xdn` lists that class and is the
+# person's call rather than the build system's.
+#
+# **The cache line was doing nothing for the case it names first, and that
+# was measured rather than suspected.** It read
+#
+#     find . -name __pycache__ -o -name .pytest_cache -type d -prune -exec rm
+#
+# and `-a` binds tighter than `-o`, so it parses as `__pycache__` OR
+# (`.pytest_cache` AND -type d AND -prune AND -exec). A `__pycache__` match
+# satisfies the left branch, the action never runs, and there is no implicit
+# -print to make the silence visible: the target removed `.pytest_cache` and
+# left every `__pycache__` where it was. Parenthesising the two names is the
+# fix.
+#
+# What is removed is named exactly and is disposable by construction; the
+# search is a wildcard only because a cache appears beside whatever ran.
+# `.git` is pruned, and every removal is printed, because a clean target
+# that deletes silently is one nobody can check.
 distclean: veryclean
-	find . -name '*~' -o -name '*.swp' -o -name '*.orig' | xargs -r rm -f
-	find . -name __pycache__ -o -name .pytest_cache -type d -prune -exec rm -rf {} +
+	@find . -name .git -prune -o \
+	        \( -name __pycache__ -o -name .pytest_cache \) \
+	        -type d -prune -print -exec rm -rf {} +
 
 # The commit-msg hook lives in the tree so it is reviewable, survives a
 # clone, and can be kept in sync. .git/hooks is untracked, so a hook that
