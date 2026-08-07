@@ -776,6 +776,34 @@ object the test process uses, and this file has three leaked patches in
 its history to show for that kind of shortcut — one of them added while
 writing *these* tests, and caught by the sentinel rather than by review.
 
+### A skip condition nobody had named
+
+`AncestorRecoveryEndToEnd` guarded itself with `shutil.which("dpkg-deb")`
+written inline at the class. Every other class in that file guards on a
+named `HAVE_*` constant, and `TestEveryCapabilityIsPresent` enumerates
+those constants so that a strict run *fails* naming what is missing —
+which is the whole defence against a green run that quietly tested half
+of what it claimed. An inline condition is outside that list, so a
+machine without `dpkg-deb` would have skipped the entire recovery chain
+and still reported OK under `EMERGE_TESTS_REQUIRE_ALL=1`.
+
+Exactly the shape that cost eleven tests once already: gpgv installed in
+CI, gpg not, and the signature suite never ran there at all. It is
+`HAVE_DPKG_DEB` now, and in the list.
+
+Verified rather than reasoned about, twice over: forcing the constant
+false makes the strict run fail with `['dpkg-deb']`, and running the
+integration suite *in the CI container with the CI package list and
+`EMERGE_TESTS_REQUIRE_ALL=1`* shows the four recovery tests executing
+rather than skipping.
+
+**Packaging needed nothing.** Recovery adds `dpkg-deb`, `tar` and — via
+the default mergetool — `sdiff`, and all three come from packages marked
+`Essential: yes`. `gpgv` was already a `Suggests` and stays one, since
+both features that use it degrade rather than fail. `make deb` builds,
+and the installed binary answers `--info` with the new rows on a fresh
+container.
+
 ### The archive was the fourth thing to need an atomic write
 
 `_store_ancestor` used `shutil.copy2`, which writes straight over the

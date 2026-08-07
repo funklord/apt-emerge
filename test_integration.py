@@ -1554,6 +1554,13 @@ def _gpg_works():
 
 HAVE_GPG = _gpg_works()
 
+# Named rather than tested inline at the class, so that a machine without
+# it is reported by TestEveryCapabilityIsPresent instead of quietly
+# skipping the class. An unnamed skip condition is the vacuous pass that
+# test exists to prevent, and this file has already lost eleven tests to
+# one -- gpgv installed in CI, gpg not.
+HAVE_DPKG_DEB = bool(shutil.which("dpkg-deb"))
+
 
 @unittest.skipUnless(HAVE_GPG, "gpg/gpgv unavailable")
 class SignatureVerificationEndToEnd(unittest.TestCase):
@@ -1823,7 +1830,7 @@ class SignatureVerificationEndToEnd(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_GPG, "gpg/gpgv unavailable")
-@unittest.skipUnless(shutil.which("dpkg-deb"), "dpkg-deb unavailable")
+@unittest.skipUnless(HAVE_DPKG_DEB, "dpkg-deb unavailable")
 class AncestorRecoveryEndToEnd(unittest.TestCase):
 	"""Recovering the previously shipped config file, whole chain, no fakes.
 
@@ -2043,6 +2050,7 @@ class TestEveryCapabilityIsPresent(unittest.TestCase):
 		    ("rootless apt", HAVE_APT_ROOT),
 		    ("source-build tooling (dpkg-dev)", HAVE_SOURCE_BUILD),
 		    ("gpg and gpgv", HAVE_GPG),
+		    ("dpkg-deb", HAVE_DPKG_DEB),
 		) if not ok]
 		self.assertEqual(missing, [],
 		                 f"these capabilities are unavailable, so the tests "
