@@ -4745,6 +4745,12 @@ class TestPkgConffiles(unittest.TestCase):
 	def setUp(self):
 		self.mod = load()
 
+	def one(self, pkg):
+		"""One package's conffiles, through the batched reader the program
+        itself uses. `pkg_conffiles` was a single-name wrapper for exactly
+        this, in the shipped file, called by nothing but these four tests."""
+		return self.mod.conffiles_of([pkg]).get(pkg, [])
+
 	def stub(self, stdout):
 		"""Fake dpkg-query's real batched layout, verified against dpkg 1.22:
         `-f=${Package}:${Conffiles}\\n` puts the first conffile on the
@@ -4760,7 +4766,7 @@ class TestPkgConffiles(unittest.TestCase):
 
 	def test_reads_the_paths(self):
 		self.stub("p: /etc/foo.conf 0123abc\n /etc/bar.conf 4567def\n")
-		self.assertEqual(self.mod.pkg_conffiles("p"),
+		self.assertEqual(self.one("p"),
 		                 ["/etc/foo.conf", "/etc/bar.conf"])
 
 	def test_obsolete_entries_are_skipped(self):
@@ -4768,15 +4774,15 @@ class TestPkgConffiles(unittest.TestCase):
         would resurrect a file the package no longer ships."""
 		self.stub("p: /etc/keep.conf 0123abc\n"
 		          " /etc/gone.conf 4567def obsolete\n")
-		self.assertEqual(self.mod.pkg_conffiles("p"), ["/etc/keep.conf"])
+		self.assertEqual(self.one("p"), ["/etc/keep.conf"])
 
 	def test_blank_and_relative_lines_are_ignored(self):
 		self.stub("p:\n\n not-a-path 0123\n /etc/ok.conf 4567\n")
-		self.assertEqual(self.mod.pkg_conffiles("p"), ["/etc/ok.conf"])
+		self.assertEqual(self.one("p"), ["/etc/ok.conf"])
 
 	def test_package_with_no_conffiles(self):
 		self.stub("p:\n")
-		self.assertEqual(self.mod.pkg_conffiles("p"), [])
+		self.assertEqual(self.one("p"), [])
 
 	def test_a_batch_keeps_each_package_to_its_own_files(self):
 		"""The whole point of batching: one call, but the paths must not

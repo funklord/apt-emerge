@@ -3565,10 +3565,6 @@ def conffiles_of(packages, chunk=500):
 				out[cur].append(parts[0])
 	return out
 
-def pkg_conffiles(pkg):
-	"""Config files dpkg tracks for one installed package."""
-	return conffiles_of([pkg]).get(pkg, [])
-
 def _store_ancestor(conf, target, source):
 	"""Record the as-shipped content of one file, atomically.
 
