@@ -4042,17 +4042,25 @@ def recover_ancestors(conf, targets, verifier=None, deadline=None):
 	"""Archive the previously shipped version of files that have none.
 
     Best effort throughout: anything that does not work leaves the file to a
-    2-way review, which is what it would have had anyway. The one thing that
-    is *not* tolerated is a file that fails its hash against the signed
-    index -- that is a failure rather than an inability, and it stops the
-    run the way a bad index does in --sync.
+    2-way review, which is what it would have had anyway. Two things are
+    *not* tolerated, and both stop the run the way a bad index stops
+    --sync, because each is a failure rather than an inability:
+
+      - an index whose hash disagrees with a Release that *did* verify;
+      - a .deb whose hash disagrees with that verified index.
+
+    A signature that cannot be checked at all, a source that is not
+    answering, a size ceiling -- those are inabilities, and they cost a
+    2-way review and a warning.
 
     `deadline` is an absolute `time.monotonic()` value; the pass gives up
     on whatever is left once it is past. It is a parameter rather than an
     interval so a test can hand over one already spent, without patching
     the clock -- `time` is the same module object the test process uses,
-    and this file has three leaked patches in its history to show for
-    that kind of shortcut."""
+    and the suite's own module sentinel has caught more than one leaked
+    patch of exactly that kind, the most recent while writing these very
+    tests. No count here: the one in project.md went stale inside a single
+    session, which is the same lesson its line-count paragraph records."""
 	pending = [t for t in targets if ancestor_for(conf, t)[0] is None]
 	if not pending:
 		return 0

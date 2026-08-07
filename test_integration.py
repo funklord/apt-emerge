@@ -1936,10 +1936,10 @@ class AncestorRecoveryEndToEnd(unittest.TestCase):
 		# The two local lookups are what this test is not about: no .deb in
 		# the cache, and apt is not asked. What remains is the network path.
 		m._apt_downloaded_deb = lambda *a, **k: None
-		# Stubbed at the seam recovery actually uses -- the batched history
-		# -- rather than at previous_version, which it stopped calling when
-		# the per-package log scan was replaced by a single pass. These
-		# three tests caught that themselves, by recovering nothing.
+		# Stubbed at the seam recovery actually uses. It used to be stubbed
+		# at a per-package wrapper, which stopped being called when the log
+		# was made a single pass and has since been deleted; these tests
+		# caught that themselves, by recovering nothing.
 		m.package_histories = lambda names, lines=None: {
 		    n: [(self.stamp, "1.0"), ("20260615T133729Z", "1.1")]
 		    for n in names}

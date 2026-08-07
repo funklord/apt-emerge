@@ -807,9 +807,9 @@ path is unchanged — `/etc/nanorc` still recovers in about three seconds.
 
 The budget is a parameter rather than an interval so a test can hand over
 one already spent without patching the clock. `time` is the same module
-object the test process uses, and this file has three leaked patches in
-its history to show for that kind of shortcut — one of them added while
-writing *these* tests, and caught by the sentinel rather than by review.
+object the test process uses, and the module sentinel has caught more
+than one leaked patch of exactly that kind — including one added while
+writing *these* tests, named by the sentinel rather than by review.
 
 ### A skip condition nobody had named
 
@@ -875,8 +875,8 @@ session detection rather than by walking `/etc`.
 
 ### The log is evidence about the log, not about the system
 
-`previous_version` walks `dpkg.log` to conclude something about the
-machine, and the two can disagree. Where they do, the entry before the
+Recovery walks `dpkg.log` to conclude something about the machine, and
+the two can disagree. Where they do, the entry before the
 log's last one is the ancestor of nothing — and that failure is silent,
 because a wrong ancestor does not error: it decides which side of a merge
 wins.
@@ -1245,8 +1245,11 @@ reported green without executing any of them.
 left `os`, `shutil` or `subprocess` patched. `load()` gives each test a fresh
 copy of the *script*, but those modules are the same objects the test process
 uses, so a missing cleanup corrupts whatever runs next — in another file,
-with no clue where it came from. Three such leaks have happened; the sentinel
-names the culprit in the run that caused it, and costs nothing.
+with no clue where it came from. Several have happened, two of them while
+writing the ancestor-recovery tests -- one taking out 84 tests in files
+that had nothing to do with it. The sentinel names the culprit in the run
+that caused it, and costs nothing. No running total here, because the one
+that used to be here was wrong within a session of being written.
 
 **`--fetchonly` had no coverage at all until it was looked for**, and
 looking was misleading: the two test files mention `fetchonly` twenty-one
