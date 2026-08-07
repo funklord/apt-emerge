@@ -21,7 +21,7 @@ installed.
 | `tools/style_gate.py` | the shared indentation gate, copied verbatim |
 | `tools/hooks/commit-msg` | the shared commit-msg hook; `make hooks` installs it |
 | `.style-gate.toml` | the gate's scope here, see `code-style.md` |
-| `LICENSE` | GPL-2, verbatim from `/usr/share/common-licenses/GPL-2` |
+| `LICENSE` | GPL-3, verbatim from `/usr/share/common-licenses/GPL-3` |
 | `.github/workflows/tests.yml` | CI: interpreters, Debian, package, style, stdlib-only |
 | `project.md` | this file |
 
@@ -31,7 +31,7 @@ twice within a single session. `wc -l` is right there.
 Both test files load `emerge` **by path** rather than importing it, so the
 single-file rule survives having tests at all.
 
-**Licensed GPL-2.0-or-later** (owner's decision). Each source file carries
+**Licensed GPL-3.0-or-later** (owner's decision). Each source file carries
 the standard notice plus an SPDX tag — that per-file notice, not `LICENSE`,
 is what makes the "or later" grant effective. `AUTHOR`, `COPYRIGHT`,
 `LICENCE` and `VERSION` are module constants driving `emerge -V`; the notice
@@ -2538,7 +2538,7 @@ two share:
   a mistyped `--no-dep-upgrades`.
 - **Coverage**: end-to-end tests against throwaway dpkg *and* apt roots, the
   dispatch-conf interactive loop, and the archiving half of config merging.
-- **Repository**: README, GPL-2.0-or-later, `-V`, and CI — whose first run
+- **Repository**: README, GPL-3.0-or-later, `-V`, and CI — whose first run
   failed three times, all of them test defects invisible on the dev machine.
 
 Then a review pass and everything it pulled behind it. The recurring theme
