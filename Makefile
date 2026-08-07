@@ -36,8 +36,8 @@ INSTALL_DATA    = $(INSTALL) -m 644
 ALIASES = dispatch-conf etc-update
 
 .PHONY: all check check-unit check-integration check-isolation check-tty \
-        style install uninstall deb clean version-check help test veryclean \
-        distclean hooks
+        style style-source style-docs install uninstall deb clean \
+        version-check help test veryclean distclean hooks
 
 all:
 	@:
@@ -114,8 +114,12 @@ check-integration:
 # successfully. That was worth guarding, and it is no longer this Makefile's
 # job: the gate refuses a config it cannot read on its own now. The fix went
 # upstream instead of being kept here, so the other six projects get it too.
-style:
+style: style-source style-docs
+
+style-source:
 	$(PYTHON) tools/style_gate.py check
+
+style-docs:
 	$(PYTHON) tools/style_gate.py docs
 
 # The Portage-dialect version the program reports and the Debian package
