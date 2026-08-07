@@ -811,6 +811,35 @@ object the test process uses, and the module sentinel has caught more
 than one leaked patch of exactly that kind — including one added while
 writing *these* tests, named by the sentinel rather than by review.
 
+### The unit half does not run off a Debian box, and now it is measured
+
+This file has said the unit suite is stdlib-only and that the integration
+classes skip themselves "so the suite runs off a Debian box". Nobody had
+run it off one. On `python:3-alpine` — musl, busybox, no dpkg, no GNU
+diffutils — `python -m unittest test_emerge` reports **22 failures and
+errors**, and it did so before this session as well as after.
+
+Nineteen of them are dpkg-backend tests that reach for real dpkg
+behaviour without a `HAVE_DPKG` guard; the rest are backend selection,
+`--version`, and the pty colour test. **Pre-existing, out of scope here,
+and raised rather than fixed in passing** — guarding twenty tests is its
+own piece of work, and the claim above is the thing that was wrong rather
+than the tests.
+
+What *is* fixed is the four this session added, all with one cause: a
+mergetool test that names a real program answers with the
+not-installed check instead of the guard under test. `meld` skipped the
+guard on any box without meld; changing it to `sdiff` moved the hole
+rather than closing it. They use `sys.executable` now, which exists by
+definition, and the menu test asserts the tool is *named* rather than
+which suffix follows it, since the line legitimately reads
+`(sdiff: not installed)` where it is not there.
+
+Measured both ways: the failure set on Alpine is now byte-identical to
+the pre-session tree's. That comparison is the only honest way to say
+"this change did not make portability worse", and it is worth more than
+either number on its own.
+
 ### A skip condition nobody had named
 
 `AncestorRecoveryEndToEnd` guarded itself with `shutil.which("dpkg-deb")`

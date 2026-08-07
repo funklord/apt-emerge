@@ -5193,10 +5193,13 @@ class TestDispatchConf(unittest.TestCase):
         middle of a review, with earlier files already retired and no
         summary of what had been decided."""
 		errs = self.errors()
-		# An installed program on purpose: the not-installed check runs
-		# first, so `meld` on a box without meld would pass this test
-		# without the template guard ever being reached.
-		self.conf["mergetool"] = "sdiff"
+		# A program that certainly exists, because the not-installed check
+		# runs first and would otherwise answer instead of the guard under
+		# test. sys.executable rather than a named tool: `meld` skipped the
+		# guard on any box without meld, and `sdiff` did the same on any
+		# host without diffutils -- caught by running the unit half on
+		# Alpine, where neither exists.
+		self.conf["mergetool"] = sys.executable
 		t = self.park("app.conf", "mine\n", "theirs\n")
 		self.dispatch("5", "s")                    # must not raise
 		self.assertEqual(self.content(t), "mine\n")
@@ -5206,7 +5209,7 @@ class TestDispatchConf(unittest.TestCase):
 
 	def test_a_positional_template_of_the_wrong_arity_is_refused(self):
 		errs = self.errors()
-		self.conf["merge"] = "sdiff --output='%s' '%s'"     # two, not three
+		self.conf["merge"] = f"{sys.executable} '%s' '%s'"   # two, not three
 		t = self.park("app.conf", "mine\n", "theirs\n")
 		self.dispatch("5", "s")
 		self.assertTrue(self.parked_exists(t))
@@ -5215,7 +5218,7 @@ class TestDispatchConf(unittest.TestCase):
 
 	def test_an_unknown_named_placeholder_is_refused(self):
 		errs = self.errors()
-		self.conf["mergetool"] = "sdiff {mine} {nosuchkey}"   # installed: see above
+		self.conf["mergetool"] = f"{sys.executable} {{mine}} {{nosuchkey}}"
 		t = self.park("app.conf", "mine\n", "theirs\n")
 		self.dispatch("5", "s")
 		self.assertTrue(self.parked_exists(t))
@@ -5305,7 +5308,10 @@ class TestDispatchConf(unittest.TestCase):
 		tool = self.mod.mergetool_program(self.mod.DEFAULT_CONF)
 		self.park("app.conf", "mine\n", "theirs\n")
 		out = self.dispatch("s")
-		self.assertIn(f"launch mergetool ({tool})", out)
+		# Open-ended on purpose: the line reads "(sdiff)" where it is
+		# installed and "(sdiff: not installed)" where it is not, and this
+		# test is about the tool being named either way.
+		self.assertIn(f"launch mergetool ({tool}", out)
 
 	def test_a_two_way_review_still_offers_the_built_in_merge(self):
 		"""The built-in merge is what this program offers instead of dpkg's
@@ -6037,12 +6043,24 @@ class TestRunMergetool(unittest.TestCase):
 		                 "sdiff --suppress-common-lines "
 		                 "--output='/out' '/mine' '/theirs'")
 
-	def test_the_default_mergetool_is_installed_wherever_this_runs(self):
-		"""sdiff is from diffutils, which is Essential on Debian. That is
-        the whole reason the default is sdiff rather than a nicer tool:
-        meld and kdiff3 would be a default that is absent by default."""
+	def test_the_default_mergetool_is_the_one_it_claims_to_be(self):
+		"""Which tool is shipped as the default is a fact about this file
+        and holds anywhere, so it is asserted unconditionally."""
+		self.assertEqual(
+		    self.mod.mergetool_program(self.mod.DEFAULT_CONF), "sdiff")
+
+	@unittest.skipUnless(HAVE_DPKG, "not a Debian-ish box")
+	def test_the_default_mergetool_is_installed_on_a_debian_box(self):
+		"""sdiff is from diffutils, which is Essential on Debian -- the
+        whole reason the default is sdiff rather than a nicer tool, since
+        meld and kdiff3 would be a default that is absent by default.
+
+        Skipped rather than failed off Debian, because that is a claim
+        about Debian and this is the half of the suite that is meant to
+        run anywhere. Written as a bare assertion first, which would have
+        failed the unit suite on any machine without diffutils rather
+        than reporting that the claim was not checkable there."""
 		tool = self.mod.mergetool_program(self.mod.DEFAULT_CONF)
-		self.assertEqual(tool, "sdiff")
 		self.assertIsNotNone(shutil.which(tool),
 		                     f"the default mergetool {tool!r} is not installed")
 
