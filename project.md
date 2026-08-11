@@ -1701,6 +1701,18 @@ That covers everything CI does except the `debian:trixie` container, which
 runs as **root** — the one condition not reproducible here, and the one that
 caught a test reading real `/proc`.
 
+**The maintainer pushes this repository; a session does not.** Commit
+freely, then end substantial work by naming the unpushed commits and how
+many there are. This was asked for directly when CI was first wired up and
+has held since.
+
+It has a consequence worth stating, because it is easy to forget while
+looking at a workflow file: **CI never runs during a session.** Every change
+under `.github/workflows/` is unverified until he pushes it, so a green tick
+is not available to be cited, and the local matrix and the container recipe
+above are the substitutes rather than conveniences. Where something could
+only be proven by CI, say so plainly instead of implying it was checked.
+
 **Read the skip counts, not just the OK.** Run over this session's work the
 matrix came back clean on every interpreter — and the unit suite reported
 `OK (skipped=5)` on 3.9, `skipped=1` on 3.11 and nothing on 3.13. That
