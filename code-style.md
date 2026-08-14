@@ -10,9 +10,10 @@ Code style for this project -- `emerge`, the tests, the `Makefile` and the
 **The global source**, `~/.claude/guidelines/code-style.md`, applies to
 every private project and sits above both this file and `project.md`. Where
 either disagrees with it, that is **drift to fix, not a local override**. A
-genuine divergence needs a technical reason and is signalled to the list in `claude-guidelines`' `project.md` rather
-than decided in passing -- and when a conflict actually comes up, stop and ask
-instead of picking a winner.
+genuine divergence needs a technical reason and is signalled to the list in
+`claude-guidelines`' `project.md` rather than decided in passing -- and
+when a conflict actually comes up, stop and ask instead of picking a
+winner.
 
 Nothing is vendored.
 
