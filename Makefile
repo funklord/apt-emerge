@@ -29,6 +29,17 @@ PYTHON     ?= python3
 # to ship, and this holds whatever the last local build produced.
 BUILD_DIR  ?= build
 
+# Where the finished packages land. `dpkg-buildpackage` writes to the PARENT
+# directory, so they have to be moved somewhere regardless; this names it.
+#
+# A `deb/` subdirectory of the build tree rather than the build tree itself,
+# which is what five of the ten packaging projects already did and is now the
+# settled answer. Two reasons beyond consistency: it keeps a set of artifacts
+# separable from object files, so `ls` and `clean` can both speak about them
+# by name; and it is the only spelling that still works when BUILD_DIR is `.`,
+# as openmlx4 sets it, where the build tree and the source tree are one.
+DEB_DIR ?= $(BUILD_DIR)/deb
+
 prefix     ?= /usr
 bindir     ?= $(prefix)/bin
 datarootdir?= $(prefix)/share
@@ -191,7 +202,7 @@ uninstall:
 # instead.
 deb: version-check
 	dpkg-buildpackage --build=binary --no-sign
-	mkdir -p $(BUILD_DIR)
+	mkdir -p $(DEB_DIR)
 	set -e; ver=$$(dpkg-parsechangelog -SVersion); \
 	arch=$$(dpkg-architecture -qDEB_HOST_ARCH); \
 	moved=0; \
@@ -200,14 +211,14 @@ deb: version-check
 	         "../$(PACKAGE)_$${ver}_$${arch}.buildinfo" \
 	         "../$(PACKAGE)_$${ver}_$${arch}.changes"; do \
 		if [ -e "$$f" ]; then \
-			mv -f "$$f" $(BUILD_DIR)/; moved=$$((moved + 1)); \
+			mv -f "$$f" $(DEB_DIR)/; moved=$$((moved + 1)); \
 		fi; \
 	done; \
 	if [ "$$moved" -eq 0 ]; then \
 		echo "deb: dpkg-buildpackage produced nothing to collect"; exit 1; \
 	fi
 	@echo
-	@ls -l $(BUILD_DIR)/
+	@ls -l $(DEB_DIR)/
 
 # Files clean removes, named individually rather than swept up by a wildcard.
 # `clean` is the one target everybody runs without reading it, so what it
@@ -227,7 +238,7 @@ CLEAN_FILES = debian/files \
 # so an empty BUILD_DIR disappears in word splitting and removes nothing -- it
 # is `rm -rf $(VAR)` as a single command, where an empty VAR leaves a bare
 # `rm -rf`, that turns a typo into a disaster.
-CLEAN_DIRS = $(BUILD_DIR) debian/$(PACKAGE) debian/.debhelper __pycache__
+CLEAN_DIRS = $(DEB_DIR) debian/$(PACKAGE) debian/.debhelper __pycache__
 
 clean:
 	rm -f $(CLEAN_FILES)
