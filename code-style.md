@@ -10,8 +10,8 @@ Code style for this project -- `emerge`, the tests, the `Makefile` and the
 **The global source**, `~/.claude/guidelines/code-style.md`, applies to
 every private project and sits above both this file and `project.md`. Where
 either disagrees with it, that is **drift to fix, not a local override**. A
-genuine divergence needs a technical reason and is raised rather than
-decided in passing -- and when a conflict actually comes up, stop and ask
+genuine divergence needs a technical reason and is signalled to the list in `claude-guidelines`' `project.md` rather
+than decided in passing -- and when a conflict actually comes up, stop and ask
 instead of picking a winner.
 
 Nothing is vendored.
@@ -61,7 +61,8 @@ alignment spaces, and that is correct rather than an oversight.
 ### Settled exceptions
 
 These are settled in the source and need no discussion here. An exception
-not listed is not yet settled: raise it rather than deciding in passing.
+not listed is not yet settled: signal it to the list in
+`claude-guidelines`' `project.md` rather than deciding in passing.
 
 - **Markdown** -- list continuation and code fences are space-indented by
   specification. `project.md`, `README.md` and this file are exempt.
@@ -152,11 +153,30 @@ this project is where the failure was found.
 
 ## 3. Filenames
 
-Lowercase for everything this project names itself. The program is
-`emerge`, extensionless and executable; tests are `test_*.py`.
+**Lowercase, always**, for everything this project names itself. The
+program is `emerge`, extensionless and executable; tests are `test_*.py`.
+
+**The separator follows what the name binds to**, and the two cases are a
+technical difference rather than a matter of taste:
+
+- **`snake_case` where the filename becomes an identifier** -- a source
+  file, a module. Python is where that bites here, since the filename *is*
+  the module path and a hyphen is not legal in one: `test_resolver.py`
+  could not be imported under a kebab-case name.
+- **`kebab-case` for prose** -- documentation, design notes, decision
+  records. Nothing imports `code-style.md`, so no identifier is at stake,
+  and kebab-case is what markdown and URLs settled on long ago. It is also
+  the spelling Debian requires of the package name, so the two agree by
+  construction rather than by coincidence.
+
+The rule used to say `snake_case` for prose too, and every private project
+was quietly ignoring it. It was rewritten after measuring all fourteen
+trees: of 197 tracked markdown basenames, 174 were already kebab-case. Both
+halves already hold here, so nothing has to move.
 
 The exception is a name a tool will not accept lowercased: `Makefile`,
-`README.md`, `LICENSE`, and the `debian/` files native packaging dictates.
+`README.md`, `LICENSE`, `VERSION`, and the `debian/` files native packaging
+dictates.
 
 ## ASCII in source
 
