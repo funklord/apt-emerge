@@ -137,10 +137,10 @@ check-integration:
 style: style-source style-docs
 
 style-source:
-	$(PYTHON) tools/style_gate.py check
+	$(PYTHON) tool/style_gate.py check
 
 style-docs:
-	$(PYTHON) tools/style_gate.py docs
+	$(PYTHON) tool/style_gate.py docs
 
 # The Portage-dialect version the program reports and the Debian package
 # version are two different things, and both are hand-written. This stops
@@ -291,5 +291,5 @@ distclean: veryclean
 # a fresh clone.
 hooks:
 	@test -d .git || { echo "hooks: not a git repository" >&2; exit 1; }
-	@install -m 0755 tools/hooks/commit-msg .git/hooks/commit-msg
-	@echo "hooks: commit-msg installed from tools/hooks/"
+	@install -m 0755 tool/hooks/commit-msg .git/hooks/commit-msg
+	@echo "hooks: commit-msg installed from tool/hooks/"

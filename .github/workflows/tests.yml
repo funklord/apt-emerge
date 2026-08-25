@@ -182,7 +182,7 @@ jobs:
           test ! -e /usr/bin/dispatch-conf
 
   # Indentation and whitespace. The rules are in code-style.md and the gate
-  # is tools/style_gate.py, shared verbatim with the sibling projects.
+  # is tool/style_gate.py, shared verbatim with the sibling projects.
   #
   # The interpreter is pinned rather than left to the runner because the
   # gate reads .style-gate.toml with tomllib, which is 3.11+. It refuses to

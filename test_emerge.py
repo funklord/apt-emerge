@@ -4034,7 +4034,7 @@ class TestStyleGate(unittest.TestCase):
 
 	def setUp(self):
 		if not os.path.exists(self.GATE):
-			self.skipTest("tools/style_gate.py is not present in this tree")
+			self.skipTest("tool/style_gate.py is not present in this tree")
 
 	def gate(self, *args, root=None):
 		return subprocess.run([sys.executable, self.GATE, *args,

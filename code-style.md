@@ -146,7 +146,7 @@ above on the next save. `pycodestyle` would need W191 disabled.
 
 ## The gate
 
-What is mechanised instead is a checker: `tools/style_gate.py`, run by `make
+What is mechanised instead is a checker: `tool/style_gate.py`, run by `make
 style` and by a CI job of the same name. It is shared verbatim with the
 sibling projects -- fix drift, do not edit the copy -- and it checks
 indentation, trailing whitespace, carriage returns and the final newline.
@@ -157,7 +157,7 @@ can only ask whether tabs precede spaces; the gate instead converts the file
 with a `tokenize`-driven fixer and compares *tab counts* per line, so a line
 indented to the wrong depth is caught as well. That comparison never
 mentions a tab width -- the conversion above is what a width was needed for,
-and it is over. `tools/style_gate.py fix` writes the conversion, and refuses
+and it is over. `tool/style_gate.py fix` writes the conversion, and refuses
 to write one that would change the file's AST.
 
 ### `.style-gate.toml`
@@ -235,7 +235,7 @@ name it demands is plural, singular, capitalised or none of those.
 Present here: **Cargo** looks for `tests/`, `examples/` and `benches/` by
 those exact names, and `cargo-fuzz` for `fuzz_targets/`. **GitHub**
 requires `.github/workflows/`. **git** keeps `hooks/`, which is why
-`tools/hooks/` is spelled that way.
+`tool/hooks/` is spelled that way.
 
 **Second: a plural an ecosystem has settled**, which is a convention rather
 than a requirement -- nothing breaks, but a reader would be surprised by
@@ -249,13 +249,13 @@ because it looked like a convention and finds the build no longer works.
 So say which kind is being claimed.
 
 **This rule does not reach the settled inventory.** Three canonical names in
-`harmonization.md` are plural -- `tools/`, `docs/` and `docs/decisions/` --
+`harmonization.md` are plural -- `tool/`, `docs/` and `docs/decisions/` --
 and they stay until the copyright holder says otherwise, because renaming
 them is a cross-project rewrite rather than a spelling change. Measured
 before this was written: the decision records are cited by path 270 times in
-netcfgd and 95 times in situ, and `tools/` is named as a path 161 times in
+netcfgd and 95 times in situ, and `tool/` is named as a path 161 times in
 four projects alone, besides `sync.py`, every Makefile's hook target and the
-`~/.claude/tools/` the copies are spread from. An inventory entry is a name
+`~/.claude/tool/` the copies are spread from. An inventory entry is a name
 other things point at, which is exactly what makes it expensive and exactly
 what makes it worth having.
 
@@ -393,7 +393,7 @@ here for the detail. It does not restate the precedence rule.
 
 ## The commit-msg hook
 
-The commit-msg hook is `tools/hooks/commit-msg`, installed with `make hooks`.
+The commit-msg hook is `tool/hooks/commit-msg`, installed with `make hooks`.
 It rejects generator attribution and a subject over 75 columns. It lives in
 the tree rather than only in `.git/hooks` so that it is reviewable and
 survives a clone; the copy that runs is installed from it.
@@ -412,7 +412,7 @@ edited it.
 - **`~/.claude/guidelines/code-style.md`** -- the source this file copies.
 - **`project.md`** -- the design and the reasoning. It wins over this file
   where the two disagree.
-- **`~/.claude/tools/style_gate.py`** -- the source of `tools/style_gate.py`.
+- **`~/.claude/tool/style_gate.py`** -- the source of `tool/style_gate.py`.
 - **`../situ/code-style.md`** -- the sibling Python project, carrying the
-  same rules. Its `tools/lint_conventions.py` is one of the three checkers
+  same rules. Its `tool/lint_conventions.py` is one of the three checkers
   the shared gate was merged from.

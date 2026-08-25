@@ -18,8 +18,8 @@ installed.
 | `debian/` | native package; `debian/rules` defers to the Makefile |
 | `README.md` | user-facing front page |
 | `code-style.md` | copy of the global style source, plus this project's own |
-| `tools/style_gate.py` | the shared indentation gate, copied verbatim |
-| `tools/hooks/commit-msg` | the shared commit-msg hook; `make hooks` installs it |
+| `tool/style_gate.py` | the shared indentation gate, copied verbatim |
+| `tool/hooks/commit-msg` | the shared commit-msg hook; `make hooks` installs it |
 | `.style-gate.toml` | the gate's scope here, see `code-style.md` |
 | `LICENSE` | GPL-3, verbatim from `/usr/share/common-licenses/GPL-3` |
 | `.github/workflows/tests.yml` | CI: interpreters, Debian, package, style, stdlib-only |
@@ -1448,9 +1448,9 @@ Both skip themselves if the tool is missing, so the suite runs off a Debian box.
 
 ## The style gate
 
-`make style` runs `tools/style_gate.py`, the indentation and whitespace
+`make style` runs `tool/style_gate.py`, the indentation and whitespace
 checker shared verbatim across the private projects (source:
-`~/.claude/tools/style_gate.py` — fix drift, do not edit the copy). It was
+`~/.claude/tool/style_gate.py` — fix drift, do not edit the copy). It was
 adopted here after the tab conversion, which until then had nothing
 mechanical holding it: `code-style.md` said indentation was a review item.
 The tree passed on the first run, so nothing needed fixing — what needed
@@ -1676,7 +1676,7 @@ Free on GitHub for a suite this size. Five jobs:
   for why the interpreter is pinned rather than left to the runner.
 - **`stdlib-only`** — walks the AST for imports outside
   `sys.stdlib_module_names` and fails if a non-test `.py` appears beside
-  `emerge`. This guards hard rule 1. `tools/` is a subdirectory and so does
+  `emerge`. This guards hard rule 1. `tool/` is a subdirectory and so does
   not trip it, correctly: the gate is development scaffolding and is not
   installed.
 
@@ -2462,7 +2462,7 @@ no `Fixes:` or `Link:` trailer exists anywhere in the log.
 The format is the kernel's, from the global guidelines rather than from
 anything decided here: `subsystem: summary in the imperative`, no trailing
 period, 75 columns hard on the subject *and* on every body line, and no
-attribution trailers of any kind. `tools/hooks/commit-msg` enforces the two
+attribution trailers of any kind. `tool/hooks/commit-msg` enforces the two
 halves a script can see; the rest is a review item.
 
 The last 41 commits already followed it and kept their subjects. The first
