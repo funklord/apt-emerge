@@ -2725,3 +2725,26 @@ as an error; a `debian:trixie` container as root with
 dispatch, man pages and lintian; and the suite under a pty. The skip counts
 are the five documented ones plus the opt-in marker, so nothing new went
 dark on the old interpreters.
+
+## Open: the integration suite fails 6 of 48 under apt 3
+
+Measured 2026-08-27, on a quiet tree with no product commit for weeks.
+`make check`: the unit suite passes (598 tests, 5 skips), the integration
+suite errors 6 of 48, and one error reproduces alone in five seconds --
+`test_apt_backend_end_to_end` -- so it is not the machine's load. All six
+die at the same place: `be.merge(...)` reaches `sys.exit(rc)` at
+`emerge:2865` with rc **100**, apt's own generic failure, while merging
+`emtest-app` from the suite's `file://` repository.
+
+The suspect is the environment rather than the code: apt on this machine
+is now **3.0.3devuan1**, a major-version jump, and the harness was built
+against apt 2.x behaviours -- it already carries `[trusted=yes]` and the
+0700-mkdtemp workaround for `_apt`'s traversal, both of which were the
+apt-2-era hardenings. What rc 100 means here needs apt's stderr, which
+the harness swallows; surfacing that is the first step, and asserting on
+it afterwards would keep the next apt transition from reading as six
+opaque errors.
+
+Recorded rather than fixed because the merge path is this project's
+core and the fix belongs to a session working here, not to a survey
+passing through.
