@@ -2731,10 +2731,18 @@ dark on the old interpreters.
 Measured 2026-08-27, on a quiet tree with no product commit for weeks.
 `make check`: the unit suite passes (598 tests, 5 skips), the integration
 suite errors 6 of 48, and one error reproduces alone in five seconds --
-`test_apt_backend_end_to_end` -- so it is not the machine's load. All six
-die at the same place: `be.merge(...)` reaches `sys.exit(rc)` at
-`emerge:2865` with rc **100**, apt's own generic failure, while merging
-`emtest-app` from the suite's `file://` repository.
+`test_apt_backend_end_to_end` -- so it is not the machine's load. When
+first measured, all six died at the same place: `be.merge(...)` reaching
+`sys.exit(rc)` at `emerge:2865` with rc **100** while merging `emtest-app`
+from the suite's `file://` repository. Re-measured 2026-08-27 the
+signature has split, same six names: the two `AptBackendEndToEnd` errors
+still die at `merge`/rc 100, but the four `SourceBuildEndToEnd` errors now
+die earlier, at `emerge:3037` -- `apt-get build-dep` failing into
+`sys.exit(1)` -- before any merge runs. apt is unchanged (3.0.3devuan1),
+so both shapes stay consistent with the apt-3 diagnosis, but the original
+"all six at merge:2865" was an over-generalization from the two that were
+read closely; the stderr-swallowing note applies to the build-dep path
+too.
 
 The suspect is the environment rather than the code: apt on this machine
 is now **3.0.3devuan1**, a major-version jump, and the harness was built
