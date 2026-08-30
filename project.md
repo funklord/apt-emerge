@@ -2726,6 +2726,57 @@ dispatch, man pages and lintian; and the suite under a pty. The skip counts
 are the five documented ones plus the opt-in marker, so nothing new went
 dark on the old interpreters.
 
+## Open: CI installs the built package and fails, unobserved for days
+
+**`gh` CI access works from this tree now**, and the first thing it
+shows is a real failure. Recorded here rather than sent, because no
+session for this project was reachable when it was found.
+
+`gh auth status` is authenticated as `funklord` with `repo` scope;
+`gh run list` and `gh run view --job <id>` both work. Run
+`33099154091` (2026-08-27, "tools: take the gate fix for a brace
+closing inside a braceless body"):
+
+    ✓ style gate      8s
+    ✓ python 3.13    53s
+    ✓ python 3.9     1m6s
+    ✓ stdlib-only     5s
+    X debian package 41s
+
+and inside that job the package **builds** and then fails to install:
+
+    ✓ Install the build tooling
+    ✓ Build the package
+    X Install it, resolving dependencies as a user would
+    - The installed emerge runs
+    - argv[0] dispatch works through the packaged symlinks
+    - The man pages are installed and render
+    - Lintian, on the binary package
+    - Lintian, on the source package
+    - Removing it leaves nothing behind
+
+**Six further steps are gated by it and have not run**, two of them the
+lintian checks -- so nothing has linted the built package for at least
+five days, and the argv[0] dispatch through the packaged symlinks is
+unverified over the same window.
+
+**This is a real failure and not the workspace-wide billing block.**
+Six private repositories currently show every run as `failure` with
+zero steps executed, annotated "the job was not started because recent
+account payments have failed"; private repos meter Actions minutes and
+public ones do not. apt-emerge is PUBLIC, so its jobs genuinely run and
+this red is earned.
+
+**fmake fails in the same shape** -- `install it the way the README
+says to`, after build and lint pass -- which is either a shared cause
+or a coincidence, and cheap to distinguish. Both are the only two
+projects here whose CI executes at all.
+
+Logs could not be retrieved: `gh run view --log-failed` and
+`--job <id> --log` both return empty for runs this old, so the step
+names above are the whole of what was recovered. A fresh run will have
+logs.
+
 ## Open: the integration suite fails 6 of 48 under apt 3
 
 Measured 2026-08-27, on a quiet tree with no product commit for weeks.
