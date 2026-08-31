@@ -2835,24 +2835,34 @@ immediately, and the failing test now completes in **0.35 s** where this
 entry recorded five seconds when first measured -- it is failing earlier
 than it used to, before apt does any work.
 
-**The remedy is not obvious and was deliberately not chosen.** Two
-readings, and they want opposite fixes:
+**Settled the same day: rootless apt works here, so the guard must not
+be made to skip.** Driving `apt-get update` with the test's own option
+set -- `Debug::NoLocking=1`, `APT::Sandbox::User=root`,
+`DPkg::Options::=--root=...`, `--force-not-root`, every `Dir::*`
+redirected -- **returns 0** as uid 1000. An earlier probe here returned
+100 and was recorded as inconclusive; it was, and it was wrong, because
+it used a hand-made option set rather than this suite's.
 
-- If rootless apt genuinely cannot work in this environment, the guard
-  should attempt the operation and skip honestly. Six errors become six
-  skips and the suite tells the truth.
-- If it *should* work -- which the class docstring asserts, saying it
-  "needs no privileges and leaves nothing behind" -- then skipping hides
-  a real defect in how the backend invokes apt, and the guard is the
-  wrong place to change.
+So of the two readings, the environmental one is dead. **The capability
+is present and the six errors are a real defect** in how the backend
+invokes apt or in the fixture, still undiagnosed. Making the guard skip
+would hide it.
 
-An attempt here to settle it by driving apt into a scratch root
-unprivileged also returned 100, but with warnings about unreadable
-directories, so that probe was inconclusive and is not evidence for
-either reading. **Whoever takes this should answer that question first**,
-because a guard made to skip would close the entry without fixing
-anything, and a green suite that skips six tests is the shape this
-project's own notes warn about.
+**Two separate pieces of work follow, and they are not the same one.**
+
+1. **The guard is defective independently of the failure.** It cannot
+   detect the condition it gates, so it will not skip on a machine that
+   genuinely lacks the capability. The fix has a model in this file:
+   `_rootless_dpkg_works()` builds a `.deb` and installs it into a
+   scratch root -- it attempts the operation. `_rootless_apt_works()`
+   should do the same. **Note that this changes nothing today**, since a
+   real probe would pass here; it is worth doing so the suite tells the
+   truth elsewhere, not to fix the six.
+2. **The six errors need their cause found**, and the next step is
+   getting apt's own message. The test currently surfaces none: it fails
+   in 0.35 s with `SystemExit: 100` and no apt diagnostic reaches the
+   report, so whatever apt said is being discarded. Recovering that
+   output is the cheapest next move and probably decides it.
 
 
 Measured 2026-08-27, on a quiet tree with no product commit for weeks.
