@@ -2726,6 +2726,37 @@ dispatch, man pages and lintian; and the suite under a pty. The skip counts
 are the five documented ones plus the opt-in marker, so nothing new went
 dark on the old interpreters.
 
+## Directives this tree never received, and where it already complies
+
+apt-emerge has had no session reachable for messaging, so three
+workspace-wide instructions were relayed to every other project and not
+to this one. Recorded 2026-08-31 by the guidelines tree at the copyright
+holder's request. None requires work here; two are already satisfied.
+
+- **Push as often as possible, and do not ask whether to push** (holder,
+  2026-08-28). The only exception is a predicted rewrite -- work you
+  expect to rebase, amend, squash or reorder. In `build-and-commit.md`.
+- **Name the copyright holder in `--version`, the About window where one
+  exists, and the README** (holder, 2026-08-29). Explicitly not every
+  file. **apt-emerge already does this and is the workspace's reference
+  implementation**, verified by running it rather than reading it:
+
+      $ emerge --version
+      Portage 3.0.66-deb (python 3.13.5, apt backend)
+      emerge for Debian 1.0 -- Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>
+      Licence GPL-3.0-or-later: GNU GPL version 3 or later. ...
+
+  Its shape is cited in `harmonization.md` as the caution worth copying:
+  the first line keeps the format anything might parse, and the
+  attribution goes on a line of its own, because a version string with a
+  stable consumer is an interface.
+- **CI access via `gh` works** from any tree. apt-emerge is PUBLIC, so
+  Actions are free and unmetered here and **its jobs genuinely run** --
+  unlike the six private repositories whose every run is blocked on an
+  account billing state with zero steps executed. The red below is
+  therefore earned, and is one of only two real CI failures in the
+  workspace.
+
 ## Open: CI installs the built package and fails, unobserved for days
 
 **`gh` CI access works from this tree now**, and the first thing it
@@ -2778,6 +2809,51 @@ names above are the whole of what was recovered. A fresh run will have
 logs.
 
 ## Open: the integration suite fails 6 of 48 under apt 3
+
+**Mechanism found 2026-08-31: the skip guard tests for binaries, not for
+the capability it names.** Written by the guidelines tree, which has no
+session of its own here; the copyright holder asked for it.
+
+`_rootless_apt_works()` decides whether `AptBackendEndToEnd` runs. Its
+docstring says *"apt can be pointed entirely at scratch directories, and
+told to hand dpkg a --root, so a whole install runs unprivileged"*. Its
+body is:
+
+    if not (HAVE_DPKG_ROOT and shutil.which("apt-get")
+            and shutil.which("dpkg-scanpackages")):
+        return False
+    return True
+
+Three programs being installed. **It never attempts a rootless apt
+operation**, so it cannot fail when one is impossible -- which is why
+these tests error rather than skipping. `SourceBuildEndToEnd` is guarded
+the same way by `HAVE_SOURCE_BUILD`.
+
+That the exit code is apt's own **100** is consistent: running
+`apt-get -y -d install ...` as uid 1000 on this machine returns 100
+immediately, and the failing test now completes in **0.35 s** where this
+entry recorded five seconds when first measured -- it is failing earlier
+than it used to, before apt does any work.
+
+**The remedy is not obvious and was deliberately not chosen.** Two
+readings, and they want opposite fixes:
+
+- If rootless apt genuinely cannot work in this environment, the guard
+  should attempt the operation and skip honestly. Six errors become six
+  skips and the suite tells the truth.
+- If it *should* work -- which the class docstring asserts, saying it
+  "needs no privileges and leaves nothing behind" -- then skipping hides
+  a real defect in how the backend invokes apt, and the guard is the
+  wrong place to change.
+
+An attempt here to settle it by driving apt into a scratch root
+unprivileged also returned 100, but with warnings about unreadable
+directories, so that probe was inconclusive and is not evidence for
+either reading. **Whoever takes this should answer that question first**,
+because a guard made to skip would close the entry without fixing
+anything, and a green suite that skips six tests is the shape this
+project's own notes warn about.
+
 
 Measured 2026-08-27, on a quiet tree with no product commit for weeks.
 `make check`: the unit suite passes (598 tests, 5 skips), the integration
