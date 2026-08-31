@@ -2848,6 +2848,53 @@ is present and the six errors are a real defect** in how the backend
 invokes apt or in the fixture, still undiagnosed. Making the guard skip
 would hide it.
 
+**Root cause found 2026-08-31, and it is environmental rather than a
+defect in this program.** apt returns 100 because a `DPkg::Pre-Invoke`
+hook fails, not because anything about the merge is wrong:
+
+    /etc/etckeeper/pre-install.d/10packagelist: 4: cannot create
+      /var/cache/etckeeper/packagelist.pre-install: Permission denied
+    E: Problem executing scripts DPkg::Pre-Invoke
+      'if [ -x /usr/bin/etckeeper ]; then etckeeper pre-install; fi'
+    E: Sub-process returned an error code
+
+`/etc/apt/apt.conf.d/05etckeeper` registers that hook on this machine.
+It writes to `/var/cache/etckeeper/`, which uid 1000 cannot, so **every
+apt install fails regardless of how carefully the scratch root is
+arranged.** `needrestart` registers a `DPkg::Post-Invoke` alongside it.
+
+That explains the whole shape: all six failures are installs; the
+failure is immediate, before any unpacking; and it began when etckeeper
+arrived on the machine rather than when anything here changed.
+
+**It also corrects the conclusion recorded above.** That entry said
+rootless apt "works here", on the strength of `apt-get update` returning
+0. **Update runs no `DPkg` hooks.** The probe passed because it exercised
+the one apt operation the fault cannot reach -- which is the same error
+as the guard it was written to judge, one level up. So the requirement
+for `_rootless_apt_works()` is sharper than "attempt the operation": it
+must attempt an **install** into a scratch root, because an update
+proves nothing about installs on a machine with pre-invoke hooks.
+
+**A remedy was looked for and not found**, which is the honest state.
+None of these suppress the hook: `-o Dir::Etc::parts=/dev/null` (apt has
+already read `apt.conf.d` before `-o` is parsed), `APT_CONFIG=/dev/null`,
+an `APT_CONFIG` file containing `#clear DPkg::Pre-Invoke;`, and empty
+`-o DPkg::Pre-Invoke::=` entries. Suppressing an `apt.conf.d` hook from
+the command line may simply not be possible, in which case the fix is
+elsewhere -- skipping when invoke hooks are configured, running the
+suite in a container, or driving dpkg directly for these cases. That is
+a design choice for whoever owns this.
+
+**One thing remains genuinely unexplained.** `emerge` merges apt's
+stderr into stdout (`stderr=subprocess.STDOUT` at the `Popen` around
+line 2826) and `stream_apt` dumps its buffer when a run fails, yet the
+test reports `SystemExit: 100` with **no apt output at all** and the
+test file redirects nothing. The message above was recovered only by
+preserving the fixture and re-running the command by hand. Whatever
+discards it is worth finding, because it is the reason this sat
+unexplained for four days.
+
 **Two separate pieces of work follow, and they are not the same one.**
 
 1. **The guard is defective independently of the failure.** It cannot
