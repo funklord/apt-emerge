@@ -122,7 +122,7 @@ jobs:
 
       - name: Install it, resolving dependencies as a user would
         run: |
-          apt-get install -y ./dist/apt-emerge_*_all.deb
+          apt-get install -y ./build/deb/apt-emerge_*_all.deb
 
       # The point of the job. A package that installs but ships a broken
       # entry point is not a working install.
@@ -156,7 +156,7 @@ jobs:
       # override in debian/ answers. So a tag here is a regression, and the
       # step fails on it rather than scrolling past.
       - name: Lintian, on the binary package
-        run: lintian --tag-display-limit 0 --fail-on error,warning dist/*.changes
+        run: lintian --tag-display-limit 0 --fail-on error,warning build/deb/*.changes
 
       # The source package is built separately because `make deb` builds
       # --build=binary: its .changes names a .deb and a .buildinfo and no
