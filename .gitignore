@@ -10,7 +10,9 @@ __pycache__/
 /debian/*.substvars
 /debian/*.debhelper.log
 
-# fmake makes this directory before it works out there is nothing here
-# for it to build, so a reader who tries the command in the README gets
-# one even though no build happens.
+# The packaged fmake makes this directory before it works out there is
+# nothing here to build, so a reader who tries the command in the README
+# gets one even though no build happens. fmake's own tree stopped doing
+# that in 85a6422 and leaves a tree it has nothing to build alone; this
+# rule is kept for the installed one, which is older and still does.
 .fmake/
