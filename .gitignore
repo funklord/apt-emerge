@@ -9,3 +9,8 @@ __pycache__/
 /debian/debhelper-build-stamp
 /debian/*.substvars
 /debian/*.debhelper.log
+
+# fmake makes this directory before it works out there is nothing here
+# for it to build, so a reader who tries the command in the README gets
+# one even though no build happens.
+.fmake/

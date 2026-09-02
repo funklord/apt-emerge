@@ -30,6 +30,17 @@ That gives you `emerge`, the `dispatch-conf` and `etc-update` aliases, and
 `emerge(1)`. Building needs `debhelper` and `dpkg-dev`; the package itself
 depends on nothing but `python3` (3.9 or newer).
 
+Sibling projects here give an [fmake](../fmake) line beside their `make`
+one. **This one has nothing for fmake to do**, and the absence is the
+answer rather than an omission: fmake builds C, C++, assembly and Rust,
+and there is not a line of any of them here. Run in this tree it says so
+and stops --
+
+    !!! no C, C++, assembly or Rust source files found here
+
+-- which is the correct answer. `make deb` packages a Python program, and
+`make` is the whole interface to this project.
+
 Or skip packaging entirely, because there is nothing to build:
 
 ```sh
