@@ -139,7 +139,23 @@ class DpkgBackendEndToEnd(unittest.TestCase):
 			open(os.path.join(self.sysroot, "var/lib/dpkg", f), "a").close()
 		os.makedirs(self.repo)
 		os.makedirs(self.state)
-		self.env = {**os.environ, "PATH": SBIN_PATH}
+		# APT_CONFIG keeps the host's apt.conf.d -- and the root-only invoke
+		# hooks a machine may keep there -- out of a run that is deliberately
+		# unprivileged. It goes into os.environ and not only into self.env,
+		# because these tests call emerge's own functions in-process and the
+		# apt it spawns inherits the ambient environment -- the same reason
+		# PATH is set that way just above. Set in every fixture, including
+		# the ones that drive dpkg alone, so a test which later reaches for
+		# apt does not quietly inherit them.
+		apt_config = apt_isolation_config(self.dir)
+		had_apt_config = "APT_CONFIG" in os.environ
+		original_apt_config = os.environ.get("APT_CONFIG", "")
+		os.environ["APT_CONFIG"] = apt_config
+		self.addCleanup(
+		    lambda: os.environ.__setitem__("APT_CONFIG", original_apt_config)
+		    if had_apt_config else os.environ.pop("APT_CONFIG", None))
+		self.env = {**os.environ, "PATH": SBIN_PATH,
+		            "APT_CONFIG": apt_config}
 		# emerge spawns dpkg itself and inherits the ambient environment, so
 		# sbin has to be on PATH for the process, not just for our own calls
 		original_path = os.environ.get("PATH", "")
@@ -450,13 +466,99 @@ class DpkgBackendEndToEnd(unittest.TestCase):
 		self.assertNotIn("emtest-app", left)
 
 
+def apt_isolation_config(scratch):
+	"""An APT_CONFIG that stops apt reading the host's /etc/apt/apt.conf.d.
+
+	Everything else apt reads is already pointed at scratch or /dev/null --
+	sources, preferences, and both of their .d directories. apt.conf.d was
+	the one left out, and it is where a host keeps its invoke hooks:
+	etckeeper's writes /var/cache/etckeeper, needrestart's touches
+	/run/needrestart. Both want root. Unprivileged they fail, and apt turns
+	a hook failure into `E: Problem executing scripts DPkg::Pre-Invoke' and
+	exit 100 -- so the suite passed on a box with no such hooks and failed
+	on one that had them, with an error naming neither.
+
+	It cannot be done with -o. Those are applied AFTER apt has read its
+	configuration directory, so the hooks are already loaded by then;
+	measured, `-o Dir::Etc::parts=/dev/null' leaves them in place. APT_CONFIG
+	is read FIRST, which is why redirecting Dir::Etc::parts from there works
+	-- and why `#clear DPkg::Pre-Invoke' from there does not: the clear runs,
+	and then apt.conf.d puts them back.
+	"""
+	parts = os.path.join(scratch, "apt.conf.d")
+	os.makedirs(parts, exist_ok=True)
+	cfg = os.path.join(scratch, "apt-isolate.conf")
+	with open(cfg, "w") as f:
+		f.write(f'Dir::Etc::parts "{parts}";\n')
+	return cfg
+
+
 def _rootless_apt_works():
 	"""apt can be pointed entirely at scratch directories, and told to hand
-    dpkg a --root, so a whole install runs unprivileged."""
+    dpkg a --root, so a whole install runs unprivileged.
+
+	This used to ask only whether apt-get and dpkg-scanpackages were on
+	PATH. That is a different question, and it answered yes on a machine
+	where the install then failed -- so six tests errored where the target
+	documents itself as skipping. A guard that names a capability has to
+	exercise it, so this now does the whole thing: build a package, scan it
+	into a repository, and install it into a scratch root.
+	"""
 	if not (HAVE_DPKG_ROOT and shutil.which("apt-get")
 	        and shutil.which("dpkg-scanpackages")):
 		return False
-	return True
+	with tempfile.TemporaryDirectory() as d:
+		sysroot = os.path.join(d, "sysroot")
+		admin = os.path.join(sysroot, "var/lib/dpkg")
+		for sub in ("info", "updates", "triggers"):
+			os.makedirs(os.path.join(admin, sub))
+		for f in ("status", "available"):
+			open(os.path.join(admin, f), "a").close()
+		repo = os.path.join(d, "repo")
+		for sub in ("repo", "lists/partial", "cache/archives/partial", "log",
+		            "etc"):
+			os.makedirs(os.path.join(d, sub), exist_ok=True)
+		pkg = os.path.join(d, "probe")
+		os.makedirs(os.path.join(pkg, "DEBIAN"))
+		with open(os.path.join(pkg, "DEBIAN", "control"), "w") as f:
+			f.write("Package: aptprobe\nVersion: 1\nArchitecture: all\n"
+			        "Maintainer: t <t@t>\nDescription: probe\n")
+		env = {**os.environ, "PATH": SBIN_PATH,
+		       "APT_CONFIG": apt_isolation_config(d)}
+		if subprocess.run(["dpkg-deb", "--build", "-Znone", pkg,
+		                   os.path.join(repo, "aptprobe.deb")],
+		                  capture_output=True, env=env).returncode:
+			return False
+		scan = subprocess.run(["dpkg-scanpackages", "-m", "."], cwd=repo,
+		                      capture_output=True, text=True, env=env)
+		if scan.returncode:
+			return False
+		with open(os.path.join(repo, "Packages"), "w") as f:
+			f.write(scan.stdout)
+		src = os.path.join(d, "etc", "sources.list")
+		with open(src, "w") as f:
+			f.write(f"deb [trusted=yes] file://{repo} ./\n")
+		states = os.path.join(d, "extended_states")
+		open(states, "a").close()
+		opts = ["-o", f"Dir::State::status={admin}/status",
+		        "-o", f"Dir::State::lists={d}/lists",
+		        "-o", f"Dir::State::extended_states={states}",
+		        "-o", f"Dir::Cache={d}/cache",
+		        "-o", f"Dir::Log={d}/log",
+		        "-o", f"Dir::Etc::sourcelist={src}",
+		        "-o", "Dir::Etc::sourceparts=/dev/null",
+		        "-o", "Dir::Etc::preferences=/dev/null",
+		        "-o", "Dir::Etc::preferencesparts=/dev/null",
+		        "-o", "Debug::NoLocking=1",
+		        "-o", "APT::Sandbox::User=root",
+		        "-o", f"DPkg::Options::=--root={sysroot}",
+		        "-o", "DPkg::Options::=--force-not-root",
+		        "-o", f"DPkg::Options::=--log={d}/dpkg.log"]
+		if subprocess.run(["apt-get"] + opts + ["update"],
+		                  capture_output=True, env=env).returncode:
+			return False
+		return subprocess.run(["apt-get"] + opts + ["-y", "install", "aptprobe"],
+		                      capture_output=True, env=env).returncode == 0
 
 
 HAVE_APT_ROOT = _rootless_apt_works()
@@ -495,7 +597,23 @@ class AptBackendEndToEnd(unittest.TestCase):
 		original_path = os.environ.get("PATH", "")
 		os.environ["PATH"] = SBIN_PATH
 		self.addCleanup(os.environ.__setitem__, "PATH", original_path)
-		self.env = {**os.environ, "PATH": SBIN_PATH}
+		# APT_CONFIG keeps the host's apt.conf.d -- and the root-only invoke
+		# hooks a machine may keep there -- out of a run that is deliberately
+		# unprivileged. It goes into os.environ and not only into self.env,
+		# because these tests call emerge's own functions in-process and the
+		# apt it spawns inherits the ambient environment -- the same reason
+		# PATH is set that way just above. Set in every fixture, including
+		# the ones that drive dpkg alone, so a test which later reaches for
+		# apt does not quietly inherit them.
+		apt_config = apt_isolation_config(self.dir)
+		had_apt_config = "APT_CONFIG" in os.environ
+		original_apt_config = os.environ.get("APT_CONFIG", "")
+		os.environ["APT_CONFIG"] = apt_config
+		self.addCleanup(
+		    lambda: os.environ.__setitem__("APT_CONFIG", original_apt_config)
+		    if had_apt_config else os.environ.pop("APT_CONFIG", None))
+		self.env = {**os.environ, "PATH": SBIN_PATH,
+		            "APT_CONFIG": apt_config}
 
 		self.sources = os.path.join(self.dir, "etc", "sources.list")
 		with open(self.sources, "w") as f:
@@ -805,7 +923,23 @@ class AptlessHttpEndToEnd(unittest.TestCase):
 		original_path = os.environ.get("PATH", "")
 		os.environ["PATH"] = SBIN_PATH
 		self.addCleanup(os.environ.__setitem__, "PATH", original_path)
-		self.env = {**os.environ, "PATH": SBIN_PATH}
+		# APT_CONFIG keeps the host's apt.conf.d -- and the root-only invoke
+		# hooks a machine may keep there -- out of a run that is deliberately
+		# unprivileged. It goes into os.environ and not only into self.env,
+		# because these tests call emerge's own functions in-process and the
+		# apt it spawns inherits the ambient environment -- the same reason
+		# PATH is set that way just above. Set in every fixture, including
+		# the ones that drive dpkg alone, so a test which later reaches for
+		# apt does not quietly inherit them.
+		apt_config = apt_isolation_config(self.dir)
+		had_apt_config = "APT_CONFIG" in os.environ
+		original_apt_config = os.environ.get("APT_CONFIG", "")
+		os.environ["APT_CONFIG"] = apt_config
+		self.addCleanup(
+		    lambda: os.environ.__setitem__("APT_CONFIG", original_apt_config)
+		    if had_apt_config else os.environ.pop("APT_CONFIG", None))
+		self.env = {**os.environ, "PATH": SBIN_PATH,
+		            "APT_CONFIG": apt_config}
 		self.base = self.serve(self.repo)
 		self.m = self.load()
 
@@ -1075,7 +1209,23 @@ class ConfigMergingEndToEnd(unittest.TestCase):
 		original_path = os.environ.get("PATH", "")
 		os.environ["PATH"] = SBIN_PATH
 		self.addCleanup(os.environ.__setitem__, "PATH", original_path)
-		self.env = {**os.environ, "PATH": SBIN_PATH}
+		# APT_CONFIG keeps the host's apt.conf.d -- and the root-only invoke
+		# hooks a machine may keep there -- out of a run that is deliberately
+		# unprivileged. It goes into os.environ and not only into self.env,
+		# because these tests call emerge's own functions in-process and the
+		# apt it spawns inherits the ambient environment -- the same reason
+		# PATH is set that way just above. Set in every fixture, including
+		# the ones that drive dpkg alone, so a test which later reaches for
+		# apt does not quietly inherit them.
+		apt_config = apt_isolation_config(self.dir)
+		had_apt_config = "APT_CONFIG" in os.environ
+		original_apt_config = os.environ.get("APT_CONFIG", "")
+		os.environ["APT_CONFIG"] = apt_config
+		self.addCleanup(
+		    lambda: os.environ.__setitem__("APT_CONFIG", original_apt_config)
+		    if had_apt_config else os.environ.pop("APT_CONFIG", None))
+		self.env = {**os.environ, "PATH": SBIN_PATH,
+		            "APT_CONFIG": apt_config}
 		self.m = self.load()
 		self.etc = os.path.join(self.sysroot, "etc")
 		self.conf = dict(self.m.DEFAULT_CONF)
@@ -1289,6 +1439,78 @@ def _source_build_works():
 HAVE_SOURCE_BUILD = _source_build_works()
 
 
+def _local_deb_install_resolves():
+	"""Can apt install a local .deb while resolving against the host's own
+	package state?
+
+	The build tests below differ from every other apt test here in one way
+	that matters: they leave Dir::State::status alone, deliberately, because
+	`apt-get build-dep' has to see what is really installed. So apt resolves
+	against the host's packages while its sources are a scratch repository
+	holding one source package -- and if anything on the host depends on
+	something that universe cannot offer, apt refuses EVERY install with
+	exit 100, naming a package that has nothing to do with this suite.
+
+	Measured on a machine carrying a foreign-architecture package:
+
+	    steam-installer : Depends: steam-libs-i386 but it is not installable
+	    E: Unmet dependencies.
+
+	which surfaced as `install failed for emtest-src'. That is a property of
+	the box, so it is a skip -- but only a probe shaped like the real thing
+	can see it: `apt-get check' and a simulated install both return 0 on the
+	very host where the real install fails.
+
+	Deliberately narrower than HAVE_SOURCE_BUILD. Half of the class below
+	resolves and plans without installing anything, and those tests pass on a
+	host in this state; guarding the whole class on this would trade six
+	errors for four tests that used to run and no longer do.
+	"""
+	if not (HAVE_SOURCE_BUILD and HAVE_APT_ROOT):
+		return False
+	with tempfile.TemporaryDirectory() as d:
+		sysroot = os.path.join(d, "sysroot")
+		for sub in ("info", "updates", "triggers"):
+			os.makedirs(os.path.join(sysroot, "var/lib/dpkg", sub))
+		for sub in ("lists/partial", "cache/archives/partial", "log", "etc"):
+			os.makedirs(os.path.join(d, sub), exist_ok=True)
+		pkg = os.path.join(d, "probe")
+		os.makedirs(os.path.join(pkg, "DEBIAN"))
+		with open(os.path.join(pkg, "DEBIAN", "control"), "w") as f:
+			f.write("Package: srcprobe\nVersion: 1\nArchitecture: all\n"
+			        "Maintainer: t <t@t>\nDescription: probe\n")
+		deb = os.path.join(d, "srcprobe.deb")
+		env = {**os.environ, "PATH": SBIN_PATH,
+		       "APT_CONFIG": apt_isolation_config(d)}
+		if subprocess.run(["dpkg-deb", "--build", "-Znone", pkg, deb],
+		                  capture_output=True, env=env).returncode:
+			return False
+		src = os.path.join(d, "etc", "sources.list")
+		open(src, "w").close()
+		states = os.path.join(d, "extended_states")
+		open(states, "a").close()
+		return subprocess.run(
+		    ["apt-get",
+		     "-o", f"Dir::State::lists={d}/lists",
+		     "-o", f"Dir::State::extended_states={states}",
+		     "-o", f"Dir::Cache={d}/cache",
+		     "-o", f"Dir::Log={d}/log",
+		     "-o", f"Dir::Etc::sourcelist={src}",
+		     "-o", "Dir::Etc::sourceparts=/dev/null",
+		     "-o", "Dir::Etc::preferences=/dev/null",
+		     "-o", "Dir::Etc::preferencesparts=/dev/null",
+		     "-o", "Debug::NoLocking=1",
+		     "-o", "APT::Sandbox::User=root",
+		     "-o", f"DPkg::Options::=--root={sysroot}",
+		     "-o", "DPkg::Options::=--force-not-root",
+		     "-o", f"DPkg::Options::=--log={d}/dpkg.log",
+		     "-y", "install", deb],
+		    capture_output=True, env=env).returncode == 0
+
+
+HAVE_LOCAL_DEB_INSTALL = _local_deb_install_resolves()
+
+
 @unittest.skipUnless(HAVE_SOURCE_BUILD, "source-build tooling unavailable")
 class SourceBuildEndToEnd(unittest.TestCase):
 	"""`emerge -b` / `-B`, which had never executed.
@@ -1327,7 +1549,23 @@ class SourceBuildEndToEnd(unittest.TestCase):
 		original_path = os.environ.get("PATH", "")
 		os.environ["PATH"] = SBIN_PATH
 		self.addCleanup(os.environ.__setitem__, "PATH", original_path)
-		self.env = {**os.environ, "PATH": SBIN_PATH}
+		# APT_CONFIG keeps the host's apt.conf.d -- and the root-only invoke
+		# hooks a machine may keep there -- out of a run that is deliberately
+		# unprivileged. It goes into os.environ and not only into self.env,
+		# because these tests call emerge's own functions in-process and the
+		# apt it spawns inherits the ambient environment -- the same reason
+		# PATH is set that way just above. Set in every fixture, including
+		# the ones that drive dpkg alone, so a test which later reaches for
+		# apt does not quietly inherit them.
+		apt_config = apt_isolation_config(self.dir)
+		had_apt_config = "APT_CONFIG" in os.environ
+		original_apt_config = os.environ.get("APT_CONFIG", "")
+		os.environ["APT_CONFIG"] = apt_config
+		self.addCleanup(
+		    lambda: os.environ.__setitem__("APT_CONFIG", original_apt_config)
+		    if had_apt_config else os.environ.pop("APT_CONFIG", None))
+		self.env = {**os.environ, "PATH": SBIN_PATH,
+		            "APT_CONFIG": apt_config}
 
 		self.sources = os.path.join(self.dir, "etc", "sources.list")
 		with open(self.sources, "w") as f:
@@ -1491,6 +1729,9 @@ binary: binary-indep
 
 	# -- building ----------------------------------------------------------
 
+	@unittest.skipUnless(HAVE_LOCAL_DEB_INSTALL,
+	                     "apt cannot resolve a local .deb against this "
+	                     "host's package state")
 	def test_buildpkgonly_produces_a_deb_and_installs_nothing(self):
 		self.publish_source("1.0")
 		be = self.m.AptBackend()
@@ -1504,6 +1745,9 @@ binary: binary-indep
 		self.assertNotIn(self.SRC, self.installed(),
 		                 "-B must not install what it builds")
 
+	@unittest.skipUnless(HAVE_LOCAL_DEB_INSTALL,
+	                     "apt cannot resolve a local .deb against this "
+	                     "host's package state")
 	def test_buildpkg_installs_what_it_built(self):
 		self.publish_source("1.0")
 		be = self.m.AptBackend()
@@ -1519,6 +1763,9 @@ binary: binary-indep
 		with open(marker) as f:
 			self.assertEqual(f.read().strip(), "built-from-source")
 
+	@unittest.skipUnless(HAVE_LOCAL_DEB_INSTALL,
+	                     "apt cannot resolve a local .deb against this "
+	                     "host's package state")
 	def test_the_build_happens_under_portage_tmpdir(self):
 		"""It used to be written inline as /var/tmp/portage, which is the one
 		path the source builder writes to and the only one that could not be
@@ -1530,6 +1777,9 @@ binary: binary-indep
 		self.assertTrue(os.path.isdir(self.m.PORTAGE_TMPDIR))
 		self.assertIn(f"{self.SRC}-1.0", os.listdir(self.m.PORTAGE_TMPDIR))
 
+	@unittest.skipUnless(HAVE_LOCAL_DEB_INSTALL,
+	                     "apt cannot resolve a local .deb against this "
+	                     "host's package state")
 	def test_a_rebuild_replaces_the_previous_work_tree(self):
 		"""build() rmtree's the work directory first, so a second run cannot
 		pick up a stale source tree."""
@@ -2049,6 +2299,8 @@ class TestEveryCapabilityIsPresent(unittest.TestCase):
 		    ("rootless dpkg --root", HAVE_DPKG_ROOT),
 		    ("rootless apt", HAVE_APT_ROOT),
 		    ("source-build tooling (dpkg-dev)", HAVE_SOURCE_BUILD),
+		    ("a local .deb install resolving against host state",
+		     HAVE_LOCAL_DEB_INSTALL),
 		    ("gpg and gpgv", HAVE_GPG),
 		    ("dpkg-deb", HAVE_DPKG_DEB),
 		) if not ok]
