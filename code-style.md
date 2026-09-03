@@ -397,18 +397,38 @@ here for the detail. It does not restate the precedence rule.
 ## The commit-msg hook
 
 The commit-msg hook is `tool/hooks/commit-msg`, installed with `make hooks`.
-It rejects generator attribution and a subject over 75 columns. It lives in
-the tree rather than only in `.git/hooks` so that it is reviewable and
-survives a clone; the copy that runs is installed from it.
+It rejects generator attribution, a subject over 75 columns, and body prose
+over 75 columns. It lives in the tree rather than only in `.git/hooks` so
+that it is reviewable and survives a clone; the copy that runs is installed
+from it.
 
-Two things it deliberately does not reject. The directory `.claude` and the
-file `CLAUDE.md` are names, so a message may say where the shared tooling
-comes from -- the ban is on crediting a generator, and neither spelling is
-one. And it ignores what git is about to discard: comment lines, and the
-diff that `git commit -v` puts below the scissors line. Reading those
-refused commits over text that never reaches the message -- the hook's own
-diff contains its own pattern list, so it rejected every commit that
-edited it.
+The body limit was stated long before anything checked it, and only the
+subject was checked -- so a body line at 76 columns went through while a
+subject at 76 was refused.
+
+What it deliberately does not reject, in three groups.
+
+**Three names are spared**, so a message may say where the shared tooling
+comes from: the directory `.claude`, the file `CLAUDE.md`, and
+`claude-guidelines`, the repository the guidelines live in. The ban is on
+crediting a generator and none of the three is a spelling of that. Only the
+names are neutralised, never the token around them -- a vendor word at the
+end of a path under the tree is still refused.
+
+**What git is about to discard**: comment lines, and the diff that
+`git commit -v` puts below the scissors line. Reading those refused commits
+over text that never reaches the message -- the hook's own diff contains its
+own pattern list, so it rejected every commit that edited it.
+
+**Three shapes the length check exempts**, each because wrapping it is the
+actual mistake rather than a concession: a *trailer*, since git parses the
+block a line at a time and a broken `Link:` stops being a trailer at all; a
+line holding a *url*, which no longer works once it is split; and an
+*indented* line, which is how a message quotes a compiler error or a stack
+trace, where reflowing what you are quoting corrupts the one thing it was
+included for. It cannot tell prose opening `Note:` from a trailer, so it
+forgives that -- the wrong way round would refuse a real trailer, and that
+is the expensive error.
 
 ## See also
 
