@@ -2986,3 +2986,56 @@ The general shape, which is the reason it is written down here rather than
 just fixed: **a rename that updates the message and not the constant leaves
 a check that cannot fail and a reason that cannot be doubted.** Grepping
 for the old string finds the message and stops.
+
+## Two more messages that name a cause the code never tested
+
+Reported from claude-guidelines 2026-09-03, from a second sweep of all
+seventeen trees. Recorded, not fixed. Separate from the `tools/` typo
+above, which is still the sharper one.
+
+**`Makefile:161,167-169` — "no dpkg-parsechangelog" for a changelog it
+could not parse.**
+
+    changelog=$$(dpkg-parsechangelog -SVersion 2>/dev/null); \
+    ...
+    if [ -z "$$changelog" ]; then \
+        echo "version-check: $$file, script in step "; \
+        echo "               (changelog skipped, no dpkg-parsechangelog)"; \
+
+It tests empty output, not availability. Demonstrated with
+`/usr/bin/dpkg-parsechangelog` present and an unparsable
+`debian/changelog` -- exit 255, empty stdout, stderr swallowed -- and
+again with no `debian/` at all: both print the same two lines and exit 0.
+`version-check` is a prerequisite of `check` (`Makefile:83`), so the
+VERSION/changelog comparison silently stops running under a message
+blaming a tool that is installed.
+
+`project.md:1574` currently restates the wrong story -- "the script/file
+half needs no `dpkg-parsechangelog`, so it still runs where the changelog
+check skips" -- which is true of the halves and hides that the changelog
+half skipped for a reason it did not name.
+
+**This is the fourth tree with this recipe.** hydra, beerssh and
+fuzzypickles have it too; situ hit it and fixed it on 2026-08-07
+(`814eb47`, "stop version-check reporting success over nothing") and the
+fix was never spread. situ reads changelog line 1 with `sed`, uses
+`dpkg-parsechangelog` only as a cross-check, and prints "in step (no
+dpkg-dev; read line 1)" -- a message that says what it actually did.
+hydra has since adopted that shape.
+
+**`test_integration.py:2301` — the capability census names the wrong
+package.**
+
+`("source-build tooling (dpkg-dev)", HAVE_SOURCE_BUILD)`.
+`_source_build_works()` at `:1421-1436` checks four dpkg-dev binaries and
+**then** `dpkg-query -W build-essential`; its own comment records that
+build-essential-absent is the case actually hit, in a debian:trixie
+container, and CI installs it as a separate package
+(`tests.yml:69`). Under `EMERGE_TESTS_REQUIRE_ALL=1` the failure names
+dpkg-dev, which is installed.
+
+Confirmed sound while looking, and worth recording because it was
+rewritten this week for exactly this reason: every `HAVE_*` probe in
+`test_integration.py` now exercises the capability it names --
+`_rootless_dpkg_works` really unpacks, and `_rootless_apt_works` was
+rebuilt *because* a PATH check answered a different question.
