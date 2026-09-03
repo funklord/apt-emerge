@@ -3039,3 +3039,40 @@ rewritten this week for exactly this reason: every `HAVE_*` probe in
 `test_integration.py` now exercises the capability it names --
 `_rootless_dpkg_works` really unpacks, and `_rootless_apt_works` was
 rebuilt *because* a PATH check answered a different question.
+
+## Signal: this document's own claims of missing coverage, 2026-09-03
+
+Raised from `claude-guidelines` while sweeping the seventeen trees for
+missing tests. **The sweep does not find missing tests.** It finds
+claims that have outlived their subject: four trees that read their
+lists produced seven of those and no gaps -- qtty four, bbq-predictor
+two, anti-avx one, situ none.
+
+**The cost is measured rather than assumed.** A claim that outlives its
+gap sends the next reader at work already done. bbq-predictor's
+document said twice that its window layer could not be tested; the
+suite that tests it landed in the very next commit, nine minutes later,
+from the same session, and the sentence stood for a week. Two of qtty's
+four were "never exercised at all" about things a suite named eight and
+sixteen times.
+
+**The cheapest first pass is not reading the claim.** anti-avx's one
+stale claim named a dial's value, and the code comment at that constant
+had recorded the disproof all along: when a document and the source
+disagree, check the source first, and prefer claims that name something
+countable over claims that name a limit.
+
+**One candidate here**, after filtering to present-tense claims -- these
+documents are logs, so a past-tense "no test" is usually the setup
+sentence of a fix:
+
+    1767  **A guard that everything else has to stub out is a guard nothing tests.**
+
+That reads as a principle rather than a declaration, so the expected
+answer is that there is nothing to do. It is recorded so the next sweep
+does not spend the same twenty minutes reaching it.
+
+The nine raw matches before filtering were all past-tense accounts of
+gaps this document closed -- the `--fetchonly` coverage, the
+`_apt_downloaded_deb` case, and the CI runs that had never happened
+there once. That is the log genre working as intended.
