@@ -2940,3 +2940,49 @@ opaque errors.
 Recorded rather than fixed because the merge path is this project's
 core and the fix belongs to a session working here, not to a survey
 passing through.
+
+## The style-gate tests have not run since the tooling directory was renamed
+
+Reported from claude-guidelines 2026-09-03, from a sweep of all seventeen
+trees for gates that report success having checked nothing. Recorded, not
+fixed; it is a one-word change and it is this project's to make.
+
+`test_emerge.py:4027` reads
+
+    GATE = os.path.join(HERE, "tools", "style_gate.py")
+
+and this tree has `tool/`, not `tools/`. So `:4036` finds no file and
+`:4037` skips, and five tests have been skipping ever since:
+
+    $ python3 -m unittest -v test_emerge.TestStyleGate
+    Ran 5 tests in 0.001s
+    OK (skipped=5)
+
+They are `test_the_gate_looks_at_the_file_that_ships`,
+`test_a_config_it_cannot_open_is_refused_not_ignored`,
+`test_a_config_that_is_not_valid_toml_is_refused`,
+`test_a_wrong_typed_value_is_refused_rather_than_half_applied` and
+`test_the_local_copy_is_verbatim_apart_from_its_provenance_header` -- the
+last being the only thing in this tree that would notice a locally edited
+copy of a file that is meant to be byte-identical across sixteen projects,
+and the first being this tree's collapse detector for the gate.
+
+**The history is the part worth keeping.** `b246953` (2026-08-25, *"build:
+singular tooling directory -- tool/"*) did touch `test_emerge.py`. It
+changed exactly one line:
+
+    -		self.skipTest("tools/style_gate.py is not present in this tree")
+    +		self.skipTest("tool/style_gate.py is not present in this tree")
+
+It corrected the sentence *describing* the check and left the constant
+*performing* it pointing at the old path. The skip message is now true
+about a file that does exist, which is exactly what makes the skip
+unreadable as a fault: a reader who sees it has been told a sentence that
+checks out. Twenty-seven commits have landed since, every one of them with
+`make check` green, because `check-unit` reports `OK (skipped=5)` and five
+skips in a 598-test run look like the Debian-tool skips this suite legitimately has.
+
+The general shape, which is the reason it is written down here rather than
+just fixed: **a rename that updates the message and not the constant leaves
+a check that cannot fail and a reason that cannot be doubted.** Grepping
+for the old string finds the message and stops.
