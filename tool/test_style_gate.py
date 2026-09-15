@@ -1134,6 +1134,37 @@ class DocsModeReportsWhatItRead(unittest.TestCase):
 		self.assertIn("1 heading(s)", few)
 		self.assertIn("4 heading(s)", many)
 
+	def test_a_repeated_section_NUMBER_is_reported(self):
+		"""A number is an identifier, and the repeat check above cannot
+		see one: two sections carrying 130 with different titles are
+		different headings. Two sessions appending to one document pick
+		the next number by reading the file, and between the read and
+		the write the other has taken it -- which happened three times in
+		one afternoon 2026-09-06 while writing into another tree, and had
+		already happened twice unnoticed."""
+		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                     "project.md": "# T\n\n## 1. One\n\n## 1. Other\n"})
+		self.assertNotEqual(rc, 0, out)
+		self.assertIn("section 1 repeats", out)
+
+	def test_a_number_restarting_under_a_new_parent_is_not_a_repeat(self):
+		"""The case that decides the rule's shape, and the reason it is
+		keyed by parent rather than by number alone: several of these
+		documents write a bare `### 1.` under each `##`, and fuzznet has
+		three such. Flagging those would be a gate switched off by
+		instalments in the trees that number most."""
+		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                     "project.md": "# T\n\n## 1. A\n\n### 1. x\n"
+		                                   "\n## 2. B\n\n### 1. y\n"})
+		self.assertEqual(rc, 0, out)
+
+	def test_an_unnumbered_document_is_untouched(self):
+		"""Three of the sixteen number no sections at all, so the check
+		has to be silent rather than merely correct there."""
+		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                     "project.md": "# T\n\n## One\n\n## Two\n"})
+		self.assertEqual(rc, 0, out)
+
 	def test_a_repeated_heading_is_still_reported(self):
 		"""The rule the mode exists for, unmoved by the fix."""
 		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
