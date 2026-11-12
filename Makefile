@@ -56,7 +56,7 @@ INSTALL_DATA    = $(INSTALL) -m 644
 ALIASES = dispatch-conf etc-update
 
 .PHONY: all check check-unit check-integration check-isolation check-tty \
-        style style-source style-docs install uninstall deb clean \
+        style style-source style-tool style-docs install uninstall deb clean \
         version-check help test veryclean distclean hooks
 
 all:
@@ -134,7 +134,15 @@ check-integration:
 # successfully. That was worth guarding, and it is no longer this Makefile's
 # job: the gate refuses a config it cannot read on its own now. The fix went
 # upstream instead of being kept here, so the other six projects get it too.
-style: style-source style-docs
+style: style-tool style-source style-docs
+
+# The style gate's own suite, run ahead of the gate's verdict. A checker
+# that has stopped inspecting anything passes exactly as loudly as one
+# that works, so its pass is worth reading only once its suite has.
+# tool/test_style_gate.py arrives beside tool/style_gate.py and was
+# carried here unrun until 2026-11-12, on the holder's word.
+style-tool:
+	$(PYTHON) tool/test_style_gate.py
 
 style-source:
 	$(PYTHON) tool/style_gate.py check
