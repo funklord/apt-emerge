@@ -1014,6 +1014,18 @@ def shell_scan(text: str) -> tuple[frozenset[int], list[tuple[int, int, str]]]:
 	- **A line that begins inside a quoted string**, single or double,
 	  opened on an earlier line: its leading spaces are in the value.
 
+	And one that is alignment rather than data: **a row under a `(` or a
+	group's `{` still open with content after it on its own line** --
+	`FILES=(a b` with `       c d)` under it, `|| { bad ...` with the next
+	command under `bad`, a backgrounded `(cmd` with its second command
+	under the first. It is the shell form of a C argument list aligned
+	under its paren, which code-style.md allows; hembygd's mutate.sh
+	carried 17 such rows. A `{` or `(` ending its line opens a block,
+	whose rows are indentation and checked. So is **a line after one
+	ending in `&&`, `||` or `|`**, which continues the command as a
+	backslash would: netcfgd, hull and beerssh align a condition's second
+	half under its first.
+
 	A scanner, not a parser: it knows quotes, backslash escapes outside
 	single quotes, `#` comments at the start of a word, and heredoc
 	openers. `$(...)` nested inside double quotes is not followed, and a
@@ -1033,6 +1045,13 @@ def shell_scan(text: str) -> tuple[frozenset[int], list[tuple[int, int, str]]]:
 	held: list[tuple[int, int, str]] = []	# characters in an open literal
 	quoted: list[int] = []
 	quote = ""
+	# Openers -- `(` and a group's `{` -- still open, each with whether
+	# content followed it on its own line. While one that had content is
+	# open, the rows under it align with that content rather than indent:
+	# `FILES=(a b` / `       c)`, `|| { bad ...` / `       c ...; }`.
+	open_: list[bool] = []
+	line_openers: list[int] = []	# indices into open_ opened on this line
+	continued = False	# the last line ended in && || or |
 
 	def close() -> None:
 		nonlocal quoted, held
@@ -1054,7 +1073,12 @@ def shell_scan(text: str) -> tuple[frozenset[int], list[tuple[int, int, str]]]:
 			continue
 		if quote:
 			quoted.append(row)
+		elif continued or any(open_):
+			inside.add(row)
 		i, n = 0, len(line)
+		code_end = n
+		line_openers = []
+		opener_at: list[int] = []
 		while i < n:
 			c = line[i]
 			if ord(c) > 127:
@@ -1083,7 +1107,22 @@ def shell_scan(text: str) -> tuple[frozenset[int], list[tuple[int, int, str]]]:
 			if c == "#" and (i == 0 or line[i - 1] in " \t;&|()"):
 				loose.extend((row, j + 1, line[j]) for j in range(i + 1, n)
 				             if ord(line[j]) > 127)
+				code_end = i
 				break
+			if c == "(" or (c == "{" and (i + 1 == n or line[i + 1] in " \t")
+			                 and (i == 0 or line[i - 1] in " \t;&|(")):
+				open_.append(False)
+				line_openers.append(len(open_) - 1)
+				opener_at.append(i)
+				i += 1
+				continue
+			if (c == ")" or (c == "}" and (i == 0 or line[i - 1] in " \t;&"))) and open_:
+				open_.pop()
+				if line_openers and line_openers[-1] == len(open_):
+					line_openers.pop()
+					opener_at.pop()
+				i += 1
+				continue
 			if c == "<" and line.startswith("<<<", i):
 				i += 3
 				continue
@@ -1103,6 +1142,11 @@ def shell_scan(text: str) -> tuple[frozenset[int], list[tuple[int, int, str]]]:
 				i += 2
 				continue
 			i += 1
+		for index, at in zip(line_openers, opener_at):
+			if index < len(open_) and line[at + 1:code_end].strip():
+				open_[index] = True
+		tail = line[:code_end].rstrip()
+		continued = not quote and not pending and tail.endswith(("&&", "||", "|"))
 	loose.extend(held)
 	return frozenset(inside), sorted(loose)
 

@@ -1006,6 +1006,41 @@ class ShellIsGated(unittest.TestCase):
 		self.assertNotEqual(self.gate("#!/bin/sh\necho a   \n", "t.sh",
 		                              'tab_exempt = ["t.sh"]\n'), 0)
 
+	def test_an_array_aligned_under_its_paren_is_alignment(self) -> None:
+		"""hembygd's mutate.sh: a file list aligned under `FILES=(`."""
+		self.assertEqual(self.gate(
+			"#!/bin/bash\nFILES=(a.cpp b.cpp\n       c.cpp)\necho ok\n"), 0)
+
+	def test_code_after_an_array_is_checked_again(self) -> None:
+		self.assertNotEqual(self.gate(
+			"#!/bin/bash\nFILES=(a\n       b)\nif true; then\n    echo a\nfi\n"), 0)
+
+	def test_a_line_after_an_operator_is_continuation(self) -> None:
+		"""netcfgd, hull, beerssh: `if a &&` with `   b; then` aligned under it."""
+		self.assertEqual(self.gate(
+			"#!/bin/sh\nif true &&\n   true; then\n\techo a\nfi\n"
+			"ls |\n    wc -l\n"), 0)
+
+	def test_an_operator_in_a_comment_continues_nothing(self) -> None:
+		self.assertNotEqual(self.gate(
+			"#!/bin/sh\nif true; then # a &&\n    echo a\nfi\n"), 0)
+
+	def test_a_group_with_content_aligns_its_rows(self) -> None:
+		"""fuzzypickles' e2e `|| { bad ...` and hull's `(cmd` / ` cmd) &`."""
+		self.assertEqual(self.gate(
+			"#!/bin/sh\ntrue || { echo a\n       echo b; }\n"
+			"(sleep 1\n echo c) &\n"), 0)
+
+	def test_a_block_opened_at_line_end_is_indentation(self) -> None:
+		self.assertNotEqual(self.gate(
+			"#!/bin/sh\nf() {\n    echo a\n}\n"), 0)
+		self.assertNotEqual(self.gate(
+			"#!/bin/sh\n(\n    echo a\n)\n"), 0)
+
+	def test_braces_in_expansions_open_nothing(self) -> None:
+		self.assertNotEqual(self.gate(
+			"#!/bin/sh\necho ${x} {a,b}\nif true; then\n    echo a\nfi\n"), 0)
+
 	def ascii_gate(self, src: str) -> int:
 		return self.gate(src, config="ascii_only = true\n")
 
