@@ -115,6 +115,12 @@ Divergence needs a technical reason. These are accepted:
   whitespace is field syntax rather than indentation, and everything past
   it is alignment.
 - **Go** -- `gofmt` emits tabs natively. Compliant already.
+- **Shell -- tabs wherever they cannot change what the script does**
+  (holder, 2026-11-23). A heredoc body is written out byte for byte and
+  a multi-line quoted string is a value, so the spaces in both stay; the
+  gate skips them. A script that must stay short, or that nobody reads,
+  is exempt by name -- `tab_exempt` in `.style-gate.toml` -- and listing
+  it is the tree's claim that it is one of those.
 - **Vendored, generated and attic sources** -- exempt, per the header.
 
 **Python**: PEP 8 prefers spaces, but the language's only hard rule is that

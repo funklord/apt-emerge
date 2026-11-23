@@ -947,6 +947,90 @@ class PythonStructuralDepth(unittest.TestCase):
 
 
 
+class ShellIsGated(unittest.TestCase):
+	"""`.sh` was in no suffix list while a suffixless shell script was.
+
+	Signalled from raidcfgd 2026-10-01: `tool/hooks/commit-msg` was gated
+	and `tool/inject.sh` beside it was not. Settled by the holder
+	2026-11-23 -- tabs wherever they cannot change what the script does,
+	and not for a script that must stay short or that nobody reads.
+	"""
+
+	def gate(self, src: str, name: str = "a.sh", config: str = "") -> int:
+		return gate_rc({name: src}, "floor = 0.1\n" + config)
+
+	def test_tab_indented_shell_passes(self) -> None:
+		self.assertEqual(self.gate("#!/bin/sh\nif true; then\n\techo a\nfi\n"), 0)
+
+	def test_space_indented_shell_is_caught(self) -> None:
+		self.assertNotEqual(self.gate("#!/bin/sh\nif true; then\n    echo a\nfi\n"), 0)
+
+	def test_heredoc_body_is_data(self) -> None:
+		"""A config written out byte for byte keeps its spaces."""
+		self.assertEqual(self.gate(
+			"#!/bin/sh\ncat > f <<EOF\n  key = value\n    nested\nEOF\necho done\n"), 0)
+
+	def test_quoted_heredoc_and_dash_heredoc_are_data(self) -> None:
+		self.assertEqual(self.gate(
+			"#!/bin/sh\ncat <<'X'\n  a $b\nX\nif true; then\n\tcat <<-Y\n\t  c\n\tY\nfi\n"), 0)
+
+	def test_code_after_a_heredoc_is_checked_again(self) -> None:
+		self.assertNotEqual(self.gate(
+			"#!/bin/sh\ncat <<EOF\n  data\nEOF\nif true; then\n    echo a\nfi\n"), 0)
+
+	def test_multi_line_string_is_data(self) -> None:
+		self.assertEqual(self.gate(
+			"#!/bin/sh\nusage=\"usage: x\n    -h  help\n    -v  verbose\"\necho \"$usage\"\n"), 0)
+
+	def test_a_shift_is_not_a_heredoc(self) -> None:
+		"""Read as one, it would claim the rest of the file as data."""
+		self.assertNotEqual(self.gate(
+			"#!/bin/sh\nx=$(( 1 << n ))\nif true; then\n    echo a\nfi\n"), 0)
+
+	def test_an_unterminated_heredoc_claims_nothing(self) -> None:
+		self.assertNotEqual(self.gate(
+			"#!/bin/sh\ncat <<EOF\nif true; then\n    echo a\nfi\n"), 0)
+
+	def test_an_apostrophe_in_a_comment_opens_nothing(self) -> None:
+		self.assertNotEqual(self.gate(
+			"#!/bin/sh\n# don't\nif true; then\n    echo a\nfi\n"), 0)
+
+	def test_tab_exempt_names_a_script(self) -> None:
+		src = "#!/bin/sh\nif true; then\n    echo a\nfi\n"
+		self.assertEqual(self.gate(src, "tool/tiny.sh",
+		                           'tab_exempt = ["tool/tiny.sh"]\n'), 0)
+		self.assertEqual(self.gate(src, "tool/tiny.sh",
+		                           'tab_exempt = ["tool/*.sh"]\n'), 0)
+
+	def test_tab_exempt_keeps_the_text_checks(self) -> None:
+		self.assertNotEqual(self.gate("#!/bin/sh\necho a   \n", "t.sh",
+		                              'tab_exempt = ["t.sh"]\n'), 0)
+
+	def ascii_gate(self, src: str) -> int:
+		return self.gate(src, config="ascii_only = true\n")
+
+	def test_unicode_in_a_string_is_output(self) -> None:
+		"""fuzzypickles' e2e: `--text "Grattis \u00c5sa!"` is test data."""
+		self.assertEqual(self.ascii_gate(
+			'#!/bin/sh\nsend --text "Grattis \u00c5sa!" \'\u00b0\'\n'), 0)
+
+	def test_unicode_in_a_heredoc_is_output(self) -> None:
+		self.assertEqual(self.ascii_gate(
+			"#!/bin/sh\npython3 - <<'EOF'\nprint('S 180\u00b0')\nEOF\n"), 0)
+
+	def test_unicode_in_a_comment_is_prose(self) -> None:
+		self.assertNotEqual(self.ascii_gate("#!/bin/sh\n# an em dash \u2014 here\necho a\n"), 0)
+
+	def test_unicode_in_code_is_caught(self) -> None:
+		self.assertNotEqual(self.ascii_gate("#!/bin/sh\necho \u00e5\n"), 0)
+
+	def test_unicode_after_an_unterminated_quote_is_caught(self) -> None:
+		self.assertNotEqual(self.ascii_gate("#!/bin/sh\necho \"open\n# \u2014\n"), 0)
+
+	def test_suffixless_shell_gets_the_same_scanner(self) -> None:
+		self.assertEqual(self.gate("#!/usr/bin/env bash\ncat <<E\n  x\nE\n", "run"), 0)
+
+
 class RustIsGated(unittest.TestCase):
 	"""Rust was in no suffix list, so nothing looked at it.
 

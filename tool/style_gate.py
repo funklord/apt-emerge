@@ -147,8 +147,16 @@ DEFAULTS: Config = {
 	# had been generalised from the tree that measured it.
 	#
 	# So Rust gets the checks that need no parser and not the one that does.
+	#
+	# `.sh` since 2026-11-23 (holder): shell takes tabs wherever they cannot
+	# change what the script does. A shell script with no suffix and a
+	# shebang was already gated; one with the suffix was not, so two
+	# scripts in one directory answered to different rules. What tabs could
+	# change -- heredoc bodies and multi-line quoted strings -- is skipped
+	# by shell_literal_lines, and a script that must stay short or that
+	# nobody reads is named in `tab_exempt`.
 	"indent_suffixes": [".c", ".h", ".cpp", ".hpp", ".cc", ".hh", ".py",
-	                    ".situ", ".ebnf", ".lua", ".rs"],
+	                    ".situ", ".ebnf", ".lua", ".rs", ".sh"],
 	"indent_names": [],
 
 	# Files that get the text checks (trailing space, final newline, and
@@ -177,6 +185,12 @@ DEFAULTS: Config = {
 	# across every project and none of them real; checking table rows
 	# produces zero false positives across all eight.
 	"doc_check_paths": True,
+
+	# Files the tab rule does not govern though their kind is, each a claim
+	# a tree makes by listing it: a script that must stay short, or one
+	# nobody reads (holder, 2026-11-23, of shell). Paths from the tree's
+	# root, or globs over them. They still get the text checks.
+	"tab_exempt": [],
 }
 
 SKIP_DIR_NAMES = frozenset({"__pycache__", ".git"})
@@ -493,6 +507,13 @@ def has_shebang(path: Path) -> bool:
 			return handle.readline(2) == b"#!"
 	except OSError:
 		return False
+
+
+def tab_exempt(rel: Path, cfg: Config) -> bool:
+	"""A file the tree has named as outside the tab rule."""
+	name = rel.as_posix()
+	return any(name == e.strip("/") or fnmatch.fnmatchcase(name, e.strip("/"))
+	           for e in cfg["tab_exempt"])
 
 
 def wants_text(path: Path, cfg: Config) -> bool:
@@ -947,6 +968,156 @@ def picolisp_literal_lines(text: str) -> frozenset[int]:
 	return frozenset(inside)
 
 
+SHELLS = (b"sh", b"bash", b"dash", b"ksh", b"zsh", b"busybox")
+
+
+def is_shell(path: Path) -> bool:
+	"""Shell by suffix, or by a shebang naming a shell for a command with none."""
+	if path.suffix in (".sh", ".bash"):
+		return True
+	if path.suffix:
+		return False
+	try:
+		with path.open("rb") as handle:
+			first = handle.readline(80)
+	except OSError:
+		return False
+	if not first.startswith(b"#!"):
+		return False
+	words = first[2:].split()
+	if not words:
+		return False
+	name = words[0].rsplit(b"/", 1)[-1]
+	if name == b"env" and len(words) > 1:
+		name = words[1]
+	return name in SHELLS
+
+
+HEREDOC = re.compile(r"""<<(-?)[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|\\?([A-Za-z_0-9.-]+))""")
+
+
+def shell_scan(text: str) -> tuple[frozenset[int], list[tuple[int, int, str]]]:
+	"""Read a shell script for what is data and what is the script.
+
+	Returns the rows whose leading whitespace is data, not indent, and the
+	non-ASCII characters that stand outside any literal -- in code or in a
+	comment -- which are what the ASCII rule governs (code-style.md: a
+	string a program prints or feeds a test is output, not prose).
+
+	Data, either of which a retab would change:
+
+	- **A heredoc body and its terminator.** The body is written out byte
+	  for byte -- a config, a C file, a usage text -- and under `<<WORD`
+	  the terminator must stand at column one. `<<-WORD` strips leading
+	  TABS, so a tab there is legal and a space is content; the body is
+	  skipped either way.
+	- **A line that begins inside a quoted string**, single or double,
+	  opened on an earlier line: its leading spaces are in the value.
+
+	A scanner, not a parser: it knows quotes, backslash escapes outside
+	single quotes, `#` comments at the start of a word, and heredoc
+	openers. `$(...)` nested inside double quotes is not followed, and a
+	quote inside one can end the string early; such a script reports a
+	line it should not, which is the failure that shows itself, rather than
+	skipping one it should check. And a heredoc or a quote that never ends
+	was misread -- a shift the arithmetic check missed, an apostrophe the
+	scanner took for code -- so its rows and characters go back to being
+	checked: claiming the rest of a file as data would be a pass over
+	nothing.
+	"""
+	inside: set[int] = set()
+	loose: list[tuple[int, int, str]] = []
+	lines = text.split("\n")
+	pending: list[tuple[str, bool]] = []
+	claimed: list[int] = []
+	held: list[tuple[int, int, str]] = []	# characters in an open literal
+	quoted: list[int] = []
+	quote = ""
+
+	def close() -> None:
+		nonlocal quoted, held
+		inside.update(quoted)
+		quoted = []
+		held = []
+
+	for number, line in enumerate(lines):
+		row = number + 1
+		if pending:
+			word, strip_tabs = pending[0]
+			claimed.append(row)
+			held.extend((row, col + 1, ch) for col, ch in enumerate(line) if ord(ch) > 127)
+			if (line.lstrip("\t") if strip_tabs else line) == word:
+				pending.pop(0)
+				inside.update(claimed)
+				claimed = []
+				held = []
+			continue
+		if quote:
+			quoted.append(row)
+		i, n = 0, len(line)
+		while i < n:
+			c = line[i]
+			if ord(c) > 127:
+				(held if quote else loose).append((row, i + 1, c))
+			if quote == "'":
+				if c == "'":
+					quote = ""
+					close()
+				i += 1
+				continue
+			if c == "\\":
+				if i + 1 < n and ord(line[i + 1]) > 127:
+					(held if quote else loose).append((row, i + 2, line[i + 1]))
+				i += 2
+				continue
+			if quote == '"':
+				if c == '"':
+					quote = ""
+					close()
+				i += 1
+				continue
+			if c in "'\"":
+				quote = c
+				i += 1
+				continue
+			if c == "#" and (i == 0 or line[i - 1] in " \t;&|()"):
+				loose.extend((row, j + 1, line[j]) for j in range(i + 1, n)
+				             if ord(line[j]) > 127)
+				break
+			if c == "<" and line.startswith("<<<", i):
+				i += 3
+				continue
+			if c == "<" and line.startswith("<<", i):
+				# `1 << n` inside $(( )) or (( )) is a shift, not a heredoc.
+				before = line[:i]
+				if before.count("((") > before.count("))"):
+					i += 2
+					continue
+				m = HEREDOC.match(line, i)
+				if m:
+					word = m.group(2) if m.group(2) is not None else (
+					       m.group(3) if m.group(3) is not None else m.group(4))
+					pending.append((word, m.group(1) == "-"))
+					i = m.end()
+					continue
+				i += 2
+				continue
+			i += 1
+	loose.extend(held)
+	return frozenset(inside), sorted(loose)
+
+
+def shell_literal_lines(text: str) -> frozenset[int]:
+	"""Rows of a shell script whose leading whitespace is data; see shell_scan."""
+	return shell_scan(text)[0]
+
+
+def shell_ascii_problems(text: str, where: Path) -> list["Problem"]:
+	"""Non-ASCII in shell code and comments, not in its literals; see shell_scan."""
+	return [Problem(where, row, col, f"non-ASCII character {ch!r} outside a literal")
+	        for row, col, ch in shell_scan(text)[1]]
+
+
 # --------------------------------------------------------------- checks
 
 class Problem:
@@ -1046,6 +1217,7 @@ def check_file(path: Path, root: Path, cfg: Config) -> list[Problem]:
 		found = None
 		reader = (python_ascii_problems if is_python(path)
 		          else c_ascii_problems if path.suffix in C_SUFFIXES
+		          else shell_ascii_problems if is_shell(path)
 		          else None)
 		if reader is not None:
 			try:
@@ -1101,9 +1273,12 @@ def check_file(path: Path, root: Path, cfg: Config) -> list[Problem]:
 		skip = python_literal_lines(text)
 	elif path.suffix == ".l":
 		skip = picolisp_literal_lines(text)
+	elif is_shell(path):
+		skip = shell_literal_lines(text)
 	else:
 		skip = frozenset()
-	problems.extend(check_text(text, rel, wants_indent(path, cfg), skip,
+	governed = wants_indent(path, cfg) and not tab_exempt(rel, cfg)
+	problems.extend(check_text(text, rel, governed, skip,
 	                           heuristic=wants_column_heuristic(path)))
 
 	# Where a fixer exists, "tabs-then-spaces" is the weaker of two possible
@@ -1113,7 +1288,7 @@ def check_file(path: Path, root: Path, cfg: Config) -> list[Problem]:
 	# not. Migrating to this tool without asking the stronger question would
 	# have quietly weakened two projects' gates, which is the exact failure
 	# the floor above exists to prevent, arriving by a different door.
-	if wants_indent(path, cfg) and has_fixer(path):
+	if governed and has_fixer(path):
 		dual: set[int] = set()
 		short: dict[int, int] = {}
 		fixed, error = fixed_text(path, text, cfg, dual, short)
