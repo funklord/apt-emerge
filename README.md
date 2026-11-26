@@ -1,10 +1,55 @@
 # emerge for Debian
 
-A Gentoo Portage–flavoured package manager for Debian and Ubuntu, in one
-stdlib-only Python file. It speaks emerge's command line and prints
-Portage-style output, but everything underneath is real Debian tooling —
-apt, dpkg and their indexes. Nothing is emulated and no state of its own is
-invented: `@selected` really is apt's set of manually-installed packages.
+Installing one program on Debian can upgrade a good part of the system.
+apt takes the newest version of the package you asked for, and when that
+version wants a newer library than you have, the library comes too -- a
+newer libc, a newer systemd, a newer graphics stack -- even where an older
+release of the same program would have run on what is installed. Some of
+those upgrades want a reboot; some restart the desktop you are sitting at
+and close everything open on it. A configuration file you have edited and a
+package has changed either stops the install to ask keep-or-replace, or,
+told not to ask, is left beside yours as `.dpkg-dist` for a merge nobody
+gets round to. And a small machine that carries dpkg but not apt has no
+dependency resolver at all.
+
+apt-emerge is one Python file, with nothing but the standard library, that
+gives Debian and Ubuntu Gentoo's `emerge` command line and an answer to each
+of those. Underneath it is real Debian tooling -- apt and dpkg and their
+indexes. Nothing is emulated and no state of its own is invented:
+`@selected` really is apt's set of manually installed packages.
+
+How it differs from what you would otherwise use:
+
+- **apt-get, aptitude and nala** take the newest version of what you ask
+  for and upgrade whatever it requires. apt-get's `--no-upgrade` only
+  concerns the packages named on the command line, never what they pull
+  in. `emerge --no-dep-upgrade` searches instead: it keeps every installed
+  package exactly where it is, and for the target and each missing
+  dependency takes the newest version whose whole subtree allows that,
+  stepping back through older versions until one fits. When nothing fits it names the installed package that
+  forms the wall, and `--with` lets that one package move.
+- **dpkg's conffile prompt** asks keep-or-replace in the middle of an
+  install, one file at a time, with no common ancestor to merge from.
+  `emerge --dispatch-conf` parks every update, archives each package's
+  as-shipped configuration at install time, and later does a real three-way
+  merge of your edits against the new version. Untouched files,
+  comment-only differences and clean merges apply by themselves; only real
+  conflicts reach you. For a file parked before apt-emerge was installed it
+  recovers the old shipped version from the apt cache, a repository or
+  snapshot.debian.org, verified against your archive keys.
+- **needrestart** tells you after an upgrade what is still running old
+  code. apt-emerge tells you before, in the plan, which upgrades touch the
+  code your running X or Wayland session has loaded -- and tells a Debian
+  rebuild that leaves the session running apart from an upstream change
+  that may restart it.
+- **dpkg alone**, on a machine without apt, installs a `.deb` you already
+  have and resolves nothing. apt-emerge's dpkg backend reads your sources,
+  fetches signed indexes and checks them with `gpgv`, resolves dependencies
+  itself, verifies each download's SHA256 and keeps a real world file --
+  still one file you can `scp` onto the box.
+- **Portage** is Gentoo's. This is its vocabulary -- `-av`, `-uD @world`,
+  `--depclean`, `-C`, sets, Portage-style output -- on a Debian system, with
+  Debian's packages and Debian's own state.
 
 ```console
 $ emerge -pv sl
@@ -23,7 +68,7 @@ Build a package and install it the normal way:
 
 ```sh
 make deb
-sudo apt install ./build/apt-emerge_*_all.deb
+sudo apt install ./build/deb/apt-emerge_*_all.deb
 ```
 
 That gives you `emerge`, the `dispatch-conf` and `etc-update` aliases, and
