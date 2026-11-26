@@ -2228,7 +2228,10 @@ write surface ever needs testing.
      Proven 2026-11-26 in a trixie container: `emerge -b cargo-fd-find`
      chose 10.3.0 (10.5.2 needs rustc 1.90, trixie has 1.85), built it,
      installed `fd` into `/usr/lib/cargo/bin` with `Depends: libc6,
-     libgcc-s1`, and `fd --version` ran.
+     libgcc-s1`, and `fd --version` ran. The upgrade too: fd 9.0.0 built
+     as for a rustc 1.70, then `emerge -u @world` listed
+     `cargo-fd-find-10.3.0 [9.0.0]` among eight archive upgrades, built
+     it, kept it in @world, and a second `-pu` found nothing outdated.
 
      **A `-sys` crate gets its C library** (2026-11-26): the `-sys`
      crates in the published `Cargo.lock` are mapped through a table
