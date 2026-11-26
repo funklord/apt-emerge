@@ -382,6 +382,75 @@ _OPS = {"<<": lambda r: r < 0, "<=": lambda r: r <= 0, "=": lambda r: r == 0,
 def meets(version, op, want):
 	return _OPS[op](vercmp(version, want))
 
+# PEP 440's own pattern (its appendix B), which accepts every spelling the
+# spec normalises: a leading v, any of - _ . as separators, alpha/beta/c/
+# pre/preview/rev/r, and an implicit 0 where a number is left out.
+_PEP440 = re.compile(r"""
+	v?
+	(?:(?P<epoch>[0-9]+)!)?
+	(?P<release>[0-9]+(?:\.[0-9]+)*)
+	(?P<pre>[-_.]?(?P<pre_l>alpha|a|beta|b|preview|pre|c|rc)[-_.]?(?P<pre_n>[0-9]+)?)?
+	(?P<post>(?:-(?P<post_n1>[0-9]+))
+	        |(?:[-_.]?(?P<post_l>post|rev|r)[-_.]?(?P<post_n2>[0-9]+)?))?
+	(?P<dev>[-_.]?dev[-_.]?(?P<dev_n>[0-9]+)?)?
+	(?:\+(?P<local>[a-z0-9]+(?:[-_.][a-z0-9]+)*))?
+	""", re.VERBOSE | re.IGNORECASE)
+
+_PEP440_PRE = {"alpha": "a", "a": "a", "beta": "b", "b": "b",
+               "c": "rc", "rc": "rc", "pre": "rc", "preview": "rc"}
+
+def pep440_to_debian(version):
+	"""A PEP 440 version as a Debian upstream version that sorts the same.
+
+	PEP 440 orders dev < pre-release < release < post-release, and a pre-
+	or post-release can carry a dev of its own. Debian's `~` sorts before
+	everything, the end of the string included, so it carries what must
+	come BEFORE the release; `+` sorts after the end, so it carries what
+	comes after:
+
+	    1.0.dev1        1.0~~dev1        (before 1.0a1: `~~` beats `~a`)
+	    1.0a1           1.0~a1           (a < b < rc by letter)
+	    1.0rc1          1.0~rc1
+	    1.0             1.0
+	    1.0.post1       1.0+post1        (before 1.0.1: `+` is below `.`)
+	    1.0.post1.dev2  1.0+post1~dev2
+
+	Passed through unchanged, `1.0rc1` sorts ABOVE `1.0` in dpkg, so a
+	packaged release candidate would never be superseded by its release
+	and `-u @world` would decline the upgrade for ever, silently -- the
+	fault stdeb has (project.md, open item 9).
+
+	Refuses with ValueError what is not PEP 440, rather than guessing: a
+	version that sorts wrongly is invisible until an upgrade fails to
+	happen. That includes a local version (`1.0+abc`): PyPI will not host
+	one, so it never came from an index, and PEP 440 sorts a numeric local
+	segment above a lettered one where dpkg sorts it below.
+
+	One difference is kept on purpose: PEP 440 calls 1.0, 1 and 1.0.0 the
+	same release and dpkg does not, so `1.0rc1` sorts above `1` here.
+	Dropping trailing zeros would fix that and break the commoner case: a
+	Debian dependency on `python3-foo (>= 1.0)` is not met by `1`. Debian's
+	own Python packages keep the upstream spelling too, so this sorts the
+	way they do."""
+	m = _PEP440.fullmatch(version.strip())
+	if not m:
+		raise ValueError(f"not a PEP 440 version: {version!r}")
+	if m["local"]:
+		raise ValueError(f"a local version is not published: {version!r}")
+	out = m["release"]
+	if m["epoch"] is not None:
+		out = f"{int(m['epoch'])}:{out}"
+	if m["pre"]:
+		out += f"~{_PEP440_PRE[m['pre_l'].lower()]}{int(m['pre_n'] or 0)}"
+	if m["post"]:
+		out += f"+post{int(m['post_n1'] or m['post_n2'] or 0)}"
+	if m["dev"]:
+		n = int(m["dev_n"] or 0)
+		# A dev of a plain release sorts before its pre-releases; a dev of a
+		# pre- or post-release only before that one.
+		out += f"~dev{n}" if (m["pre"] or m["post"]) else f"~~dev{n}"
+	return out
+
 def _dep_ok(alt, inst, chosen, iprov, provides_of):
 	"""Is a single dependency alternative (name, op, ver) already satisfied
     by an installed or already-chosen package (or a Provides of one)?

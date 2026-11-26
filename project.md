@@ -2028,10 +2028,19 @@ write surface ever needs testing.
    **The hard parts, none of them optional:**
    - *Name mapping.* PyPI `PyYAML` is Debian `python3-yaml`. Either keep a
      mapping or vendor everything and accept the duplication.
-   - *Version translation.* PEP 440 `1.0.0rc1` must become `1.0.0~rc1` or it
-     sorts **above** the final release — measured above, not feared.
-     `vercmp` already gets `~` right, so
-     this is mechanical — but getting it wrong is silent.
+   - *Version translation.* **Done 2026-11-26: `pep440_to_debian()`**,
+     beside `vercmp`. PEP 440 `1.0.0rc1` must become `1.0.0~rc1` or it
+     sorts **above** the final release — measured above, not feared. `~`
+     carries what sorts before a release (`~~devN` for a release's own dev,
+     so it comes before `~aN`), `+postN` what sorts after. Two choices
+     made: a local version (`1.0+abc`) is refused, since PyPI hosts none
+     and PEP 440 orders its numeric segments above lettered ones where
+     dpkg does the reverse; and the release keeps its trailing zeros, so
+     `1.0rc1` sorts above `1` as it does in Debian's own Python packages —
+     dropping them would leave a `(>= 1.0)` dependency unmet by `1`.
+     `TestPep440ToDebian` holds 3,000 generated pairs to `packaging`'s
+     order (the reference implementation) and a sample to dpkg; writing
+     `~dev` for `~~dev` fails nine of them.
    - *Collision with archive packages*, which is the problem being solved
      reappearing in new clothes. A self-built `python3-requests` shadowing
      Debian's is no better than pip's mess. Needs a namespace

@@ -420,6 +420,118 @@ def dpkg_cmp(a, b):
 	return -1 if rel("lt") else 1
 
 
+try:
+	from packaging.version import Version as Pep440Version
+except ImportError:
+	Pep440Version = None
+
+
+def zero_padded_apart(pa, pb):
+	"""Releases PEP 440 calls equal and dpkg does not: the same numbers,
+    one spelled with more trailing zeros."""
+	def strip(r):
+		r = list(r)
+		while len(r) > 1 and r[-1] == 0:
+			r.pop()
+		return r
+	return pa.release != pb.release and strip(pa.release) == strip(pb.release)
+
+
+class TestPep440ToDebian(unittest.TestCase):
+	"""A Python package's version has to become a Debian one that sorts
+    the same, or a packaged release candidate outranks its release and is
+    never upgraded (project.md, open item 9). PEP 440's order is held to
+    by `packaging`, the reference implementation, and Debian's by dpkg --
+    the translation is checked against both rather than against what its
+    author believed either one says."""
+
+	TABLE = [
+		("1.0", "1.0"),
+		("1.0a1", "1.0~a1"), ("1.0.alpha.1", "1.0~a1"), ("1.0-beta2", "1.0~b2"),
+		("1.0c3", "1.0~rc3"), ("1.0pre3", "1.0~rc3"), ("1.0RC1", "1.0~rc1"),
+		("1.0rc", "1.0~rc0"),
+		("1.0.post1", "1.0+post1"), ("1.0-1", "1.0+post1"), ("1.0rev2", "1.0+post2"),
+		("1.0.dev3", "1.0~~dev3"), ("1.0a1.dev3", "1.0~a1~dev3"),
+		("1.0.post1.dev2", "1.0+post1~dev2"),
+		("2!1.0", "2:1.0"), ("v1.2.3", "1.2.3"),
+	]
+
+	def test_table(self):
+		for pep, deb in self.TABLE:
+			with self.subTest(pep=pep):
+				self.assertEqual(em.pep440_to_debian(pep), deb)
+
+	def test_a_release_candidate_sorts_below_its_release(self):
+		"""The fault the translation exists for: untranslated, dpkg puts
+        1.0rc1 above 1.0."""
+		self.assertGreater(em.vercmp("1.0rc1", "1.0"), 0)
+		self.assertLess(em.vercmp(em.pep440_to_debian("1.0rc1"),
+		                          em.pep440_to_debian("1.0")), 0)
+
+	def test_what_is_not_pep440_is_refused(self):
+		for odd in ("", "abc", "1.0-beta-x", "1..0", "1.0~rc1", "1:1.0",
+		            "1.0+", "1.0 rc1",
+		            # Local: PyPI does not host one, and its order differs.
+		            "1.0+abc", "1.0+1", "1.0.post1+ubuntu-1"):
+			with self.subTest(v=odd):
+				with self.assertRaises(ValueError):
+					em.pep440_to_debian(odd)
+
+	def versions(self, rnd, count):
+		"""Generated, seeded, and dense in the parts that interact: small
+        numbers so that equal releases meet each other's pre, post and dev
+        forms, every spelling the spec normalises, and the odd epoch."""
+		out = []
+		for _ in range(count):
+			v = ".".join(str(rnd.randint(0, 2))
+			             for _ in range(rnd.randint(1, 3)))
+			if rnd.random() < 0.1:
+				v = f"{rnd.randint(0, 1)}!{v}"
+			if rnd.random() < 0.4:
+				v += (rnd.choice(["a", "b", "rc", "c", ".alpha", "-beta", "pre"])
+				      + str(rnd.randint(0, 2)))
+			if rnd.random() < 0.3:
+				v += rnd.choice([".post", "-", "rev", ".r"]) + str(rnd.randint(0, 2))
+			if rnd.random() < 0.3:
+				v += rnd.choice([".dev", "-dev", "dev"]) + str(rnd.randint(0, 2))
+			out.append(v)
+		return out
+
+	@unittest.skipUnless(Pep440Version, "python3-packaging is not installed")
+	def test_generated_versions_sort_as_pep440_says(self):
+		"""Every pair, equal ones included, except those whose releases
+        differ only by trailing zeros (1.0 against 1 or 1.0.0) -- the one
+        difference the translation keeps on purpose, as its docstring
+        says."""
+		rnd = random.Random(20261126)
+		vs = self.versions(rnd, 400)
+		for _ in range(3000):
+			a, b = rnd.choice(vs), rnd.choice(vs)
+			pa, pb = Pep440Version(a), Pep440Version(b)
+			want = (pa > pb) - (pa < pb)
+			if zero_padded_apart(pa, pb):
+				continue
+			da, db = em.pep440_to_debian(a), em.pep440_to_debian(b)
+			with self.subTest(a=a, b=b, da=da, db=db):
+				self.assertEqual(sign(em.vercmp(da, db)), want)
+
+	@unittest.skipUnless(Pep440Version and HAVE_DPKG,
+	                     "python3-packaging or dpkg is not available")
+	def test_dpkg_agrees(self):
+		"""vercmp is itself a reimplementation, so a sample goes to dpkg."""
+		rnd = random.Random(20261127)
+		vs = self.versions(rnd, 60)
+		for _ in range(150):
+			a, b = rnd.choice(vs), rnd.choice(vs)
+			pa, pb = Pep440Version(a), Pep440Version(b)
+			want = (pa > pb) - (pa < pb)
+			if zero_padded_apart(pa, pb):
+				continue
+			da, db = em.pep440_to_debian(a), em.pep440_to_debian(b)
+			with self.subTest(a=a, b=b, da=da, db=db):
+				self.assertEqual(dpkg_cmp(da, db), want)
+
+
 class TestMeets(unittest.TestCase):
 	def test_operators(self):
 		cases = [
