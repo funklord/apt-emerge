@@ -2183,13 +2183,22 @@ write surface ever needs testing.
        `pypi-pysocks`), read from the release this run chose or else
        from the installed `dist-info/METADATA`. Shown by unit tests only;
        no container run met a real extra.
-     - *Build backends newer than the archive's.* The classifier switch
-       covers the case met. A release needing a newer backend outright is
-       now refused before the build, naming both versions
-       (`pypi_build_shortfalls()` against `apt-cache policy`'s
-       candidate), where it used to fail somewhere inside pybuild.
-       Building backends as `pypi-` packages too is the general answer,
-       not yet built; this check is the half of it that says when.
+     - ~~*Build backends newer than the archive's.*~~ **Built
+       2026-11-26.** `pypi_build_shortfalls()` finds the build
+       requirements the archive's candidate cannot meet;
+       `_pypi_backends()` builds those from PyPI first (with their
+       closure, recursively, refusing a package that needs a newer build
+       of itself), installs them and marks them auto. The package's
+       `Build-Depends` then names the `pypi-` builds with their bounds,
+       and its build imports `PYPI_TREE` ahead of `dist-packages`.
+       Proven in a trixie container: `emerge -b pypi-platformdirs`
+       (`hatchling>=1.29`, `python-sbom`) built 19 packages, among them
+       hatchling 1.33, setuptools 84 and two projects the archive does
+       not carry, and put only `pypi-platformdirs` in @world.
+     - *Architecture by heuristic.* A `.c` file anywhere in the sdist
+       makes the package `any`; setuptools, poetry-core and python-sbom
+       came out `amd64` from sources they ship but do not compile. A
+       per-architecture package of pure Python is wasteful, not wrong.
      - A dynamic `Requires-Dist`, a URL requirement and `===` are refused.
    - *Transitive closure size*, npm especially.
    - *apt backend only*, like `-b/-B`: it needs build tooling, and the dpkg

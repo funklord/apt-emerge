@@ -747,6 +747,20 @@ class TestPypiDebianFiles(unittest.TestCase):
 			("flit_core>=3.12,<4", "flit", "3.10.1-1"),
 			("scikit-build-core", "python3-scikit-build-core", None)])
 
+	def test_a_backend_built_from_pypi_is_depended_on_and_imported_first(self):
+		meta = {"name": "packaging", "version": "26.4", "summary": "",
+		        "requires_dist": [], "requires_build": ["flit_core >=3.12"]}
+		files, _ = em.pypi_debian_files(meta, env=self.env,
+		                                from_pypi=["flit_core >=3.12"])
+		self.assertIn("pypi-flit-core (>= 3.12)", files["control"])
+		self.assertNotIn(", flit", files["control"])
+		self.assertIn(f"PYTHONPATH=$(CURDIR)/debian/pypi-build:{em.PYPI_TREE}",
+		              files["rules"])
+		files, _ = em.pypi_debian_files(meta, env=self.env)
+		self.assertIn(", flit\n", files["control"])
+		self.assertNotIn(em.PYPI_TREE + "\n", files["rules"].split(
+			"PYTHONPATH=")[1].split("\n")[0] + "\n")
+
 	def test_no_pyproject_means_setuptools(self):
 		meta = em.pypi_sdist_metadata(self.sdist(
 			"Metadata-Version: 2.1\nName: old\nVersion: 1.0\n"))

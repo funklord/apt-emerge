@@ -839,7 +839,7 @@ def pypi_build_shortfalls(meta, candidate_of, env=None):
 	return out
 
 def pypi_debian_files(meta, arch="all", env=None, when=None,
-                      extra_requires=None):
+                      extra_requires=None, from_pypi=()):
 	"""The debian/ directory that builds `meta` as a pypi- package with
 	dh-python: {path under debian/: content}. `arch` is `any` where the
 	sdist compiles something; dh-python does the rest either way.
@@ -876,10 +876,21 @@ def pypi_debian_files(meta, arch="all", env=None, when=None,
 					break
 	build = ["debhelper-compat (= 13)", "dh-python",
 	         "pybuild-plugin-pyproject", "python3-all"]
+	# A build requirement the archive is too old for (from_pypi, lines of
+	# requires_build) is met by a pypi- build of it instead, which the
+	# build then has to import ahead of dist-packages.
 	for line in meta["requires_build"]:
+		if line in from_pypi:
+			got = pypi_requirement(line, env)
+			if got:
+				build += [r for r in got[2] if r not in build]
+			continue
 		b = _pypi_build_package(line, env)
 		if b and b not in build:
 			build.append(b)
+	build_path = "$(CURDIR)/debian/pypi-build"
+	if from_pypi:
+		build_path += ":" + PYPI_TREE
 	summary = re.sub(r"\s+", " ", meta["summary"]) or meta["name"]
 	when = when or email.utils.formatdate(localtime=True)
 	# Whoever builds it maintains it: dch's convention, and lintian
@@ -935,7 +946,7 @@ def pypi_debian_files(meta, arch="all", env=None, when=None,
 	                  # import and the network is off limits.
 	                  "export HATCH_METADATA_CLASSIFIERS_NO_VERIFY=1\n"
 	                  "export VALIDATE_PYPROJECT_NO_NETWORK=1\n"
-	                  "export PYTHONPATH=$(CURDIR)/debian/pypi-build\n"
+	                  f"export PYTHONPATH={build_path}\n"
 	                  f"export PYBUILD_DESTDIR=debian/{package}\n"
 	                  "%:\n"
 	                  "\tdh $@ --buildsystem=pybuild\n"
@@ -3801,6 +3812,7 @@ class AptBackend:
 		env = {**os.environ, "DEB_BUILD_OPTIONS": use,
 		       "DEBIAN_FRONTEND": "noninteractive"}
 		pypi_plan = getattr(self, "_pypi_plan", [])
+		self._pypi_also_installed = []
 		total = len(pypi_plan) + len(self._src_plan)
 		for i, entry in enumerate(pypi_plan, 1):
 			if self._build_pypi(entry, env, use, opts, i, total):
@@ -3844,6 +3856,7 @@ class AptBackend:
 			                           use, opts, pv, i, total):
 				installed.append(atom)
 		print()
+		installed += self._pypi_also_installed
 		if installed:
 			self._apply_marks(was_manual, opts["oneshot"], named=installed)
 		einfo("GNU info directory index is up-to-date.")
@@ -3956,6 +3969,40 @@ class AptBackend:
 				return info.get_all("Requires-Dist") or []
 		return []
 
+	def _pypi_backends(self, package, meta, env, use, opts):
+		"""Build from PyPI what the archive's build tools are too old or
+		absent for, before `package` itself, and say which requirement
+		lines it now meets. Each is installed -- a build dependency has
+		to be -- and marked auto afterwards, as apt's build-dep is."""
+		short = pypi_build_shortfalls(meta, self._candidate)
+		if not short:
+			return []
+		building = self.__dict__.setdefault("_pypi_building", set())
+		if package in building:
+			raise RuntimeError(f"{package} needs a newer build of itself "
+			                   "to build")
+		roots, lines = [], []
+		for line, deb, have in short:
+			got = pypi_requirement(line)
+			mine = self._installed_version(got[0])
+			lines.append(line)
+			print(f"{ARROW} {package} needs {line} to build; the archive has "
+			      + (f"{deb} {have}" if have else f"no {deb}")
+			      + "; building it from PyPI")
+			if not (mine and debian_relations_hold(mine, got[2])):
+				roots.append((got[0], got[2]))
+		plan = pypi_closure(roots, self._installed_version) if roots else []
+		building.add(package)
+		try:
+			for n, entry in enumerate(plan, 1):
+				if self._build_pypi(entry, env, use,
+				                    dict(opts, buildpkgonly=False), n,
+				                    len(plan)):
+					self._pypi_also_installed.append(entry[0])
+		finally:
+			building.discard(package)
+		return lines
+
 	def _build_pypi(self, entry, env, use, opts, i, total):
 		"""Fetch a PyPI sdist, give it the debian/ pypi_debian_files()
 		writes, and build it as -b builds an archive source package."""
@@ -3979,9 +4026,11 @@ class AptBackend:
 				       or n == "Cargo.toml" for n in names):
 					arch = "any"
 					break
+			from_pypi = self._pypi_backends(package, meta, env, use, opts)
 			files, _ = pypi_debian_files(meta, arch,
-			                             extra_requires=self._pypi_requires)
-		except (RuntimeError, ValueError, OSError) as e:
+			                             extra_requires=self._pypi_requires,
+			                             from_pypi=from_pypi)
+		except (RuntimeError, ValueError, LookupError, OSError) as e:
 			efail(e)
 			sys.exit(1)
 		for path, text in files.items():
@@ -3991,14 +4040,6 @@ class AptBackend:
 				f.write(text)
 		os.chmod(os.path.join(srcdir, "debian", "rules"), 0o755)
 		print(f"{ARROW} Source unpacked in {srcdir}")
-		short = pypi_build_shortfalls(meta, self._candidate)
-		if short:
-			for line, deb, have in short:
-				eerror(f"{package} needs {line} to build; the archive has "
-				       + (f"{deb} {have}" if have else f"no {deb}"))
-			efail(f"cannot build {package} with the archive's build tools "
-			      f"(building them from PyPI is not supported yet)")
-			sys.exit(1)
 		einfo(f"Installing build dependencies for {package} "
 		      f"(oneshot: --depclean removes them again)...")
 		r = capture(["apt-get", "-y", "build-dep", srcdir])
