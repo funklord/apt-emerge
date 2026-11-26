@@ -737,6 +737,16 @@ class TestPypiDebianFiles(unittest.TestCase):
 		files, _ = em.pypi_debian_files(meta, env=self.env)
 		self.assertNotIn("pysocks", files["control"])
 
+	def test_build_requirements_the_archive_cannot_meet(self):
+		meta = {"requires_build": ["flit_core>=3.12,<4", "hatchling",
+		                           "setuptools>=80; python_version < '3'",
+		                           "maturin>=1.5", "scikit-build-core"]}
+		archive = {"flit": "3.10.1-1", "python3-hatchling": "1.27.0-1",
+		           "python3-maturin": "1:1.8.3-1"}.get
+		self.assertEqual(em.pypi_build_shortfalls(meta, archive, self.env), [
+			("flit_core>=3.12,<4", "flit", "3.10.1-1"),
+			("scikit-build-core", "python3-scikit-build-core", None)])
+
 	def test_no_pyproject_means_setuptools(self):
 		meta = em.pypi_sdist_metadata(self.sdist(
 			"Metadata-Version: 2.1\nName: old\nVersion: 1.0\n"))

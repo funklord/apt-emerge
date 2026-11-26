@@ -812,6 +812,32 @@ def _pypi_build_package(requirement, env):
 	name = pypi_package_name(m["name"])[len("pypi-"):]
 	return _PYPI_BUILD_PACKAGES.get(name, f"python3-{name}")
 
+def pypi_build_shortfalls(meta, candidate_of, env=None):
+	"""The build requirements the archive cannot meet: [(requirement,
+	package, the archive's version or None)]. `candidate_of` gives the
+	version apt would install for a package, or None.
+
+	The bound itself is not passed to the build -- the archive's backend
+	is what runs -- so an unmet one surfaces as a failure deep inside
+	pybuild, or not at all until a feature is missing. Asked before the
+	build, it is a sentence naming both versions. The archive's version
+	compares by its upstream part, revision and epoch dropped, against
+	the PEP 440 bound in Debian form."""
+	env = pep508_environment() if env is None else env
+	out = []
+	for line in meta["requires_build"]:
+		package = _pypi_build_package(line, env)
+		if package is None:
+			continue
+		got = pypi_requirement(line, env)
+		have = candidate_of(package)
+		upstream = None
+		if have:
+			upstream = have.split(":", 1)[-1].rsplit("-", 1)[0]
+		if have is None or not debian_relations_hold(upstream, got[2]):
+			out.append((line.strip(), package, have))
+	return out
+
 def pypi_debian_files(meta, arch="all", env=None, when=None,
                       extra_requires=None):
 	"""The debian/ directory that builds `meta` as a pypi- package with
@@ -3843,6 +3869,13 @@ class AptBackend:
 		print(f"{ARROW} Completed ({i} of {total}) {BGREEN(pv)}")
 		return True
 
+	@staticmethod
+	def _candidate(package):
+		"""The version `apt-get install` would choose, or None."""
+		r = capture(["apt-cache", "policy", package])
+		m = re.search(r"^\s*Candidate:\s*(\S+)", r.stdout, re.M)
+		return m[1] if m and m[1] != "(none)" else None
+
 	def _pypi_requires(self, package):
 		"""A pypi- package's Requires-Dist: from the release this run
 		chose, or else from the METADATA of the one installed."""
@@ -3901,6 +3934,14 @@ class AptBackend:
 				f.write(text)
 		os.chmod(os.path.join(srcdir, "debian", "rules"), 0o755)
 		print(f"{ARROW} Source unpacked in {srcdir}")
+		short = pypi_build_shortfalls(meta, self._candidate)
+		if short:
+			for line, deb, have in short:
+				eerror(f"{package} needs {line} to build; the archive has "
+				       + (f"{deb} {have}" if have else f"no {deb}"))
+			efail(f"cannot build {package} with the archive's build tools "
+			      f"(building them from PyPI is not supported yet)")
+			sys.exit(1)
 		einfo(f"Installing build dependencies for {package} "
 		      f"(oneshot: --depclean removes them again)...")
 		r = capture(["apt-get", "-y", "build-dep", srcdir])

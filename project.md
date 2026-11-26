@@ -2169,9 +2169,12 @@ write surface ever needs testing.
        from the installed `dist-info/METADATA`. Shown by unit tests only;
        no container run met a real extra.
      - *Build backends newer than the archive's.* The classifier switch
-       covers the case met; a release needing a newer backend outright
-       fails in `apt-get build-dep` or the build. Building backends as
-       `pypi-` packages too is the general answer, not yet built.
+       covers the case met. A release needing a newer backend outright is
+       now refused before the build, naming both versions
+       (`pypi_build_shortfalls()` against `apt-cache policy`'s
+       candidate), where it used to fail somewhere inside pybuild.
+       Building backends as `pypi-` packages too is the general answer,
+       not yet built; this check is the half of it that says when.
      - A dynamic `Requires-Dist`, a URL requirement and `===` are refused.
    - *Transitive closure size*, npm especially.
    - *apt backend only*, like `-b/-B`: it needs build tooling, and the dpkg
