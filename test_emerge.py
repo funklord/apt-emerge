@@ -4024,7 +4024,7 @@ class TestStyleGate(unittest.TestCase):
     alternative is falling back to defaults and checking a DIFFERENT set of
     files successfully, which is indistinguishable from a clean tree."""
 
-	GATE = os.path.join(HERE, "tools", "style_gate.py")
+	GATE = os.path.join(HERE, "tool", "style_gate.py")
 
 	# Everything this project writes itself in a language whose indentation
 	# is ours to govern. A file may leave this list when it leaves the tree,
