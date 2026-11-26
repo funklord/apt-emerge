@@ -2169,14 +2169,16 @@ write surface ever needs testing.
      found nothing outdated.
 
      **Open:**
-     - *What a plain `python3` imports.* The tree comes after
-       `dist-packages`, so with both installed `import requests` gives
-       the archive's 2.32.3, not the 2.34.2 just built. That is the
-       namespace doing its job for Debian's programs, and a surprise for
-       somebody who typed `emerge -b pypi-requests` to get the newer one
-       into their own scripts; only the `pypi-` commands see the tree
-       first. Whose call: the holder's, since it decides what the
-       feature is for.
+     - ~~*What a plain `python3` imports.*~~ **Settled 2026-11-26
+       (holder): Debian first.** The tree comes after `dist-packages`, so
+       with both installed `import requests` gives the archive's 2.32.3,
+       not the 2.34.2 just built: the programs Debian ships keep importing
+       what Debian tested them with, and a plain `python3` gets the
+       `pypi-` build only of what the archive does not carry. The `pypi-`
+       commands are the exception, each putting the tree first. Rejected:
+       the tree first for everyone, which is the shadowing the namespace
+       exists to prevent. The README says so, so that nobody builds a
+       newer `pypi-requests` expecting their own scripts to see it.
      - ~~*Extras are built, not depended on.*~~ **Fixed 2026-11-26:** a
        requirement naming an extra adds the extra's own requirements to
        the dependent's Depends (`requests[socks]` gives the dependent

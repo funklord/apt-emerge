@@ -9,8 +9,10 @@ those upgrades want a reboot; some restart the desktop you are sitting at
 and close everything open on it. A configuration file you have edited and a
 package has changed either stops the install to ask keep-or-replace, or,
 told not to ask, is left beside yours as `.dpkg-dist` for a merge nobody
-gets round to. And a small machine that carries dpkg but not apt has no
-dependency resolver at all.
+gets round to. A Python program that is not in the archive cannot be
+installed at all: Debian refuses `pip install` into the system, rightly,
+since pip would overwrite what Debian's own programs import. And a small
+machine that carries dpkg but not apt has no dependency resolver at all.
 
 apt-emerge is one Python file, with nothing but the standard library, that
 gives Debian and Ubuntu Gentoo's `emerge` command line and an answer to each
@@ -47,6 +49,18 @@ How it differs from what you would otherwise use:
   fetches signed indexes and checks them with `gpgv`, resolves dependencies
   itself, verifies each download's SHA256 and keeps a real world file --
   still one file you can `scp` onto the box.
+- **pip** is refused by Debian's Python (PEP 668), and **pipx** or a
+  virtual environment installs beside the system where dpkg cannot see
+  it. `emerge -b pypi-requests` builds each project and its dependencies
+  from PyPI's source releases into real Debian packages named `pypi-*`,
+  checked against PyPI's SHA256, installed into a tree of their own
+  beside the archive's `python3-*` packages and never over them. Where
+  both carry a module, a plain `python3` keeps importing Debian's, so
+  Debian's programs run with what Debian tested; the `pypi-` packages'
+  own commands, in `/usr/lib/pypi/bin`, run with what they were built
+  against. `-u @world` upgrades them, `--depclean` removes what nothing
+  needs, and a build tool Debian's archive is too old for is built from
+  PyPI first.
 - **Portage** is Gentoo's. This is its vocabulary -- `-av`, `-uD @world`,
   `--depclean`, `-C`, sets, Portage-style output -- on a Debian system, with
   Debian's packages and Debian's own state.
