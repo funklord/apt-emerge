@@ -885,6 +885,89 @@ def pypi_debian_files(meta, arch="all", env=None, when=None):
 	                  "override_dh_auto_test:\n"),
 	        }, extras
 
+def debian_relations_hold(version, relations):
+	"""Does a Debian version meet every relation, each `a | b` by one of
+	its sides? Relations as pypi_requirement() writes them; the package
+	name is not checked."""
+	for relation in relations:
+		sides = re.findall(r"\((<<|<=|=|>=|>>) ([^)]+)\)", relation)
+		if sides and not any(meets(version, o, v) for o, v in sides):
+			return False
+	return True
+
+# PyPI's JSON API. EMERGE_PYPI_INDEX names another with the same layout, a
+# mirror or a file:// tree in the tests.
+PYPI_INDEX = os.environ.get("EMERGE_PYPI_INDEX", "https://pypi.org/pypi")
+MAX_SDIST_BYTES = 256 * 1024 * 1024
+
+def pypi_choose(name, relations=(), index=None):
+	"""The release of a PyPI project to build: the newest whose sdist is
+	not yanked and whose version meets `relations`, a final release over
+	a pre-release as PEP 440 orders installers to. Returns (version, url,
+	sha256, filename); raises LookupError when none qualifies.
+
+	Only an sdist will do: a wheel is somebody else's build, and the point
+	is that this machine builds what it installs. A release without a
+	sha256 is skipped too -- the digest is the only thing tying the bytes
+	fetched to the release the index lists."""
+	import json
+	url = f"{index or PYPI_INDEX}/{pypi_package_name(name)[5:]}/json"
+	data = json.loads(fetch(url, limit=MAX_INDEX_BYTES))
+	candidates = []
+	for version, files in data.get("releases", {}).items():
+		try:
+			deb = pep440_to_debian(version)
+		except ValueError:
+			continue                    # PyPI keeps pre-PEP 440 releases
+		for f in files:
+			sha = (f.get("digests") or {}).get("sha256")
+			if (f.get("packagetype") == "sdist" and not f.get("yanked")
+			    and sha and f.get("filename", "").endswith(".tar.gz")
+			    and debian_relations_hold(deb, relations)):
+				pre = _pep440_split(version)[2]
+				candidates.append((not pre, deb, version, f["url"], sha,
+				                   f["filename"]))
+				break
+	if not candidates:
+		raise LookupError(f"{name}: no sdist on {index or PYPI_INDEX} "
+		                  f"meets {', '.join(relations) or 'nothing'}")
+	key = functools.cmp_to_key(lambda a, b: (a[0] - b[0]) or vercmp(a[1], b[1]))
+	best = max(candidates, key=key)
+	return best[2], best[3], best[4], best[5]
+
+def pypi_fetch_sdist(url, sha256, filename, dest):
+	"""Download an sdist, check it against the index's sha256, and unpack
+	it under `dest`. Returns the unpacked tree. A digest mismatch removes
+	nothing and unpacks nothing.
+
+	Unpacked with tarfile's "data" filter where the interpreter has one
+	(3.12, and the 3.9-3.11 security releases): no absolute paths, nothing
+	outside `dest`, no device files. Without it, members are checked by
+	hand to the same effect, since an sdist is whatever its uploader made."""
+	import io
+	import tarfile
+	data = fetch(url, limit=MAX_SDIST_BYTES)
+	got = hashlib.sha256(data).hexdigest()
+	if got != sha256.lower():
+		raise RuntimeError(f"{filename}: sha256 {got}, the index says "
+		                   f"{sha256}; not unpacking it")
+	with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+		if hasattr(tarfile, "data_filter"):
+			tar.extractall(dest, filter="data")
+		else:
+			root = os.path.realpath(dest)
+			for m in tar.getmembers():
+				target = os.path.realpath(os.path.join(dest, m.name))
+				if (not (m.isfile() or m.isdir())
+				    or os.path.commonpath([root, target]) != root):
+					raise RuntimeError(f"{filename}: refusing member {m.name!r}")
+			tar.extractall(dest)
+	top = filename[:-len(".tar.gz")]
+	tree = os.path.join(dest, top)
+	if not os.path.isfile(os.path.join(tree, "PKG-INFO")):
+		raise RuntimeError(f"{filename}: no {top}/PKG-INFO; not an sdist")
+	return tree
+
 def _dep_ok(alt, inst, chosen, iprov, provides_of):
 	"""Is a single dependency alternative (name, op, ver) already satisfied
     by an installed or already-chosen package (or a Provides of one)?

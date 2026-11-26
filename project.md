@@ -2102,8 +2102,16 @@ write surface ever needs testing.
      scripts, and left an import's `__pycache__` behind), and lintian named
      only upstream's summary opening with an article.
 
-     **Still to build**, in order: fetching the sdist (PyPI's JSON API
-     gives its sha256), the closure (each `pypi-` dependency and the
+     **Fetching is built**: `pypi_choose()` reads PyPI's JSON API
+     (`EMERGE_PYPI_INDEX` names a mirror) and takes the newest release
+     meeting the relations, a final one over a pre-release, skipping
+     yanked ones, wheels (somebody else's build) and any sdist with no
+     sha256; `pypi_fetch_sdist()` checks the digest before unpacking and
+     unpacks with tarfile's `data` filter, or the same checks by hand
+     where the interpreter lacks it. Read live from pypi.org 2026-11-26:
+     `tomli<2.3` chose and unpacked 2.2.1.
+
+     **Still to build**, in order: the closure (each `pypi-` dependency and the
      extras `pypi_debian_files()` returns), the command-line spelling, and
      driving it through the `-b` machinery. **Open, not decided:** an
      entry point lands in `/usr/bin` under upstream's name, where a

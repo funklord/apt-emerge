@@ -28,6 +28,7 @@ import importlib.machinery
 import importlib.util
 import io
 import itertools
+import json
 import os
 import pty
 import random
@@ -727,6 +728,76 @@ class TestPypiDebianFiles(unittest.TestCase):
 		                  "Dynamic: Requires-Dist\n")
 		with self.assertRaises(ValueError):
 			em.pypi_sdist_metadata(tree)
+
+
+class TestPypiFetch(unittest.TestCase):
+	"""Choosing a release from PyPI's JSON API and fetching its sdist,
+    against a file:// index of the same layout."""
+
+	def setUp(self):
+		self.root = tempfile.mkdtemp()
+		self.addCleanup(shutil.rmtree, self.root)
+
+	def sdist(self, name, version, pkg_info=None, extra=()):
+		import tarfile
+		top = f"{name}-{version}"
+		path = os.path.join(self.root, f"{top}.tar.gz")
+		with tarfile.open(path, "w:gz") as tar:
+			members = [(f"{top}/PKG-INFO", pkg_info or
+			            f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")]
+			for n, text in list(members) + list(extra):
+				data = text.encode()
+				info = tarfile.TarInfo(n)
+				info.size = len(data)
+				tar.addfile(info, io.BytesIO(data))
+		with open(path, "rb") as f:
+			sha = hashlib.sha256(f.read()).hexdigest()
+		return {"packagetype": "sdist", "filename": f"{top}.tar.gz",
+		        "url": "file://" + path, "digests": {"sha256": sha}}
+
+	def index(self, name, releases):
+		os.makedirs(os.path.join(self.root, name), exist_ok=True)
+		with open(os.path.join(self.root, name, "json"), "w") as f:
+			json.dump({"releases": releases}, f)
+		return "file://" + self.root
+
+	def test_the_newest_final_release_that_meets_the_relations(self):
+		wheel = {"packagetype": "bdist_wheel", "filename": "x.whl",
+		         "url": "file:///nonexistent", "digests": {"sha256": "0"}}
+		index = self.index("foo", {
+			"1.0": [self.sdist("foo", "1.0")],
+			"1.1": [dict(self.sdist("foo", "1.1"), yanked=True)],
+			"1.2rc1": [self.sdist("foo", "1.2rc1")],
+			"1.3": [wheel],
+			"0.9": [dict(self.sdist("foo", "0.9"), digests={})],
+			"not-a-version": [self.sdist("foo", "bad")],
+		})
+		self.assertEqual(em.pypi_choose("Foo", (), index)[0], "1.0")
+		rel = em.pypi_requirement("foo>1.0", {})[2]
+		self.assertEqual(em.pypi_choose("foo", rel, index)[0], "1.2rc1")
+		rel = em.pypi_requirement("foo<1.0", {})[2]
+		with self.assertRaises(LookupError):
+			em.pypi_choose("foo", rel, index)
+
+	def test_fetch_checks_the_digest_before_unpacking(self):
+		f = self.sdist("bar", "2.0")
+		dest = os.path.join(self.root, "work")
+		os.makedirs(dest)
+		with self.assertRaises(RuntimeError):
+			em.pypi_fetch_sdist(f["url"], "0" * 64, f["filename"], dest)
+		self.assertEqual(os.listdir(dest), [])
+		tree = em.pypi_fetch_sdist(f["url"], f["digests"]["sha256"],
+		                           f["filename"], dest)
+		self.assertEqual(em.pypi_sdist_metadata(tree)["version"], "2.0")
+
+	def test_a_member_outside_the_tree_is_refused(self):
+		f = self.sdist("evil", "1.0", extra=[("../escaped", "x")])
+		dest = os.path.join(self.root, "work")
+		os.makedirs(dest)
+		with self.assertRaises(Exception):
+			em.pypi_fetch_sdist(f["url"], f["digests"]["sha256"],
+			                    f["filename"], dest)
+		self.assertFalse(os.path.exists(os.path.join(self.root, "escaped")))
 
 
 class TestMeets(unittest.TestCase):
