@@ -2153,6 +2153,21 @@ write surface ever needs testing.
      `pypi-` version. The archive's `-b` path still passes as root
      (`EMERGE_TESTS_REQUIRE_ALL=1`, 48 of 48).
 
+     **`-u` on a set keeps them current** (2026-11-26). apt cannot see a
+     newer release on PyPI, so a package built from it would otherwise
+     stay at that release for ever. `pypi_upgrade_roots()` asks the index
+     about every installed `pypi-` package, offering only what the other
+     installed `pypi-` packages' Depends allow (as apt would), and the
+     closure plans the newer releases with any new dependencies. They
+     appear in the same merge list as the archive's upgrades and are built
+     after them; an index that cannot be reached costs a warning, never
+     the archive's upgrade. Relations are read as installed, so a
+     dependent being upgraded in the same run still holds back what its
+     new release might allow; the next `-u` takes that up. Proven in a
+     trixie container: `pypi-idna` built at 3.9, then `emerge -u @world`
+     upgraded eight archive packages and built 3.20, and a second `-pu`
+     found nothing outdated.
+
      **Open:**
      - *What a plain `python3` imports.* The tree comes after
        `dist-packages`, so with both installed `import requests` gives

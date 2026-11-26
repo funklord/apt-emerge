@@ -1102,8 +1102,43 @@ def pypi_closure(roots, installed_version, env=None, index=None):
 			order.append((package, version, url, sha, filename))
 
 	for root in roots:
-		visit(root, [], set(), [], True)
+		package, relations = (root, []) if isinstance(root, str) else root
+		visit(package, list(relations), set(), [], True)
 	return order
+
+def pypi_upgrade_roots(installed, index=None):
+	"""Which installed pypi- packages have a newer release on the index:
+	[(package, relations)], ready for pypi_closure(). `installed` maps
+	each installed pypi- package to (Debian version, its Depends field).
+
+	apt cannot see PyPI, so `-u @world` would otherwise leave every
+	package built from it at the release it was built from, for ever.
+	The relations are what the other installed pypi- packages ask of it:
+	a newer release one of them refuses is not offered, as apt would not
+	offer it either. They are read as installed, so a dependent that is
+	itself being upgraded still holds back what its new release might
+	allow; the next -u picks that up."""
+	wanted = {p: [] for p in installed}
+	for package, (_, depends) in installed.items():
+		for clause in parse_depends(depends or ""):
+			names = {name for name, _, _ in clause}
+			if len(names) != 1 or names <= {package}:
+				continue
+			(name,) = names
+			if name in wanted:
+				wanted[name].append(" | ".join(
+					f"{n} ({op} {v})" if op else n for n, op, v in clause))
+	out = []
+	for package in sorted(installed):
+		have = installed[package][0]
+		relations = wanted[package]
+		try:
+			version = pypi_choose(package[len("pypi-"):], relations, index)[0]
+		except LookupError:
+			continue                    # nothing it may move to
+		if vercmp(pep440_to_debian(version), have) > 0:
+			out.append((package, relations))
+	return out
 
 def _dep_ok(alt, inst, chosen, iprov, provides_of):
 	"""Is a single dependency alternative (name, op, ver) already satisfied
@@ -3869,6 +3904,28 @@ class AptBackend:
 		print(f"{ARROW} Completed ({i} of {total}) {BGREEN(pv)}")
 		return True
 
+	def resolve_pypi_upgrades(self):
+		"""Plan newer releases of the installed pypi- packages, as build
+		entries and merge-list lines. The plan is kept for build()."""
+		r = capture(["dpkg-query", "-W", "-f=${Package}\t${Version}\t"
+		             "${db:Status-Abbrev}\t${Depends}\n", "pypi-*"])
+		installed = {}
+		for line in r.stdout.splitlines():
+			parts = line.split("\t")
+			if len(parts) == 4 and parts[2].startswith("ii"):
+				installed[parts[0]] = (parts[1], parts[3])
+		self._src_plan, self._pypi_plan = [], []
+		if not installed:
+			return []
+		roots = pypi_upgrade_roots(installed)
+		if not roots:
+			return []
+		self._pypi_plan = pypi_closure(roots, self._installed_version)
+		use = self._build_use()
+		return [(package, pep440_to_debian(version),
+		         self._installed_version(package), 0, "ebuild", use)
+		        for package, version, *_ in self._pypi_plan]
+
 	@staticmethod
 	def _candidate(package):
 		"""The version `apt-get install` would choose, or None."""
@@ -5563,7 +5620,8 @@ Options:
                  A pypi-<name> atom with no Debian source is built from
                  PyPI instead, with its pypi- dependencies, into
                  /usr/lib/pypi beside the archive's python3- packages;
-                 its commands go to /usr/lib/pypi/bin.
+                 its commands go to /usr/lib/pypi/bin. -u on a set also
+                 rebuilds installed pypi- packages PyPI has newer releases of.
 
    --buildpkgonly (-B)
                  Build, but do not install. Products are kept in PKGDIR
@@ -6206,7 +6264,22 @@ def main(argv):
 	calc_deps_done()
 	_finish_merge(be, merges, pkgs, opts)
 
+def _pypi_upgrades(be, pkgs, opts):
+	"""-u on a set also moves the pypi- packages built from PyPI, which apt
+	cannot see newer releases of (project.md, item 9). An index that cannot
+	be reached costs a warning, never the archive's own upgrade."""
+	if not (opts["update"] and be.name == "apt"
+	        and any(p.startswith("@") for p in pkgs)):
+		return []
+	try:
+		return be.resolve_pypi_upgrades()
+	except (RuntimeError, LookupError, ValueError, OSError) as e:
+		ewarn(f"pypi- packages not checked for upgrades: {e}")
+		return []
+
 def _finish_merge(be, merges, pkgs, opts):
+	pypi = _pypi_upgrades(be, pkgs, opts)
+	merges = list(merges) + pypi
 	if not merges:
 		einfo("No outdated packages were found on your system."
 		      if any(p.startswith("@") for p in pkgs) else
@@ -6219,7 +6292,12 @@ def _finish_merge(be, merges, pkgs, opts):
 		return
 	if opts["ask"] and not ask_continue():
 		print("\nQuitting."); sys.exit(1)
-	be.merge(merges, pkgs, opts)
+	archive = merges[:len(merges) - len(pypi)]
+	if archive:
+		be.merge(archive, pkgs, opts)
+	if pypi:
+		be._atoms = []                  # an upgrade adds nothing to @world
+		be.build(dict(opts, buildpkgonly=False))
 
 if __name__ == "__main__":
 	# Die on a closed pipe the way every other Unix tool does. Python

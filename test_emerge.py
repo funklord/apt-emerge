@@ -897,6 +897,25 @@ class TestPypiFetch(unittest.TestCase):
 			                 ["win-inet-pton; sys_platform == 'win32'"])
 			self.assertEqual(be._pypi_requires("pypi-absent"), [])
 
+	def test_upgrades_offer_what_installed_dependents_allow(self):
+		self.release("lib", "1.0")
+		self.release("lib", "1.5")
+		index = self.release("lib", "2.0")
+		self.release("app", "1.0")
+		installed = {"pypi-lib": ("1.0", ""),
+		             "pypi-app": ("1.0", "python3, pypi-lib (<< 2~~~), "
+		                         "pypi-lib (>= 1.0)")}
+		roots = em.pypi_upgrade_roots(installed, index)
+		self.assertEqual(roots, [("pypi-lib", ["pypi-lib (<< 2~~~)",
+		                                       "pypi-lib (>= 1.0)"])])
+		plan = em.pypi_closure(roots, {}.get, env={"extra": ""}, index=index)
+		self.assertEqual([(p, v) for p, v, *_ in plan], [("pypi-lib", "1.5")])
+		installed["pypi-lib"] = ("1.5", "")
+		self.assertEqual(em.pypi_upgrade_roots(installed, index), [])
+		del installed["pypi-app"]
+		self.assertEqual(em.pypi_upgrade_roots(installed, index),
+		                 [("pypi-lib", [])])
+
 	def test_a_member_outside_the_tree_is_refused(self):
 		f = self.sdist("evil", "1.0", extra=[("../escaped", "x")])
 		dest = os.path.join(self.root, "work")
