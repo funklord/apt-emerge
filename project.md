@@ -2073,9 +2073,43 @@ write surface ever needs testing.
      **Settled 2026-11-26 (holder): the `pypi-` namespace.** A name does
      not keep files apart, though: `pypi-requests` and `python3-requests`
      both want `/usr/lib/python3/dist-packages/requests`, and dpkg refuses
-     the second. So the next step, the generated `debian/`, has to install
-     into a tree of its own, and the same holds for an entry point in
-     `/usr/bin`. Not yet built.
+     the second. So a `pypi-` package installs into a tree of its own,
+     `/usr/lib/pypi/python3` (`PYPI_TREE`), and ships
+     `dist-packages/pypi-<name>.pth` naming it. The `.pth` puts the tree on
+     the system `python3`'s path **after** Debian's `dist-packages`: where
+     both carry a module the archive's wins, so the programs Debian ships
+     import what Debian tested them with, and the tree serves what the
+     archive lacks. Rejected: the tree first, which is the shadowing the
+     namespace exists to prevent.
+
+     **`pypi_debian_files()` generates the `debian/`**, from
+     `pypi_sdist_metadata()` (PKG-INFO, and `build-system.requires` from
+     `pyproject.toml`): `3.0 (native)`, a `dh --buildsystem=pybuild` rules
+     with `PYBUILD_INSTALL_DIR`, a postinst running `py3compile -p` and a
+     prerm running `py3clean -p` (what `dh_python3` writes for
+     `dist-packages`, said for the tree), upstream's licence files as
+     `copyright`, and `DEBFULLNAME`/`DEBEMAIL` as maintainer, as `dch`
+     takes them. A dynamic `Requires-Dist` is refused: its dependencies
+     are unknown until the backend runs. Tests are not run, an sdist's
+     suite wanting its test extras.
+
+     Proven 2026-11-26 in a `debian:trixie` container: `tomli` 2.4.1 and
+     `iniconfig` 2.1.0 from PyPI built as `pypi-tomli` and
+     `pypi-iniconfig` and installed beside the archive's `python3-tomli`
+     2.2.1. `import tomli` took Debian's, `import iniconfig` the tree's,
+     the tree was compiled at install, nothing was left after `dpkg -r`
+     (a first draft leaned on `dh_python3 <dir>`, wrote no maintainer
+     scripts, and left an import's `__pycache__` behind), and lintian named
+     only upstream's summary opening with an article.
+
+     **Still to build**, in order: fetching the sdist (PyPI's JSON API
+     gives its sha256), the closure (each `pypi-` dependency and the
+     extras `pypi_debian_files()` returns), the command-line spelling, and
+     driving it through the `-b` machinery. **Open, not decided:** an
+     entry point lands in `/usr/bin` under upstream's name, where a
+     Debian package of the same command (`black`) makes dpkg refuse the
+     install -- loud rather than silent, but a refusal; and an sdist with
+     compiled code needs `Architecture: any`, which the caller passes.
    - *Transitive closure size*, npm especially.
    - *apt backend only*, like `-b/-B`: it needs build tooling, and the dpkg
      backend is binary-only by design.

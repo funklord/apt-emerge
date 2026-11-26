@@ -743,6 +743,148 @@ def pypi_requirement(text, env=None):
 		relations += _specifier_to_debian(package, s[1], s[2])
 	return package, extras, relations or [package]
 
+# Where a pypi- package installs, apart from the archive's dist-packages:
+# pypi-requests and python3-requests would otherwise both own
+# .../dist-packages/requests and dpkg would refuse the second. A .pth file
+# per package puts the tree on the system python3's path AFTER Debian's
+# dist-packages, so where both carry a module the archive's wins and the
+# programs Debian ships import what Debian tested them with.
+PYPI_TREE = "/usr/lib/pypi/python3"
+
+# build-system.requires names a PyPI project; dh-python runs the backend
+# from the system, so Build-Depends names the archive's package. Every
+# common backend is python3-<name> but this one (trixie, 2026-11-26).
+_PYPI_BUILD_PACKAGES = {"flit-core": "flit"}
+
+def pypi_sdist_metadata(tree):
+	"""What an unpacked sdist says about itself: its PKG-INFO, and the
+	build requirements from pyproject.toml. A Requires-Dist marked Dynamic
+	is not known until the backend runs, and a guess at it would be a
+	package with dependencies nobody declared, so that is refused."""
+	import email.parser
+	with open(os.path.join(tree, "PKG-INFO"), encoding="utf-8") as f:
+		info = email.parser.Parser().parse(f, headersonly=True)
+	# Debian wants the licence in the package; upstream's own files are
+	# what it says, copied rather than summarised. License-File names them
+	# from metadata 2.4; before that they sit at the top by convention.
+	named = info.get_all("License-File") or sorted(
+		n for n in os.listdir(tree)
+		if re.match(r"(LICEN[CS]E|COPYING|NOTICE)", n, re.IGNORECASE))
+	texts = []
+	for n in named:
+		path = os.path.join(tree, n)
+		if os.path.isfile(path):
+			with open(path, encoding="utf-8", errors="replace") as f:
+				texts.append(f"{n}:\n\n{f.read().rstrip()}\n")
+	dynamic = {d.strip().lower() for d in info.get_all("Dynamic") or []}
+	if "requires-dist" in dynamic:
+		raise ValueError(f"{info['Name']}: Requires-Dist is dynamic in "
+		                 "PKG-INFO, so its dependencies are not known")
+	build = ["setuptools>=40.8.0"]      # PEP 517's default backend
+	pyproject = os.path.join(tree, "pyproject.toml")
+	if os.path.exists(pyproject):
+		try:
+			import tomllib
+		except ImportError:
+			raise ValueError("reading pyproject.toml needs Python 3.11")
+		with open(pyproject, "rb") as f:
+			build = (tomllib.load(f).get("build-system", {})
+			         .get("requires", build))
+	return {"name": info["Name"], "version": info["Version"],
+	        "summary": (info["Summary"] or "").strip(),
+	        "requires_dist": info.get_all("Requires-Dist") or [],
+	        "requires_build": build,
+	        "copyright": (f"{info['Name']} {info['Version']}, from PyPI, as its"
+	                      " distribution states it.\n\n" + "\n".join(texts)
+	                      if texts else None)}
+
+def _pypi_build_package(requirement, env):
+	m = _REQUIREMENT.fullmatch(requirement)
+	if not m:
+		raise ValueError(f"not a PEP 508 requirement: {requirement!r}")
+	if m["marker"] is not None and not pep508_marker(m["marker"], env):
+		return None
+	name = pypi_package_name(m["name"])[len("pypi-"):]
+	return _PYPI_BUILD_PACKAGES.get(name, f"python3-{name}")
+
+def pypi_debian_files(meta, arch="all", env=None, when=None):
+	"""The debian/ directory that builds `meta` as a pypi- package with
+	dh-python: {path under debian/: content}. `arch` is `any` where the
+	sdist compiles something; dh-python does the rest either way.
+
+	Versions in build-system.requires are not carried over: the build
+	runs the archive's backend whatever it is, and a bound it cannot meet
+	is better found by the backend than turned into an unbuildable
+	package. Run-time requirements are translated exactly."""
+	env = pep508_environment() if env is None else env
+	package = pypi_package_name(meta["name"])
+	version = pep440_to_debian(meta["version"])
+	depends = ["python3"]
+	extras = {}
+	for line in meta["requires_dist"]:
+		got = pypi_requirement(line, env)
+		if got:
+			depends += got[2]
+			if got[1]:
+				extras[got[0]] = got[1]
+	build = ["debhelper-compat (= 13)", "dh-python",
+	         "pybuild-plugin-pyproject", "python3-all"]
+	for line in meta["requires_build"]:
+		b = _pypi_build_package(line, env)
+		if b and b not in build:
+			build.append(b)
+	summary = re.sub(r"\s+", " ", meta["summary"]) or meta["name"]
+	when = when or email.utils.formatdate(localtime=True)
+	# Whoever builds it maintains it: dch's convention, and lintian
+	# refuses the localhost fallback only as metadata.
+	maintainer = (f"{os.environ.get('DEBFULLNAME') or 'apt-emerge local build'}"
+	              f" <{os.environ.get('DEBEMAIL') or 'root@localhost'}>")
+	pth = f"{package}.pth"
+	return {"source/format": "3.0 (native)\n",
+	        "control": (f"Source: {package}\n"
+	                    "Section: python\n"
+	                    "Priority: optional\n"
+	                    f"Maintainer: {maintainer}\n"
+	                    f"Build-Depends: {', '.join(build)}\n"
+	                    "Rules-Requires-Root: no\n"
+	                    "\n"
+	                    f"Package: {package}\n"
+	                    f"Architecture: {arch}\n"
+	                    f"Depends: {', '.join(depends + ['${misc:Depends}'])}\n"
+	                    f"Description: {summary}\n"
+	                    f" {meta['name']} {meta['version']}, built from PyPI by"
+	                    " apt-emerge.\n"),
+	        "changelog": (f"{package} ({version}) unstable; urgency=medium\n\n"
+	                      f"  * {meta['name']} {meta['version']} from PyPI.\n\n"
+	                      f" -- {maintainer}  {when}\n"),
+	        "copyright": meta.get("copyright") or
+	                     (f"{meta['name']} {meta['version']}, from PyPI. Its "
+	                      "distribution names no licence file.\n"),
+	        # What dh_python3 writes for dist-packages, said for the tree:
+	        # compile on install, since nobody else can write there, and
+	        # clean on removal, imports by root having compiled more.
+	        f"{package}.postinst": ("#!/bin/sh\nset -e\n"
+	                                 'if [ "$1" = configure ]; then\n'
+	                                 f"\tpy3compile -p {package} {PYPI_TREE}\n"
+	                                 "fi\n#DEBHELPER#\n"),
+	        f"{package}.prerm": ("#!/bin/sh\nset -e\n"
+	                              f"py3clean -p {package}\n#DEBHELPER#\n"),
+	        # PYBUILD_INSTALL_DIR moves the modules out of dist-packages.
+	        # No tests: an sdist's suite wants its test extras, which are
+	        # not the package's dependencies.
+	        "rules": ("#!/usr/bin/make -f\n"
+	                  f"export PYBUILD_INSTALL_DIR={PYPI_TREE}\n"
+	                  f"export PYBUILD_DESTDIR=debian/{package}\n"
+	                  "%:\n"
+	                  "\tdh $@ --buildsystem=pybuild\n"
+	                  "override_dh_auto_install:\n"
+	                  "\tdh_auto_install\n"
+	                  f"\tmkdir -p debian/{package}/usr/lib/python3/dist-packages\n"
+	                  f"\techo {PYPI_TREE} >debian/{package}"
+	                  f"/usr/lib/python3/dist-packages/{pth}\n"
+	                  "override_dh_auto_test:\n"),
+	        }, extras
+
 def _dep_ok(alt, inst, chosen, iprov, provides_of):
 	"""Is a single dependency alternative (name, op, ver) already satisfied
     by an installed or already-chosen package (or a Provides of one)?

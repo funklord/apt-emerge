@@ -657,6 +657,78 @@ class TestPypiNamespace(unittest.TestCase):
 		self.assertGreater(checked, 3000)
 
 
+class TestPypiDebianFiles(unittest.TestCase):
+	"""The debian/ directory a PyPI sdist is built with. Proven end to end
+    in a trixie container on 2026-11-26 (project.md, item 9); these hold
+    what that run depended on without needing dh-python here."""
+
+	def sdist(self, pkg_info, pyproject=None, files=()):
+		tree = tempfile.mkdtemp()
+		self.addCleanup(shutil.rmtree, tree)
+		with open(os.path.join(tree, "PKG-INFO"), "w") as f:
+			f.write(pkg_info)
+		if pyproject is not None:
+			with open(os.path.join(tree, "pyproject.toml"), "w") as f:
+				f.write(pyproject)
+		for name, text in files:
+			with open(os.path.join(tree, name), "w") as f:
+				f.write(text)
+		return tree
+
+	def setUp(self):
+		self.env = dict(em.pep508_environment(), python_version="3.13",
+		                python_full_version="3.13.5")
+
+	def test_a_package_with_dependencies(self):
+		tree = self.sdist(
+			"Metadata-Version: 2.1\nName: Foo.Bar\nVersion: 1.2rc1\n"
+			"Summary: does   foo\nRequires-Dist: PyYAML>=5.1\n"
+			"Requires-Dist: requests[socks]<3\n"
+			"Requires-Dist: tomli; python_version < '3.11'\n"
+			"Requires-Dist: pytest; extra == 'test'\n",
+			'[build-system]\nrequires = ["flit_core>=3.2,<4", '
+			'"setuptools_scm"]\n',
+			[("LICENSE.txt", "MIT, upstream's words\n")])
+		meta = em.pypi_sdist_metadata(tree)
+		files, extras = em.pypi_debian_files(meta, env=self.env,
+		                                     when="Thu, 26 Nov 2026 12:00:00 +0000")
+		control = files["control"]
+		self.assertIn("Source: pypi-foo-bar\n", control)
+		self.assertIn("Package: pypi-foo-bar\n", control)
+		self.assertIn("Description: does foo\n", control)
+		self.assertIn("Depends: python3, pypi-pyyaml (>= 5.1), "
+		              "pypi-requests (<< 3~~~), ${misc:Depends}\n", control)
+		self.assertNotIn("tomli", control)
+		self.assertNotIn("pytest", control)
+		self.assertIn(", flit, python3-setuptools-scm\n", control)
+		self.assertEqual(extras, {"pypi-requests": ["socks"]})
+		self.assertTrue(files["changelog"].startswith(
+			"pypi-foo-bar (1.2~rc1) unstable;"))
+		self.assertIn("MIT, upstream's words", files["copyright"])
+		self.assertIn(f"PYBUILD_INSTALL_DIR={em.PYPI_TREE}", files["rules"])
+		self.assertIn("pypi-foo-bar.pth", files["rules"])
+		self.assertIn(f"py3compile -p pypi-foo-bar {em.PYPI_TREE}",
+		              files["pypi-foo-bar.postinst"])
+		self.assertIn("py3clean -p pypi-foo-bar", files["pypi-foo-bar.prerm"])
+		for line in files["rules"].splitlines():
+			if line[:1].isspace():
+				with self.subTest(line=line):
+					self.assertTrue(line.startswith("\t"))
+
+	def test_no_pyproject_means_setuptools(self):
+		meta = em.pypi_sdist_metadata(self.sdist(
+			"Metadata-Version: 2.1\nName: old\nVersion: 1.0\n"))
+		files, _ = em.pypi_debian_files(meta, env=self.env)
+		self.assertIn(", python3-setuptools\n", files["control"])
+		self.assertIn("names no licence file", files["copyright"])
+
+	def test_dynamic_dependencies_are_refused(self):
+		tree = self.sdist("Metadata-Version: 2.2\nName: dyn\nVersion: 1.0\n"
+		                  "Dynamic: Requires-Dist\n")
+		with self.assertRaises(ValueError):
+			em.pypi_sdist_metadata(tree)
+
+
 class TestMeets(unittest.TestCase):
 	def test_operators(self):
 		cases = [
