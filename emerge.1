@@ -175,10 +175,16 @@ beside the archive's
 .B python3-
 packages; its commands go to
 .IR /usr/lib/pypi/bin .
+A
+.BI cargo- name
+atom builds a crate's programs from crates.io into
+.IR /usr/lib/cargo/bin .
 .B -u
 on a set also rebuilds installed
 .B pypi-
-packages PyPI has newer releases of.
+and
+.B cargo-
+packages with newer releases.
 .TP
 .BR --buildpkgonly ", " -B
 Build but do not install. Products are kept in

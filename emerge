@@ -1023,14 +1023,20 @@ def pypi_choose(name, relations=(), index=None):
 	return best[2], best[3], best[4], best[5]
 
 def pypi_fetch_sdist(url, sha256, filename, dest):
-	"""Download an sdist, check it against the index's sha256, and unpack
-	it under `dest`. Returns the unpacked tree. A digest mismatch removes
-	nothing and unpacks nothing.
+	"""Download an sdist and unpack it: fetch_source_tarball()."""
+	return fetch_source_tarball(url, sha256, filename, dest,
+	                            ".tar.gz", "PKG-INFO", "an sdist")
+
+def fetch_source_tarball(url, sha256, filename, dest, suffix, marker, kind):
+	"""Download a registry's source tarball (`filename`, ending `suffix`),
+	check it against the registry's sha256, and unpack it under `dest`.
+	Returns the unpacked tree, `filename` less `suffix`, which must hold
+	`marker`. A digest mismatch removes nothing and unpacks nothing.
 
 	Unpacked with tarfile's "data" filter where the interpreter has one
 	(3.12, and the 3.9-3.11 security releases): no absolute paths, nothing
 	outside `dest`, no device files. Without it, members are checked by
-	hand to the same effect, since an sdist is whatever its uploader made."""
+	hand to the same effect, since a source tarball is whatever its uploader made."""
 	import io
 	import tarfile
 	data = fetch(url, limit=MAX_SDIST_BYTES)
@@ -1049,10 +1055,10 @@ def pypi_fetch_sdist(url, sha256, filename, dest):
 				    or os.path.commonpath([root, target]) != root):
 					raise RuntimeError(f"{filename}: refusing member {m.name!r}")
 			tar.extractall(dest)
-	top = filename[:-len(".tar.gz")]
+	top = filename[:-len(suffix)]
 	tree = os.path.join(dest, top)
-	if not os.path.isfile(os.path.join(tree, "PKG-INFO")):
-		raise RuntimeError(f"{filename}: no {top}/PKG-INFO; not an sdist")
+	if not os.path.isfile(os.path.join(tree, marker)):
+		raise RuntimeError(f"{filename}: no {top}/{marker}; not {kind}")
 	return tree
 
 def pypi_release_requires(name, version, index=None):
@@ -1150,6 +1156,181 @@ def pypi_upgrade_roots(installed, index=None):
 		if vercmp(pep440_to_debian(version), have) > 0:
 			out.append((package, relations))
 	return out
+
+# Rust programs from crates.io are cargo-<name> (holder, 2026-11-26), as
+# PyPI's are pypi-<name>: the archive's own Rust packages are rust-* and
+# its programs carry their plain names, and neither is touched. A crate's
+# dependencies are compiled into it, so there is no closure to plan and
+# no Depends but what dh_shlibdeps finds.
+CARGO_INDEX = os.environ.get("EMERGE_CARGO_INDEX",
+                             "https://crates.io/api/v1/crates")
+CARGO_DOWNLOAD = os.environ.get("EMERGE_CARGO_DOWNLOAD",
+                                "https://static.crates.io/crates")
+CARGO_BIN = "/usr/lib/cargo/bin"
+_CRATE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
+
+def cargo_package_name(name):
+	"""The Debian package a crate is built as: `cargo-` and the crate's
+	name lowercased with `_` as `-`, which crates.io itself treats as the
+	same name. Refuses what crates.io would not accept."""
+	if not _CRATE_NAME.fullmatch(name):
+		raise ValueError(f"not a crate name: {name!r}")
+	return "cargo-" + name.lower().replace("_", "-")
+
+_SEMVER = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+                     r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+                     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?")
+
+def semver_to_debian(version):
+	"""A crate's SemVer as a Debian version that sorts the same for a
+	release, and below it for its pre-releases: a pre-release goes after
+	`~`, which sorts below the end of the string, and build metadata,
+	which SemVer ignores in ordering, is dropped. Pre-releases are never
+	chosen for a build, so their order among themselves is not leaned
+	on."""
+	m = _SEMVER.fullmatch(version.strip())
+	if not m:
+		raise ValueError(f"not a SemVer version: {version!r}")
+	out = f"{m[1]}.{m[2]}.{m[3]}"
+	if m[4]:
+		out += "~" + m[4].replace("-", ".")
+	return out
+
+def _rust_version_fits(needed, have):
+	"""Does a crate's rust-version (`1.70`, `1.70.0`) fit the toolchain
+	the archive offers (a Debian version such as 1.85.1+dfsg1-1)?"""
+	if not needed:
+		return True
+	if not have:
+		return False
+	want = [int(x) for x in re.findall(r"\d+", needed)[:3]]
+	got = [int(x) for x in re.findall(r"\d+", have.split(":")[-1])[:3]]
+	return got[:len(want)] >= want
+
+def cargo_choose(name, rustc=None, index=None):
+	"""The release of a crate to build: the newest that is not yanked,
+	not a pre-release, has a program to install, and whose rust-version
+	the archive's rustc (`rustc`, a Debian version) meets -- an older
+	release that builds beats a newer one that cannot, as pip honours
+	Requires-Python. Returns (version, url, sha256, filename); raises
+	LookupError naming why when none qualifies."""
+	import json
+	crate = cargo_package_name(name)[len("cargo-"):]
+	data = json.loads(fetch(f"{index or CARGO_INDEX}/{crate}",
+	                        limit=MAX_INDEX_BYTES))
+	real = (data.get("crate") or {}).get("name") or crate
+	best, too_new = None, None
+	for v in data.get("versions") or []:
+		num = v.get("num", "")
+		try:
+			deb = semver_to_debian(num)
+		except ValueError:
+			continue
+		if v.get("yanked") or "~" in deb or not v.get("checksum"):
+			continue
+		if not v.get("bin_names"):
+			continue
+		if not _rust_version_fits(v.get("rust_version"), rustc):
+			if too_new is None or vercmp(deb, semver_to_debian(too_new[0])) > 0:
+				too_new = (num, v.get("rust_version"))
+			continue
+		if best is None or vercmp(deb, best[0]) > 0:
+			best = (deb, num, v["checksum"])
+	if best is None:
+		why = (f"; {real} {too_new[0]} needs rustc {too_new[1]}, the "
+		       f"archive has {rustc}" if too_new else "")
+		raise LookupError(f"{real}: no release on {index or CARGO_INDEX} "
+		                  f"with a program to install that this system "
+		                  f"can build{why}")
+	_, num, sha = best
+	filename = f"{real}-{num}.crate"
+	return num, f"{CARGO_DOWNLOAD}/{real}/{filename}", sha, filename
+
+def cargo_fetch_crate(url, sha256, filename, dest):
+	"""Download a .crate, check it against crates.io's sha256, unpack it."""
+	return fetch_source_tarball(url, sha256, filename, dest,
+	                            ".crate", "Cargo.toml", "a crate")
+
+def cargo_crate_metadata(tree):
+	"""What an unpacked .crate says about itself, from the Cargo.toml
+	`cargo publish` normalised, and upstream's licence files."""
+	try:
+		import tomllib
+	except ImportError:
+		raise ValueError("reading Cargo.toml needs Python 3.11")
+	with open(os.path.join(tree, "Cargo.toml"), "rb") as f:
+		package = tomllib.load(f).get("package") or {}
+	names = sorted(n for n in os.listdir(tree)
+	               if re.match(r"(LICEN[CS]E|COPYING|NOTICE|UNLICENSE)", n,
+	                           re.IGNORECASE))
+	if package.get("license-file") and package["license-file"] not in names:
+		names.append(package["license-file"])
+	texts = []
+	for n in names:
+		path = os.path.join(tree, n)
+		if os.path.isfile(path):
+			with open(path, encoding="utf-8", errors="replace") as f:
+				texts.append(f"{n}:\n\n{f.read().rstrip()}\n")
+	head = f"{package.get('name')} {package.get('version')}, from crates.io"
+	stated = (f"; its Cargo.toml says license = \"{package['license']}\""
+	          if package.get("license") else "")
+	return {"name": package.get("name"), "version": package.get("version"),
+	        "summary": (package.get("description") or "").strip(),
+	        "locked": os.path.exists(os.path.join(tree, "Cargo.lock")),
+	        "copyright": (f"{head}{stated}.\n\n" + "\n".join(texts) if texts
+	                      else f"{head}{stated}. It ships no licence file.\n")}
+
+def cargo_debian_files(meta, when=None):
+	"""The debian/ directory that builds a crate's programs as a cargo-
+	package, with the archive's cargo and rustc: {path under debian/:
+	content}. `cargo install` builds and installs in one step, into
+	CARGO_BIN rather than /usr/bin, which is the archive's -- the reason
+	pypi- commands live in /usr/lib/pypi/bin. Its dependencies are
+	fetched from crates.io during the build, pinned by the Cargo.lock
+	the crate was published with (--locked), and compiled in."""
+	package = cargo_package_name(meta["name"])
+	version = semver_to_debian(meta["version"])
+	summary = re.sub(r"\s+", " ", meta["summary"]) or meta["name"]
+	when = when or email.utils.formatdate(localtime=True)
+	maintainer = (f"{os.environ.get('DEBFULLNAME') or 'apt-emerge local build'}"
+	              f" <{os.environ.get('DEBEMAIL') or 'root@localhost'}>")
+	d = f"debian/{package}"
+	locked = " --locked" if meta["locked"] else ""
+	return {"source/format": "3.0 (native)\n",
+	        "control": (f"Source: {package}\n"
+	                    "Section: utils\n"
+	                    "Priority: optional\n"
+	                    f"Maintainer: {maintainer}\n"
+	                    "Build-Depends: debhelper-compat (= 13), cargo, rustc\n"
+	                    "Rules-Requires-Root: no\n"
+	                    "\n"
+	                    f"Package: {package}\n"
+	                    "Architecture: any\n"
+	                    "Depends: ${shlibs:Depends}, ${misc:Depends}\n"
+	                    f"Description: {summary}\n"
+	                    f" {meta['name']} {meta['version']}, built from crates.io"
+	                    " by apt-emerge.\n"),
+	        "changelog": (f"{package} ({version}) unstable; urgency=medium\n\n"
+	                      f"  * {meta['name']} {meta['version']} from crates.io.\n\n"
+	                      f" -- {maintainer}  {when}\n"),
+	        "copyright": meta["copyright"],
+	        # CARGO_HOME inside the tree: the registry cache is the build's,
+	        # not root's ~/.cargo. No tests: a crate's suite wants its
+	        # dev-dependencies. dwz has nothing to do for a release build.
+	        "rules": ("#!/usr/bin/make -f\n"
+	                  "export CARGO_HOME=$(CURDIR)/debian/cargo-home\n"
+	                  "%:\n"
+	                  "\tdh $@\n"
+	                  "override_dh_auto_configure:\n"
+	                  "override_dh_auto_build:\n"
+	                  "override_dh_auto_test:\n"
+	                  "override_dh_dwz:\n"
+	                  "override_dh_auto_install:\n"
+	                  f"\tcargo install{locked} --path . --no-track"
+	                  f" --root $(CURDIR)/{d}{CARGO_BIN[:-len('/bin')]}\n"
+	                  "override_dh_auto_clean:\n"
+	                  "\trm -rf target debian/cargo-home\n"),
+	        }
 
 def _dep_ok(alt, inst, chosen, iprov, provides_of):
 	"""Is a single dependency alternative (name, op, ver) already satisfied
@@ -3751,6 +3932,22 @@ class AptBackend:
 				merges.append((package, pep440_to_debian(version),
 				               self._installed_version(package), 0,
 				               "ebuild", use))
+		# cargo- likewise, from crates.io (item 9). One release each, no
+		# closure: a crate's dependencies are compiled into it.
+		self._cargo_plan = []
+		cargo_roots = [a for a in atoms if a.startswith("cargo-")
+		               and self._src_version(a) is None]
+		atoms = [a for a in atoms if a not in cargo_roots]
+		if cargo_roots:
+			rustc = self._candidate("rustc")
+			for a in cargo_roots:
+				try:
+					entry = (a,) + cargo_choose(a[len("cargo-"):], rustc)
+				except (LookupError, ValueError, OSError) as e:
+					raise RuntimeError(str(e))
+				self._cargo_plan.append(entry)
+				merges.append((a, semver_to_debian(entry[1]),
+				               self._installed_version(a), 0, "ebuild", use))
 		for a in atoms:
 			sv = self._src_version(a)
 			if sv is None:
@@ -3812,13 +4009,17 @@ class AptBackend:
 		env = {**os.environ, "DEB_BUILD_OPTIONS": use,
 		       "DEBIAN_FRONTEND": "noninteractive"}
 		pypi_plan = getattr(self, "_pypi_plan", [])
+		cargo_plan = getattr(self, "_cargo_plan", [])
 		self._pypi_also_installed = []
-		total = len(pypi_plan) + len(self._src_plan)
+		total = len(pypi_plan) + len(cargo_plan) + len(self._src_plan)
 		for i, entry in enumerate(pypi_plan, 1):
 			if self._build_pypi(entry, env, use, opts, i, total):
 				installed.append(entry[0])
-		for i, (atom, srcver, newver) in enumerate(self._src_plan,
-		                                           len(pypi_plan) + 1):
+		for i, entry in enumerate(cargo_plan, len(pypi_plan) + 1):
+			if self._build_cargo(entry, env, use, opts, i, total):
+				installed.append(entry[0])
+		for i, (atom, srcver, newver) in enumerate(
+		        self._src_plan, len(pypi_plan) + len(cargo_plan) + 1):
 			pv = f"{atom}-{newver}"
 			print(f"\n{ARROW} Emerging ({i} of {total}) {BGREEN(pv)}")
 			einfo(f"Installing build dependencies for {atom} "
@@ -4002,6 +4203,66 @@ class AptBackend:
 		finally:
 			building.discard(package)
 		return lines
+
+	def _build_cargo(self, entry, env, use, opts, i, total):
+		"""Fetch a .crate, give it the debian/ cargo_debian_files()
+		writes, and build it as -b builds an archive source package."""
+		package, version, url, sha, filename = entry
+		newver = semver_to_debian(version)
+		pv = f"{package}-{newver}"
+		print(f"\n{ARROW} Emerging ({i} of {total}) {BGREEN(pv)}")
+		portage_dir = os.path.join(PORTAGE_TMPDIR, f"{package}-{version}")
+		workdir = os.path.join(portage_dir, "work")
+		shutil.rmtree(portage_dir, ignore_errors=True)
+		os.makedirs(workdir)
+		print(f"{ARROW} Fetching {filename} from crates.io...")
+		try:
+			srcdir = cargo_fetch_crate(url, sha, filename, workdir)
+			files = cargo_debian_files(cargo_crate_metadata(srcdir))
+		except (RuntimeError, ValueError, OSError) as e:
+			efail(e)
+			sys.exit(1)
+		for path, text in files.items():
+			full = os.path.join(srcdir, "debian", path)
+			os.makedirs(os.path.dirname(full), exist_ok=True)
+			with open(full, "w", encoding="utf-8") as f:
+				f.write(text)
+		os.chmod(os.path.join(srcdir, "debian", "rules"), 0o755)
+		print(f"{ARROW} Source unpacked in {srcdir}")
+		einfo(f"Installing build dependencies for {package} "
+		      f"(oneshot: --depclean removes them again)...")
+		r = capture(["apt-get", "-y", "build-dep", srcdir])
+		if r.returncode != 0:
+			print(r.stderr, file=sys.stderr)
+			efail(f"build-dep failed for {package}")
+			sys.exit(1)
+		return self._compile_and_merge(package, newver, srcdir, workdir, env,
+		                               use, opts, pv, i, total)
+
+	def resolve_cargo_upgrades(self):
+		"""Plan newer buildable releases of the installed cargo- packages,
+		which apt cannot see on crates.io. Kept for build()."""
+		r = capture(["dpkg-query", "-W", "-f=${Package}\t${Version}\t"
+		             "${db:Status-Abbrev}\n", "cargo-*"])
+		self._cargo_plan = []
+		rustc = None
+		for line in r.stdout.splitlines():
+			parts = line.split("\t")
+			if len(parts) != 3 or not parts[2].startswith("ii"):
+				continue
+			package, have = parts[0], parts[1]
+			if package.endswith("-dbgsym"):
+				continue
+			rustc = rustc or self._candidate("rustc")
+			try:
+				entry = (package,) + cargo_choose(package[len("cargo-"):], rustc)
+			except LookupError:
+				continue
+			if vercmp(semver_to_debian(entry[1]), have) > 0:
+				self._cargo_plan.append(entry)
+		use = self._build_use()
+		return [(p, semver_to_debian(v), self._installed_version(p), 0,
+		         "ebuild", use) for p, v, *_ in self._cargo_plan]
 
 	def _build_pypi(self, entry, env, use, opts, i, total):
 		"""Fetch a PyPI sdist, give it the debian/ pypi_debian_files()
@@ -5661,8 +5922,10 @@ Options:
                  A pypi-<name> atom with no Debian source is built from
                  PyPI instead, with its pypi- dependencies, into
                  /usr/lib/pypi beside the archive's python3- packages;
-                 its commands go to /usr/lib/pypi/bin. -u on a set also
-                 rebuilds installed pypi- packages PyPI has newer releases of.
+                 its commands go to /usr/lib/pypi/bin. A cargo-<name> atom
+                 builds a crate's programs from crates.io into
+                 /usr/lib/cargo/bin. -u on a set also rebuilds installed
+                 pypi- and cargo- packages with newer releases.
 
    --buildpkgonly (-B)
                  Build, but do not install. Products are kept in PKGDIR
@@ -6312,11 +6575,16 @@ def _pypi_upgrades(be, pkgs, opts):
 	if not (opts["update"] and be.name == "apt"
 	        and any(p.startswith("@") for p in pkgs)):
 		return []
+	out = []
 	try:
-		return be.resolve_pypi_upgrades()
+		out += be.resolve_pypi_upgrades()
 	except (RuntimeError, LookupError, ValueError, OSError) as e:
 		ewarn(f"pypi- packages not checked for upgrades: {e}")
-		return []
+	try:
+		out += be.resolve_cargo_upgrades()
+	except (RuntimeError, LookupError, ValueError, OSError) as e:
+		ewarn(f"cargo- packages not checked for upgrades: {e}")
+	return out
 
 def _finish_merge(be, merges, pkgs, opts):
 	pypi = _pypi_upgrades(be, pkgs, opts)

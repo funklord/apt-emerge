@@ -61,6 +61,13 @@ How it differs from what you would otherwise use:
   against. `-u @world` upgrades them, `--depclean` removes what nothing
   needs, and a build tool Debian's archive is too old for is built from
   PyPI first.
+- **cargo install** puts a Rust program in `~/.cargo/bin`, out of dpkg's
+  sight and out of every upgrade. `emerge -b cargo-fd-find` builds the
+  newest release Debian's own `rustc` can compile -- an older one where
+  the newest needs a newer compiler -- from crates.io's checksummed
+  source with the lock file it was published with, as a `cargo-*`
+  package whose programs go to `/usr/lib/cargo/bin`; `-u @world`
+  rebuilds it when a newer buildable release appears.
 - **Portage** is Gentoo's. This is its vocabulary -- `-av`, `-uD @world`,
   `--depclean`, `-C`, sets, Portage-style output -- on a Debian system, with
   Debian's packages and Debian's own state.

@@ -2204,6 +2204,36 @@ write surface ever needs testing.
        came out `amd64` from sources they ship but do not compile. A
        per-architecture package of pure Python is wasteful, not wrong.
      - A dynamic `Requires-Dist`, a URL requirement and `===` are refused.
+   - **Rust from crates.io: `cargo-<name>`** (holder, 2026-11-26, chosen
+     as the second ecosystem because a crate's dependencies are compiled
+     into it: no runtime closure to plan, no namespace of libraries to
+     keep apart). The archive's own Rust packages are `rust-*` and its
+     programs carry their plain names; neither is touched.
+
+     `cargo_choose()` reads crates.io's API, which lists each release's
+     `rust_version` and `bin_names`, and takes the newest release that
+     is not yanked, not a pre-release, installs a program, and builds
+     with the archive's `rustc` -- an older release that builds beats a
+     newer one that cannot, as pip honours `Requires-Python`. A library
+     crate is refused: nothing to install. `semver_to_debian()` puts a
+     pre-release after `~` and drops build metadata.
+     `cargo_debian_files()` writes a native `dh` build whose install step
+     is `cargo install --locked --path .` with the Cargo.lock the crate
+     was published with, `CARGO_HOME` inside the build tree, programs into
+     `/usr/lib/cargo/bin` (`CARGO_BIN`) for the reason `pypi-` commands
+     leave `/usr/bin`, and `Depends` from `dh_shlibdeps`. Dependencies are
+     fetched from crates.io during the build. `-u` on a set rebuilds an
+     installed `cargo-` package when a newer buildable release appears.
+
+     Proven 2026-11-26 in a trixie container: `emerge -b cargo-fd-find`
+     chose 10.3.0 (10.5.2 needs rustc 1.90, trixie has 1.85), built it,
+     installed `fd` into `/usr/lib/cargo/bin` with `Depends: libc6,
+     libgcc-s1`, and `fd --version` ran.
+
+     **Open:** a crate whose `-sys` dependencies need a C library
+     (`openssl-sys` wants `libssl-dev` and `pkg-config`) fails in the
+     build, naming the missing library, since nothing maps a `-sys`
+     crate to the archive's `-dev` package yet.
    - *Transitive closure size*, npm especially.
    - *apt backend only*, like `-b/-B`: it needs build tooling, and the dpkg
      backend is binary-only by design.

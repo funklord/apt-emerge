@@ -940,6 +940,100 @@ class TestPypiFetch(unittest.TestCase):
 		self.assertFalse(os.path.exists(os.path.join(self.root, "escaped")))
 
 
+class TestCargoNamespace(unittest.TestCase):
+	"""A crate's programs built as cargo-<name> (holder, 2026-11-26)."""
+
+	def setUp(self):
+		self.root = tempfile.mkdtemp()
+		self.addCleanup(shutil.rmtree, self.root)
+
+	def test_names(self):
+		self.assertEqual(em.cargo_package_name("fd-find"), "cargo-fd-find")
+		self.assertEqual(em.cargo_package_name("Cargo_Edit"), "cargo-cargo-edit")
+		for bad in ["", "1abc", "a b", "a.b", "x" * 65]:
+			with self.subTest(bad=bad), self.assertRaises(ValueError):
+				em.cargo_package_name(bad)
+
+	def test_semver_sorts_as_semver_says_for_what_is_built(self):
+		"""Releases among themselves, and each pre-release below its
+        release and above the release before -- the orders a build or an
+        upgrade leans on; pre-releases are never chosen."""
+		order = ["0.9.10", "1.0.0-alpha.1", "1.0.0-rc.1", "1.0.0+build.5",
+		         "1.0.1", "1.2.0", "1.10.0", "2.0.0-beta-2", "2.0.0"]
+		debs = [em.semver_to_debian(v) for v in order]
+		self.assertEqual(debs[3], "1.0.0")
+		for a, b in zip(debs, debs[1:]):
+			with self.subTest(a=a, b=b):
+				self.assertLess(em.vercmp(a, b), 0)
+				if HAVE_DPKG:
+					self.assertEqual(dpkg_cmp(a, b), -1)
+		for bad in ["1.0", "01.0.0", "1.0.0-", "v1.0.0"]:
+			with self.subTest(bad=bad), self.assertRaises(ValueError):
+				em.semver_to_debian(bad)
+
+	def test_rust_version(self):
+		have = "1.85.1+dfsg1-1+deb13u1"
+		self.assertTrue(em._rust_version_fits(None, have))
+		self.assertTrue(em._rust_version_fits("1.85", have))
+		self.assertTrue(em._rust_version_fits("1.70.0", have))
+		self.assertFalse(em._rust_version_fits("1.90.0", have))
+		self.assertFalse(em._rust_version_fits("1.85.2", have))
+		self.assertFalse(em._rust_version_fits("1.70", None))
+
+	def crate(self, name, versions):
+		os.makedirs(os.path.join(self.root, "api"), exist_ok=True)
+		with open(os.path.join(self.root, "api", name), "w") as f:
+			json.dump({"crate": {"name": name}, "versions": versions}, f)
+		return "file://" + os.path.join(self.root, "api")
+
+	def test_the_newest_release_this_rustc_can_build(self):
+		v = lambda num, **kw: dict({"num": num, "yanked": False,
+		                           "checksum": "ab" * 32, "bin_names": ["fd"],
+		                           "rust_version": None}, **kw)
+		index = self.crate("fd-find", [
+			v("10.5.2", rust_version="1.90.0"), v("10.4.0", yanked=True),
+			v("11.0.0-rc.1"), v("10.3.0", rust_version="1.77.2"),
+			v("9.0.0"), v("10.3.1", checksum=None)])
+		got = em.cargo_choose("fd_find", "1.85.1+dfsg1-1", index)
+		self.assertEqual(got[0], "10.3.0")
+		self.assertTrue(got[1].endswith("/fd-find/fd-find-10.3.0.crate"))
+		index = self.crate("old", [v("1.0.0", rust_version="1.90")])
+		with self.assertRaises(LookupError) as cm:
+			em.cargo_choose("old", "1.85.1", index)
+		self.assertIn("needs rustc 1.90", str(cm.exception))
+		index = self.crate("lib", [v("1.0.0", bin_names=[])])
+		with self.assertRaises(LookupError):
+			em.cargo_choose("lib", "1.85.1", index)
+
+	def test_debian_files(self):
+		tree = os.path.join(self.root, "fd-find-10.3.0")
+		os.makedirs(tree)
+		with open(os.path.join(tree, "Cargo.toml"), "w") as f:
+			f.write('[package]\nname = "fd-find"\nversion = "10.3.0"\n'
+			        'description = "A simple,  fast alternative to find"\n'
+			        'license = "MIT OR Apache-2.0"\n')
+		for n in ("Cargo.lock", "LICENSE-MIT"):
+			with open(os.path.join(tree, n), "w") as f:
+				f.write("upstream's words\n")
+		files = em.cargo_debian_files(em.cargo_crate_metadata(tree),
+		                              when="Thu, 26 Nov 2026 12:00:00 +0000")
+		self.assertIn("Package: cargo-fd-find\n", files["control"])
+		self.assertIn("Architecture: any\n", files["control"])
+		self.assertIn("Description: A simple, fast alternative to find\n",
+		              files["control"])
+		self.assertIn("Build-Depends: debhelper-compat (= 13), cargo, rustc",
+		              files["control"])
+		self.assertTrue(files["changelog"].startswith("cargo-fd-find (10.3.0)"))
+		self.assertIn("cargo install --locked --path . --no-track --root "
+		              "$(CURDIR)/debian/cargo-fd-find/usr/lib/cargo\n",
+		              files["rules"])
+		self.assertIn('license = "MIT OR Apache-2.0"', files["copyright"])
+		self.assertIn("upstream's words", files["copyright"])
+		os.remove(os.path.join(tree, "Cargo.lock"))
+		files = em.cargo_debian_files(em.cargo_crate_metadata(tree))
+		self.assertNotIn("--locked", files["rules"])
+
+
 class TestMeets(unittest.TestCase):
 	def test_operators(self):
 		cases = [
