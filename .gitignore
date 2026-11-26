@@ -16,3 +16,6 @@ __pycache__/
 # that in 85a6422 and leaves a tree it has nothing to build alone; this
 # rule is kept for the installed one, which is older and still does.
 .fmake/
+
+# /go work file
+/.claude/go.md

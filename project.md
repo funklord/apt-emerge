@@ -1533,6 +1533,24 @@ each is rejected if it is absolute or contains `..`, so
 rather than a style choice: `clean` is the one target everybody runs without
 reading it.
 
+**`make deb` passes `-nc`, and `debian/rules` overrides `dh_auto_clean`**
+(2026-11-26, from claude-guidelines' inbox 20261125T1430Z, which asked every
+packaging tree for it). Nothing here compiles, so the pre-clean never cost a
+rebuild -- but it was not free. dh_auto_clean runs the first of `distclean`,
+`realclean` and `clean` the Makefile has, and `distclean` is `rm -rf build`:
+every `make deb` and every bare `dpkg-buildpackage` deleted the whole build
+tree, earlier packages in `build/deb/` included. Measured in a scratch clone:
+a file under `build/` was gone after one `make deb` before, and survives two
+`make deb` runs and a bare `dpkg-buildpackage` after. Without the pre-clean
+the recipe removes `debian/debhelper-build-stamp` (or dh skips to install and
+packages the old staging tree -- an appended line in `emerge` reached the
+package, checked) and `debian/.debhelper`, by name; not `dh_clean`, which
+also deletes every `*.orig`, `*.rej` and `*~` in the tree. The override keeps
+the one thing distclean did that a package build needs: removing the
+`__pycache__` the unit run writes, which `dpkg-source -b` otherwise puts in
+the source tarball (three entries, measured). Two `make deb` runs give
+byte-identical packages, 598 tests passing in each; lintian clean.
+
 Layout decisions worth not re-litigating:
 
 - **The `Makefile` owns the file list**, and `debian/rules` reaches it through

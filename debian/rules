@@ -27,5 +27,16 @@ ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
 	$(MAKE) version-check check-unit
 endif
 
+# dh_auto_clean would run the Makefile's `distclean`, the first of
+# distclean, realclean and clean it finds -- `rm -rf build` and every package
+# a `make deb` collected there, from a dpkg-buildpackage run only to build
+# one more. Nothing is compiled, and dh_clean already removes what a package
+# build writes (debian/apt-emerge, debian/.debhelper, the stamp, files,
+# substvars). What is left is the bytecode cache dh_auto_test's unit run
+# writes, which distclean used to take and which a source package built
+# afterwards would otherwise carry.
+override_dh_auto_clean:
+	rm -rf __pycache__ tool/__pycache__
+
 override_dh_auto_install:
 	$(MAKE) install DESTDIR=$(CURDIR)/debian/apt-emerge prefix=/usr

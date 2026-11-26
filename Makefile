@@ -208,8 +208,21 @@ uninstall:
 # outside the tree and not ours to litter -- with these projects side by side
 # in one directory, that is a sibling's tree. Collect them into BUILD_DIR
 # instead.
+#
+# -nc, so dpkg-buildpackage does not first run debian/rules clean. Nothing
+# here compiles, so the pre-clean cost no rebuild; what it cost was dh's
+# default clean, which runs this Makefile's `distclean` -- `rm -rf build`,
+# taking every earlier package in $(DEB_DIR) with it (debian/rules now
+# overrides that for a bare dpkg-buildpackage too). Without the pre-clean,
+# two things a previous run left must go by name: the build stamp, or dh
+# skips straight to install and packages the old staging tree, and
+# debian/.debhelper, which dh_prep never empties. Not dh_clean: it also
+# deletes every *.orig, *.rej and *~ in the tree. From clean stays
+# `make clean deb`.
 deb: version-check
-	dpkg-buildpackage --build=binary --no-sign
+	rm -f debian/debhelper-build-stamp
+	rm -rf debian/.debhelper
+	dpkg-buildpackage --build=binary --no-sign -nc
 	mkdir -p $(DEB_DIR)
 	set -e; ver=$$(dpkg-parsechangelog -SVersion); \
 	arch=$$(dpkg-architecture -qDEB_HOST_ARCH); \
