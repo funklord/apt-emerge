@@ -1034,6 +1034,23 @@ class TestCargoNamespace(unittest.TestCase):
 		self.assertNotIn("--locked", files["rules"])
 
 
+class TestBuildDepMarks(unittest.TestCase):
+	"""apt 3's build-dep marks what it installs manual, so a -b build's
+    build dependencies joined @world and --depclean kept them for ever
+    (measured 2026-11-26: cargo stayed after -b cargo-fd-find). Every
+    build-dep that installs passes Build-Dep-Automatic."""
+
+	def test_every_installing_build_dep_marks_auto(self):
+		with open(os.path.join(HERE, "emerge"), encoding="utf-8") as f:
+			calls = re.findall(r'capture\(\["apt-get",[^\]]*"build-dep"', f.read())
+		installing = [c for c in calls if '"-s"' not in c]
+		self.assertGreaterEqual(len(installing), 3)
+		for c in installing:
+			with self.subTest(call=c):
+				self.assertIn("*BUILD_DEP_AUTO", c)
+		self.assertEqual(em.BUILD_DEP_AUTO,
+		                 ("-o", "APT::Get::Build-Dep-Automatic=true"))
+
 class TestMeets(unittest.TestCase):
 	def test_operators(self):
 		cases = [

@@ -117,6 +117,11 @@ STATUS    = "/var/lib/dpkg/status"
 # made the only path the source builder writes to the only one that could not
 # be repointed.
 PORTAGE_TMPDIR = "/var/tmp/portage"
+# apt-get build-dep marks what it installs as manual -- apt 3.0, measured
+# 2026-11-26 -- so every build dependency of a -b build joined @world and
+# --depclean never removed it, though the build says it will. apt's own
+# switch marks them auto instead.
+BUILD_DEP_AUTO = ("-o", "APT::Get::Build-Dep-Automatic=true")
 
 # Single source of truth for what -V prints; the notice at the top of this
 # file is a comment and cannot be shared with it, so keep the two in step.
@@ -4024,7 +4029,7 @@ class AptBackend:
 			print(f"\n{ARROW} Emerging ({i} of {total}) {BGREEN(pv)}")
 			einfo(f"Installing build dependencies for {atom} "
 			      f"(oneshot: --depclean removes them again)...")
-			r = capture(["apt-get", "-y", "build-dep", atom])
+			r = capture(["apt-get", "-y", *BUILD_DEP_AUTO, "build-dep", atom])
 			if r.returncode != 0:
 				print(r.stderr, file=sys.stderr)
 				efail(f"build-dep failed for {atom}")
@@ -4231,7 +4236,7 @@ class AptBackend:
 		print(f"{ARROW} Source unpacked in {srcdir}")
 		einfo(f"Installing build dependencies for {package} "
 		      f"(oneshot: --depclean removes them again)...")
-		r = capture(["apt-get", "-y", "build-dep", srcdir])
+		r = capture(["apt-get", "-y", *BUILD_DEP_AUTO, "build-dep", srcdir])
 		if r.returncode != 0:
 			print(r.stderr, file=sys.stderr)
 			efail(f"build-dep failed for {package}")
@@ -4303,7 +4308,7 @@ class AptBackend:
 		print(f"{ARROW} Source unpacked in {srcdir}")
 		einfo(f"Installing build dependencies for {package} "
 		      f"(oneshot: --depclean removes them again)...")
-		r = capture(["apt-get", "-y", "build-dep", srcdir])
+		r = capture(["apt-get", "-y", *BUILD_DEP_AUTO, "build-dep", srcdir])
 		if r.returncode != 0:
 			print(r.stderr, file=sys.stderr)
 			efail(f"build-dep failed for {package}")
