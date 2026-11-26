@@ -2230,10 +2230,17 @@ write surface ever needs testing.
      installed `fd` into `/usr/lib/cargo/bin` with `Depends: libc6,
      libgcc-s1`, and `fd --version` ran.
 
-     **Open:** a crate whose `-sys` dependencies need a C library
-     (`openssl-sys` wants `libssl-dev` and `pkg-config`) fails in the
-     build, naming the missing library, since nothing maps a `-sys`
-     crate to the archive's `-dev` package yet.
+     **A `-sys` crate gets its C library** (2026-11-26): the `-sys`
+     crates in the published `Cargo.lock` are mapped through a table
+     (`_CARGO_SYS_PACKAGES`, eleven names checked against trixie) to the
+     archive's `-dev` packages, and `pkg-config` is always a build
+     dependency. The lock lists every platform's crates, so a mapped one
+     only some feature or platform uses costs a needless `-dev`
+     package, marked auto. An unlisted `-sys` crate builds its bundled
+     copy or fails naming the library. Proven with `cargo-update` 20.0.0
+     (`openssl-sys`, `curl-sys`, `libssh2-sys`, `libz-sys`): built, its
+     programs link the system's libcurl, libssl, libz and libssh2, and
+     `Depends` names them.
    - *Transitive closure size*, npm especially.
    - *apt backend only*, like `-b/-B`: it needs build tooling, and the dpkg
      backend is binary-only by design.

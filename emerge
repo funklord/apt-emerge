@@ -1256,6 +1256,20 @@ def cargo_fetch_crate(url, sha256, filename, dest):
 	return fetch_source_tarball(url, sha256, filename, dest,
 	                            ".crate", "Cargo.toml", "a crate")
 
+# A -sys crate links a C library and finds it with pkg-config; the
+# archive's -dev package is what it looks for. Most also carry a bundled
+# copy behind a feature, which a needless -dev package does not disturb.
+# Names checked against trixie 2026-11-26; an unlisted -sys crate builds
+# its bundled copy or fails naming the library.
+_CARGO_SYS_PACKAGES = {
+	"openssl-sys": "libssl-dev", "libz-sys": "zlib1g-dev",
+	"libsqlite3-sys": "libsqlite3-dev", "curl-sys": "libcurl4-openssl-dev",
+	"libssh2-sys": "libssh2-1-dev", "zstd-sys": "libzstd-dev",
+	"bzip2-sys": "libbz2-dev", "lzma-sys": "liblzma-dev",
+	"libdbus-sys": "libdbus-1-dev", "libudev-sys": "libudev-dev",
+	"yeslogic-fontconfig-sys": "libfontconfig-dev",
+}
+
 def cargo_crate_metadata(tree):
 	"""What an unpacked .crate says about itself, from the Cargo.toml
 	`cargo publish` normalised, and upstream's licence files."""
@@ -1265,6 +1279,13 @@ def cargo_crate_metadata(tree):
 		raise ValueError("reading Cargo.toml needs Python 3.11")
 	with open(os.path.join(tree, "Cargo.toml"), "rb") as f:
 		package = tomllib.load(f).get("package") or {}
+	sys_crates = []
+	lock = os.path.join(tree, "Cargo.lock")
+	if os.path.exists(lock):
+		with open(lock, "rb") as f:
+			sys_crates = sorted({p.get("name", "") for p in
+			                     tomllib.load(f).get("package") or []
+			                     if p.get("name", "").endswith("-sys")})
 	names = sorted(n for n in os.listdir(tree)
 	               if re.match(r"(LICEN[CS]E|COPYING|NOTICE|UNLICENSE)", n,
 	                           re.IGNORECASE))
@@ -1281,7 +1302,7 @@ def cargo_crate_metadata(tree):
 	          if package.get("license") else "")
 	return {"name": package.get("name"), "version": package.get("version"),
 	        "summary": (package.get("description") or "").strip(),
-	        "locked": os.path.exists(os.path.join(tree, "Cargo.lock")),
+	        "locked": os.path.exists(lock), "sys_crates": sys_crates,
 	        "copyright": (f"{head}{stated}.\n\n" + "\n".join(texts) if texts
 	                      else f"{head}{stated}. It ships no licence file.\n")}
 
@@ -1301,12 +1322,17 @@ def cargo_debian_files(meta, when=None):
 	              f" <{os.environ.get('DEBEMAIL') or 'root@localhost'}>")
 	d = f"debian/{package}"
 	locked = " --locked" if meta["locked"] else ""
+	build = ["debhelper-compat (= 13)", "cargo", "rustc", "pkg-config"]
+	for crate in meta.get("sys_crates", []):
+		dev = _CARGO_SYS_PACKAGES.get(crate)
+		if dev and dev not in build:
+			build.append(dev)
 	return {"source/format": "3.0 (native)\n",
 	        "control": (f"Source: {package}\n"
 	                    "Section: utils\n"
 	                    "Priority: optional\n"
 	                    f"Maintainer: {maintainer}\n"
-	                    "Build-Depends: debhelper-compat (= 13), cargo, rustc\n"
+	                    f"Build-Depends: {', '.join(build)}\n"
 	                    "Rules-Requires-Root: no\n"
 	                    "\n"
 	                    f"Package: {package}\n"

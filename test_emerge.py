@@ -1012,23 +1012,35 @@ class TestCargoNamespace(unittest.TestCase):
 			f.write('[package]\nname = "fd-find"\nversion = "10.3.0"\n'
 			        'description = "A simple,  fast alternative to find"\n'
 			        'license = "MIT OR Apache-2.0"\n')
-		for n in ("Cargo.lock", "LICENSE-MIT"):
-			with open(os.path.join(tree, n), "w") as f:
-				f.write("upstream's words\n")
+		with open(os.path.join(tree, "LICENSE-MIT"), "w") as f:
+			f.write("upstream's words\n")
+		with open(os.path.join(tree, "Cargo.lock"), "w") as f:
+			f.write("version = 3\n")
 		files = em.cargo_debian_files(em.cargo_crate_metadata(tree),
 		                              when="Thu, 26 Nov 2026 12:00:00 +0000")
 		self.assertIn("Package: cargo-fd-find\n", files["control"])
 		self.assertIn("Architecture: any\n", files["control"])
 		self.assertIn("Description: A simple, fast alternative to find\n",
 		              files["control"])
-		self.assertIn("Build-Depends: debhelper-compat (= 13), cargo, rustc",
-		              files["control"])
+		self.assertIn("Build-Depends: debhelper-compat (= 13), cargo, rustc, "
+		              "pkg-config\n", files["control"])
 		self.assertTrue(files["changelog"].startswith("cargo-fd-find (10.3.0)"))
 		self.assertIn("cargo install --locked --path . --no-track --root "
 		              "$(CURDIR)/debian/cargo-fd-find/usr/lib/cargo\n",
 		              files["rules"])
 		self.assertIn('license = "MIT OR Apache-2.0"', files["copyright"])
 		self.assertIn("upstream's words", files["copyright"])
+		with open(os.path.join(tree, "Cargo.lock"), "w") as f:
+			f.write('version = 3\n[[package]]\nname = "openssl-sys"\n'
+			        'version = "0.9.1"\n[[package]]\nname = "zstd-sys"\n'
+			        'version = "2.0.0"\n[[package]]\nname = "odd-sys"\n'
+			        'version = "1.0.0"\n[[package]]\nname = "serde"\n'
+			        'version = "1.0.0"\n')
+		meta = em.cargo_crate_metadata(tree)
+		self.assertEqual(meta["sys_crates"], ["odd-sys", "openssl-sys",
+		                                      "zstd-sys"])
+		files = em.cargo_debian_files(meta)
+		self.assertIn("pkg-config, libssl-dev, libzstd-dev\n", files["control"])
 		os.remove(os.path.join(tree, "Cargo.lock"))
 		files = em.cargo_debian_files(em.cargo_crate_metadata(tree))
 		self.assertNotIn("--locked", files["rules"])
