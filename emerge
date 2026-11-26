@@ -750,6 +750,11 @@ def pypi_requirement(text, env=None):
 # dist-packages, so where both carry a module the archive's wins and the
 # programs Debian ships import what Debian tested them with.
 PYPI_TREE = "/usr/lib/pypi/python3"
+# And its commands. /usr/bin is the archive's: pypi-charset-normalizer's
+# `normalizer` there made dpkg refuse python3-charset-normalizer, which
+# flit pulls in to build idna -- so `emerge -b pypi-requests` failed on
+# its own second package (2026-11-26). Not on PATH unless put there.
+PYPI_BIN = "/usr/lib/pypi/bin"
 
 # build-system.requires names a PyPI project; dh-python runs the backend
 # from the system, so Build-Depends names the archive's package. Every
@@ -840,6 +845,7 @@ def pypi_debian_files(meta, arch="all", env=None, when=None):
 	maintainer = (f"{os.environ.get('DEBFULLNAME') or 'apt-emerge local build'}"
 	              f" <{os.environ.get('DEBEMAIL') or 'root@localhost'}>")
 	pth = f"{package}.pth"
+	d = f"debian/{package}"
 	return {"source/format": "3.0 (native)\n",
 	        "control": (f"Source: {package}\n"
 	                    "Section: python\n"
@@ -867,6 +873,9 @@ def pypi_debian_files(meta, arch="all", env=None, when=None):
 	                                 'if [ "$1" = configure ]; then\n'
 	                                 f"\tpy3compile -p {package} {PYPI_TREE}\n"
 	                                 "fi\n#DEBHELPER#\n"),
+	        "pypi-build/trove_classifiers.py":
+	            ("raise ImportError('apt-emerge: the archive\\'s classifier "
+	             "list is older than PyPI\\'s; see debian/rules')\n"),
 	        f"{package}.prerm": ("#!/bin/sh\nset -e\n"
 	                              f"py3clean -p {package}\n#DEBHELPER#\n"),
 	        # PYBUILD_INSTALL_DIR moves the modules out of dist-packages.
@@ -874,6 +883,17 @@ def pypi_debian_files(meta, arch="all", env=None, when=None):
 	        # not the package's dependencies.
 	        "rules": ("#!/usr/bin/make -f\n"
 	                  f"export PYBUILD_INSTALL_DIR={PYPI_TREE}\n"
+	                  # The archive's backends check classifiers against the
+	                  # archive's trove-classifiers, older than what PyPI
+	                  # releases now name: `Python :: 3.15` failed urllib3
+	                  # 2.8.0 under hatchling and requests 2.34.2 under
+	                  # setuptools (2026-11-26). Metadata only, so both
+	                  # checks are off: hatchling has a switch, setuptools'
+	                  # validator skips when trove_classifiers will not
+	                  # import and the network is off limits.
+	                  "export HATCH_METADATA_CLASSIFIERS_NO_VERIFY=1\n"
+	                  "export VALIDATE_PYPROJECT_NO_NETWORK=1\n"
+	                  "export PYTHONPATH=$(CURDIR)/debian/pypi-build\n"
 	                  f"export PYBUILD_DESTDIR=debian/{package}\n"
 	                  "%:\n"
 	                  "\tdh $@ --buildsystem=pybuild\n"
@@ -882,6 +902,20 @@ def pypi_debian_files(meta, arch="all", env=None, when=None):
 	                  f"\tmkdir -p debian/{package}/usr/lib/python3/dist-packages\n"
 	                  f"\techo {PYPI_TREE} >debian/{package}"
 	                  f"/usr/lib/python3/dist-packages/{pth}\n"
+	                  # Commands leave /usr/bin, where the archive's package
+	                  # of the same program would collide; each puts the
+	                  # tree first, so it runs with the versions it was
+	                  # built against.
+	                  f"\tif [ -d {d}/usr/bin ]; then \\\n"
+	                  f"\t  mkdir -p {d}{PYPI_BIN} && \\\n"
+	                  f"\t  for f in {d}/usr/bin/*; do \\\n"
+	                  "\t    if head -n1 \"$$f\" | grep -q '^#!.*python'; then \\\n"
+	                  f"\t      sed -i '1a import sys; sys.path.insert(0, \"{PYPI_TREE}\")'"
+	                  " \"$$f\" || exit 1; \\\n"
+	                  "\t    fi; \\\n"
+	                  f"\t    mv \"$$f\" {d}{PYPI_BIN}/ || exit 1; \\\n"
+	                  f"\t  done && rmdir {d}/usr/bin; \\\n"
+	                  "\tfi\n"
 	                  "override_dh_auto_test:\n"),
 	        }, extras
 
@@ -967,6 +1001,67 @@ def pypi_fetch_sdist(url, sha256, filename, dest):
 	if not os.path.isfile(os.path.join(tree, "PKG-INFO")):
 		raise RuntimeError(f"{filename}: no {top}/PKG-INFO; not an sdist")
 	return tree
+
+def pypi_release_requires(name, version, index=None):
+	"""A release's Requires-Dist as the index lists it, for planning.
+	The build reads PKG-INFO from the sdist itself and that is what the
+	package's Depends come from; a difference shows as an install apt
+	refuses, naming the missing package, never as a silent one."""
+	import json
+	url = f"{index or PYPI_INDEX}/{pypi_package_name(name)[5:]}/{version}/json"
+	info = json.loads(fetch(url, limit=MAX_INDEX_BYTES)).get("info") or {}
+	return info.get("requires_dist") or []
+
+def pypi_closure(roots, installed_version, env=None, index=None):
+	"""Everything to build so that `roots` (pypi- package names) install:
+	[(package, pep440 version, url, sha256, filename)], dependencies
+	before what needs them. A dependency already installed at a version
+	its relations accept is left alone; a root is always built.
+
+	No backtracking: a release chosen for one dependent that a second
+	refuses is reported with both, rather than searched around -- the
+	same honesty as the resolver's walls, in a first version."""
+	env = pep508_environment() if env is None else env
+	chosen, order = {}, []
+
+	def visit(package, relations, extras, path, root):
+		if package in path:
+			raise RuntimeError("dependency cycle: "
+			                   + " -> ".join(path + [package]))
+		if package in chosen:
+			version = chosen[package][0]
+			if not debian_relations_hold(pep440_to_debian(version), relations):
+				raise RuntimeError(
+				    f"{package} {version} was chosen for {chosen[package][1]}, "
+				    f"and {path[-1]} needs {', '.join(relations)}")
+			if extras <= chosen[package][2]:
+				return
+			extras = extras | chosen[package][2]
+		else:
+			have = installed_version(package)
+			if (not root and have and not extras
+			    and debian_relations_hold(have, relations)):
+				return
+		name = package[len("pypi-"):]
+		if package in chosen:
+			version, url, sha, filename = chosen[package][3]
+		else:
+			version, url, sha, filename = pypi_choose(name, relations, index)
+		chosen[package] = (version, path[-1] if path else "the command line",
+		                   extras, (version, url, sha, filename))
+		for line in pypi_release_requires(name, version, index):
+			for extra in [""] + sorted(extras):
+				got = pypi_requirement(line, dict(env, extra=extra))
+				if got:
+					visit(got[0], got[2], set(got[1]), path + [package],
+					      False)
+					break
+		if not any(e[0] == package for e in order):
+			order.append((package, version, url, sha, filename))
+
+	for root in roots:
+		visit(root, [], set(), [], True)
+	return order
 
 def _dep_ok(alt, inst, chosen, iprov, provides_of):
 	"""Is a single dependency alternative (name, op, ver) already satisfied
@@ -3550,6 +3645,24 @@ class AptBackend:
 		merges, self._src_plan = [], []
 		self._atoms = list(atoms)          # world candidates, for --oneshot
 		use = self._build_use()
+		# A pypi- atom the archive has no source for is built from PyPI
+		# (project.md, item 9): the namespace is ours, so the name says
+		# where it comes from.
+		self._pypi_plan, pypi_roots = [], []
+		for a in list(atoms):
+			if a.startswith("pypi-") and self._src_version(a) is None:
+				pypi_roots.append(a)
+		atoms = [a for a in atoms if a not in pypi_roots]
+		if pypi_roots:
+			try:
+				self._pypi_plan = pypi_closure(pypi_roots,
+				                               self._installed_version)
+			except (LookupError, ValueError, OSError) as e:
+				raise RuntimeError(str(e))
+			for package, version, *_ in self._pypi_plan:
+				merges.append((package, pep440_to_debian(version),
+				               self._installed_version(package), 0,
+				               "ebuild", use))
 		for a in atoms:
 			sv = self._src_version(a)
 			if sv is None:
@@ -3610,8 +3723,13 @@ class AptBackend:
 		was_manual = self._manual_set()
 		env = {**os.environ, "DEB_BUILD_OPTIONS": use,
 		       "DEBIAN_FRONTEND": "noninteractive"}
-		total = len(self._src_plan)
-		for i, (atom, srcver, newver) in enumerate(self._src_plan, 1):
+		pypi_plan = getattr(self, "_pypi_plan", [])
+		total = len(pypi_plan) + len(self._src_plan)
+		for i, entry in enumerate(pypi_plan, 1):
+			if self._build_pypi(entry, env, use, opts, i, total):
+				installed.append(entry[0])
+		for i, (atom, srcver, newver) in enumerate(self._src_plan,
+		                                           len(pypi_plan) + 1):
 			pv = f"{atom}-{newver}"
 			print(f"\n{ARROW} Emerging ({i} of {total}) {BGREEN(pv)}")
 			einfo(f"Installing build dependencies for {atom} "
@@ -3645,51 +3763,9 @@ class AptBackend:
 			except (RuntimeError, OSError) as e:
 				efail(e)
 				sys.exit(1)
-			print(f"{ARROW} Compiling source in {BOLD(srcdir)} ...")
-			proc = subprocess.Popen(
-			    ["dpkg-buildpackage", "-b", "-uc", "-us"],
-			    cwd=srcdir, env=env, stdout=subprocess.PIPE,
-			    stderr=subprocess.STDOUT)
-			for line in stream_lines(proc.stdout):
-				print(line)
-			try:
-				proc.stdout.close()      # read to EOF; don't leak the pipe
-			except OSError:
-				pass
-			if proc.wait() != 0:
-				print(f"\n{RED('!!!')} {BOLD(f'compile failed for {atom}')}")
-				sys.exit(1)
-			print(f"{ARROW} Source compiled.")
-			if "nocheck" in use.split():
-				print(f"{ARROW} Test phase [not enabled]: {atom} "
-				      f"(DEB_BUILD_OPTIONS did not request tests)")
-			else:
-				print(f"{ARROW} Test phase completed: {atom}")
-			debs = sorted(f for f in os.listdir(workdir)
-			              if f.endswith(".deb"))
-			for d in debs:
-				shutil.copy2(os.path.join(workdir, d), BINPKGS)
-			print(f"{ARROW} Merging {len(debs)} binary package(s) to PKGDIR "
-			      f"({BINPKGS}):")
-			for d in debs:
-				print(f"    {GREEN(d)}")
-			if opts["buildpkgonly"]:
-				continue
-			noepoch = newver.split(":", 1)[-1]
-			target = next((d for d in debs
-			               if d.startswith(f"{atom}_{noepoch}_")), None)
-			if target is None:
-				efail(f"no .deb named {atom} among the products")
-				sys.exit(1)
-			r = capture(["apt-get", "-y", "install",
-			             os.path.join(BINPKGS, target)])
-			if r.returncode != 0:
-				print(r.stderr, file=sys.stderr)
-				efail(f"install failed for {atom}")
-				sys.exit(1)
-			installed.append(atom)
-			print(f"{ARROW} Installing ({i} of {total}) {BGREEN(pv)}")
-			print(f"{ARROW} Completed ({i} of {total}) {BGREEN(pv)}")
+			if self._compile_and_merge(atom, newver, srcdir, workdir, env,
+			                           use, opts, pv, i, total):
+				installed.append(atom)
 		print()
 		if installed:
 			self._apply_marks(was_manual, opts["oneshot"], named=installed)
@@ -3700,6 +3776,100 @@ class AptBackend:
 		if installed:
 			archive_settled(conf, installed)
 		pending_notice(conf)
+
+	def _compile_and_merge(self, atom, newver, srcdir, workdir, env, use,
+	                       opts, pv, i, total):
+		"""dpkg-buildpackage in `srcdir`, the products into PKGDIR, and the
+		one named `atom` installed unless -B. True when it was installed."""
+		print(f"{ARROW} Compiling source in {BOLD(srcdir)} ...")
+		proc = subprocess.Popen(
+		    ["dpkg-buildpackage", "-b", "-uc", "-us"],
+		    cwd=srcdir, env=env, stdout=subprocess.PIPE,
+		    stderr=subprocess.STDOUT)
+		for line in stream_lines(proc.stdout):
+			print(line)
+		try:
+			proc.stdout.close()      # read to EOF; don't leak the pipe
+		except OSError:
+			pass
+		if proc.wait() != 0:
+			print(f"\n{RED('!!!')} {BOLD(f'compile failed for {atom}')}")
+			sys.exit(1)
+		print(f"{ARROW} Source compiled.")
+		if "nocheck" in use.split():
+			print(f"{ARROW} Test phase [not enabled]: {atom} "
+			      f"(DEB_BUILD_OPTIONS did not request tests)")
+		else:
+			print(f"{ARROW} Test phase completed: {atom}")
+		debs = sorted(f for f in os.listdir(workdir)
+		              if f.endswith(".deb"))
+		for d in debs:
+			shutil.copy2(os.path.join(workdir, d), BINPKGS)
+		print(f"{ARROW} Merging {len(debs)} binary package(s) to PKGDIR "
+		      f"({BINPKGS}):")
+		for d in debs:
+			print(f"    {GREEN(d)}")
+		if opts["buildpkgonly"]:
+			return False
+		noepoch = newver.split(":", 1)[-1]
+		target = next((d for d in debs
+		               if d.startswith(f"{atom}_{noepoch}_")), None)
+		if target is None:
+			efail(f"no .deb named {atom} among the products")
+			sys.exit(1)
+		r = capture(["apt-get", "-y", "install",
+		             os.path.join(BINPKGS, target)])
+		if r.returncode != 0:
+			print(r.stderr, file=sys.stderr)
+			efail(f"install failed for {atom}")
+			sys.exit(1)
+		print(f"{ARROW} Installing ({i} of {total}) {BGREEN(pv)}")
+		print(f"{ARROW} Completed ({i} of {total}) {BGREEN(pv)}")
+		return True
+
+	def _build_pypi(self, entry, env, use, opts, i, total):
+		"""Fetch a PyPI sdist, give it the debian/ pypi_debian_files()
+		writes, and build it as -b builds an archive source package."""
+		package, version, url, sha, filename = entry
+		newver = pep440_to_debian(version)
+		pv = f"{package}-{newver}"
+		print(f"\n{ARROW} Emerging ({i} of {total}) {BGREEN(pv)}")
+		portage_dir = os.path.join(PORTAGE_TMPDIR, f"{package}-{version}")
+		workdir = os.path.join(portage_dir, "work")
+		shutil.rmtree(portage_dir, ignore_errors=True)
+		os.makedirs(workdir)
+		print(f"{ARROW} Fetching {filename} from PyPI...")
+		try:
+			srcdir = pypi_fetch_sdist(url, sha, filename, workdir)
+			meta = pypi_sdist_metadata(srcdir)
+			# Compiled code makes the package architecture-dependent; the
+			# sources say so before the build does.
+			arch = "all"
+			for _, _, names in os.walk(srcdir):
+				if any(n.endswith((".c", ".cc", ".cpp", ".pyx", ".rs"))
+				       or n == "Cargo.toml" for n in names):
+					arch = "any"
+					break
+			files, _ = pypi_debian_files(meta, arch)
+		except (RuntimeError, ValueError, OSError) as e:
+			efail(e)
+			sys.exit(1)
+		for path, text in files.items():
+			full = os.path.join(srcdir, "debian", path)
+			os.makedirs(os.path.dirname(full), exist_ok=True)
+			with open(full, "w", encoding="utf-8") as f:
+				f.write(text)
+		os.chmod(os.path.join(srcdir, "debian", "rules"), 0o755)
+		print(f"{ARROW} Source unpacked in {srcdir}")
+		einfo(f"Installing build dependencies for {package} "
+		      f"(oneshot: --depclean removes them again)...")
+		r = capture(["apt-get", "-y", "build-dep", srcdir])
+		if r.returncode != 0:
+			print(r.stderr, file=sys.stderr)
+			efail(f"build-dep failed for {package}")
+			sys.exit(1)
+		return self._compile_and_merge(package, newver, srcdir, workdir, env,
+		                               use, opts, pv, i, total)
 
 	@staticmethod
 	def _manual_set():
@@ -5309,6 +5479,10 @@ Options:
                  (default: nocheck parallel=<nproc>). Requires deb-src
                  entries in the tree and the apt backend plus dpkg-dev /
                  build-essential; the dpkg backend is binary-only.
+                 A pypi-<name> atom with no Debian source is built from
+                 PyPI instead, with its pypi- dependencies, into
+                 /usr/lib/pypi beside the archive's python3- packages;
+                 its commands go to /usr/lib/pypi/bin.
 
    --buildpkgonly (-B)
                  Build, but do not install. Products are kept in PKGDIR

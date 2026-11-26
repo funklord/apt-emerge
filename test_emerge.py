@@ -711,6 +711,11 @@ class TestPypiDebianFiles(unittest.TestCase):
 		self.assertIn(f"py3compile -p pypi-foo-bar {em.PYPI_TREE}",
 		              files["pypi-foo-bar.postinst"])
 		self.assertIn("py3clean -p pypi-foo-bar", files["pypi-foo-bar.prerm"])
+		# commands leave /usr/bin, which belongs to the archive
+		self.assertIn(f"mkdir -p debian/pypi-foo-bar{em.PYPI_BIN}", files["rules"])
+		self.assertIn("rmdir debian/pypi-foo-bar/usr/bin", files["rules"])
+		with self.assertRaises(ImportError):
+			exec(files["pypi-build/trove_classifiers.py"], {})
 		for line in files["rules"].splitlines():
 			if line[:1].isspace():
 				with self.subTest(line=line):
@@ -789,6 +794,69 @@ class TestPypiFetch(unittest.TestCase):
 		tree = em.pypi_fetch_sdist(f["url"], f["digests"]["sha256"],
 		                           f["filename"], dest)
 		self.assertEqual(em.pypi_sdist_metadata(tree)["version"], "2.0")
+
+	def release(self, name, version, requires=()):
+		"""One release in the file:// index: its sdist, and the per-version
+        JSON the closure plans from."""
+		f = self.sdist(name, version)
+		listing = os.path.join(self.root, name, "json")
+		releases = {}
+		if os.path.exists(listing):
+			with open(listing) as fh:
+				releases = json.load(fh)["releases"]
+		releases[version] = [f]
+		self.index(name, releases)
+		os.makedirs(os.path.join(self.root, name, version), exist_ok=True)
+		with open(os.path.join(self.root, name, version, "json"), "w") as fh:
+			json.dump({"info": {"requires_dist": list(requires)}}, fh)
+		return "file://" + self.root
+
+	def closure(self, roots, installed=None):
+		return [(p, v) for p, v, *_ in em.pypi_closure(
+			roots, (installed or {}).get, env={"extra": "",
+			"python_version": "3.13"}, index="file://" + self.root)]
+
+	def test_the_closure_puts_dependencies_first(self):
+		self.release("app", "1.0", ["lib>=2", "old; python_version < '3.8'"])
+		self.release("lib", "2.1", ["base"])
+		self.release("lib", "1.0")
+		self.release("base", "0.5")
+		self.assertEqual(self.closure(["pypi-app"]),
+		                 [("pypi-base", "0.5"), ("pypi-lib", "2.1"),
+		                  ("pypi-app", "1.0")])
+
+	def test_an_installed_dependency_that_suffices_is_not_rebuilt(self):
+		self.release("app", "1.0", ["lib>=2"])
+		self.release("lib", "2.1")
+		self.assertEqual(self.closure(["pypi-app"], {"pypi-lib": "2.0"}),
+		                 [("pypi-app", "1.0")])
+		self.assertEqual(self.closure(["pypi-app"], {"pypi-lib": "1.9"}),
+		                 [("pypi-lib", "2.1"), ("pypi-app", "1.0")])
+		self.assertEqual(self.closure(["pypi-lib"], {"pypi-lib": "2.1"}),
+		                 [("pypi-lib", "2.1")])     # a root is always built
+
+	def test_extras_pull_in_their_requirements(self):
+		self.release("app", "1.0", ["lib[fast]"])
+		self.release("lib", "1.0", ["speedup; extra == 'fast'",
+		                            "slow; extra == 'other'"])
+		self.release("speedup", "3.0")
+		self.assertEqual(self.closure(["pypi-app"]),
+		                 [("pypi-speedup", "3.0"), ("pypi-lib", "1.0"),
+		                  ("pypi-app", "1.0")])
+
+	def test_a_disagreement_and_a_cycle_are_reported(self):
+		self.release("a", "1.0", ["lib<2", "b"])
+		self.release("b", "1.0", ["lib>=2"])
+		self.release("lib", "1.5")
+		self.release("lib", "2.5")
+		with self.assertRaises(RuntimeError) as cm:
+			self.closure(["pypi-a"])
+		self.assertIn("pypi-lib 1.5 was chosen for pypi-a", str(cm.exception))
+		self.release("x", "1.0", ["y"])
+		self.release("y", "1.0", ["x"])
+		with self.assertRaises(RuntimeError) as cm:
+			self.closure(["pypi-x"])
+		self.assertIn("cycle", str(cm.exception))
 
 	def test_a_member_outside_the_tree_is_refused(self):
 		f = self.sdist("evil", "1.0", extra=[("../escaped", "x")])

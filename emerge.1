@@ -165,6 +165,16 @@ upgrades will not silently clobber it.
 .B DEB_BUILD_OPTIONS
 is honoured and shown as USE flags. Requires deb-src entries and the apt
 backend.
+A
+.BI pypi- name
+atom with no Debian source is built from PyPI instead, with its
+.B pypi-
+dependencies, into
+.I /usr/lib/pypi
+beside the archive's
+.B python3-
+packages; its commands go to
+.IR /usr/lib/pypi/bin .
 .TP
 .BR --buildpkgonly ", " -B
 Build but do not install. Products are kept in

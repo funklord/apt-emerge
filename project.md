@@ -2111,13 +2111,66 @@ write surface ever needs testing.
      where the interpreter lacks it. Read live from pypi.org 2026-11-26:
      `tomli<2.3` chose and unpacked 2.2.1.
 
-     **Still to build**, in order: the closure (each `pypi-` dependency and the
-     extras `pypi_debian_files()` returns), the command-line spelling, and
-     driving it through the `-b` machinery. **Open, not decided:** an
-     entry point lands in `/usr/bin` under upstream's name, where a
-     Debian package of the same command (`black`) makes dpkg refuse the
-     install -- loud rather than silent, but a refusal; and an sdist with
-     compiled code needs `Architecture: any`, which the caller passes.
+     **`emerge -b pypi-<name>` builds it, closure and all.** A `pypi-` atom
+     the archive has no source package for goes to `pypi_closure()`, which
+     plans from PyPI's per-release JSON, dependencies first, leaves alone
+     an installed dependency its relations accept, follows extras, and
+     reports a release two dependents disagree about, or a cycle, rather
+     than searching around it. `-p` shows the plan as `[ebuild N]` lines;
+     `-B` builds without installing. The build fetches the sdist, writes
+     the `debian/`, runs `apt-get build-dep` on the directory and shares
+     the compile/collect/install tail with archive source builds
+     (`_compile_and_merge()`). Sources holding C, C++, Cython or Rust make
+     the package `Architecture: any`. Only the atom typed lands in @world;
+     dependencies are marked auto, as for archive builds.
+
+     **Commands go to `/usr/lib/pypi/bin` (`PYPI_BIN`), not `/usr/bin`.**
+     Decided 2026-11-26 from measurement, not taste: the first end-to-end
+     run built `pypi-charset-normalizer` with its `normalizer` in
+     `/usr/bin`, and idna's build then needed flit, which pulls the
+     archive's `python3-charset-normalizer` -- dpkg refused it for the
+     same file. A `pypi-` package owning anything in `/usr/bin` breaks the
+     coexistence the namespace exists for. Each command gets a line after
+     its shebang putting the tree first, so it runs with the versions it
+     was built against. It is not on PATH unless somebody puts it there.
+
+     **The archive's build backends are older than PyPI's metadata.**
+     urllib3 2.8.0 and requests 2.34.2 name `Programming Language ::
+     Python :: 3.15`, which trixie's `python3-trove-classifiers`
+     (2025.4.28) does not know, and both hatchling and setuptools refuse
+     the build over it. Classifiers are metadata only, so the generated
+     rules turn both checks off: hatchling's own switch, and for
+     setuptools a `debian/pypi-build/trove_classifiers.py` that will not
+     import, which sends its validator to the path that skips when the
+     network is off limits.
+
+     Proven 2026-11-26 in a `debian:trixie` container: `emerge -b
+     pypi-requests` planned and built five packages -- charset-normalizer
+     (compiled, `amd64`), idna, urllib3, certifi, requests -- installed
+     them beside the archive's `python3-requests` and
+     `python3-charset-normalizer` (pulled in by flit), put only
+     `pypi-requests` in @world, and `/usr/lib/pypi/bin/normalizer` ran the
+     `pypi-` version. The archive's `-b` path still passes as root
+     (`EMERGE_TESTS_REQUIRE_ALL=1`, 48 of 48).
+
+     **Open:**
+     - *What a plain `python3` imports.* The tree comes after
+       `dist-packages`, so with both installed `import requests` gives
+       the archive's 2.32.3, not the 2.34.2 just built. That is the
+       namespace doing its job for Debian's programs, and a surprise for
+       somebody who typed `emerge -b pypi-requests` to get the newer one
+       into their own scripts; only the `pypi-` commands see the tree
+       first. Whose call: the holder's, since it decides what the
+       feature is for.
+     - *Extras are built, not depended on.* `requests[socks]` builds
+       `pypi-pysocks`, but no Depends line says so (a relation cannot
+       name an extra), so `--depclean` could take it. The fix is to add
+       the extra's requirements to the dependent's own Depends.
+     - *Build backends newer than the archive's.* The classifier switch
+       covers the case met; a release needing a newer backend outright
+       fails in `apt-get build-dep` or the build. Building backends as
+       `pypi-` packages too is the general answer, not yet built.
+     - A dynamic `Requires-Dist`, a URL requirement and `===` are refused.
    - *Transitive closure size*, npm especially.
    - *apt backend only*, like `-b/-B`: it needs build tooling, and the dpkg
      backend is binary-only by design.
