@@ -422,8 +422,9 @@ def dpkg_cmp(a, b):
 
 try:
 	from packaging.version import Version as Pep440Version
+	from packaging.specifiers import SpecifierSet as PepSpecifierSet
 except ImportError:
-	Pep440Version = None
+	Pep440Version = PepSpecifierSet = None
 
 
 def zero_padded_apart(pa, pb):
@@ -530,6 +531,130 @@ class TestPep440ToDebian(unittest.TestCase):
 			da, db = em.pep440_to_debian(a), em.pep440_to_debian(b)
 			with self.subTest(a=a, b=b, da=da, db=db):
 				self.assertEqual(dpkg_cmp(da, db), want)
+
+
+class TestPypiNamespace(unittest.TestCase):
+	"""A package built from PyPI is pypi-<name> and depends only on other
+    pypi- packages (holder, 2026-11-26), so its Requires-Dist lines have to
+    become Debian relations that accept exactly what PEP 440 accepts."""
+
+	def holds(self, version, relations):
+		"""Every relation met, each `a | b` by one of its sides."""
+		deb = em.pep440_to_debian(version)
+		for relation in relations:
+			sides = re.findall(r"\((<<|<=|=|>=|>>) ([^)]+)\)", relation)
+			if relation.count("(") != len(sides) or not sides:
+				return None
+			if not any(em.meets(deb, o, v) for o, v in sides):
+				return False
+		return True
+
+	def test_names_are_pep503_names_in_the_namespace(self):
+		for name, want in [("PyYAML", "pypi-pyyaml"), ("zope.interface",
+		                   "pypi-zope-interface"), ("Foo__Bar-.baz",
+		                   "pypi-foo-bar-baz"), ("x", "pypi-x")]:
+			with self.subTest(name=name):
+				self.assertEqual(em.pypi_package_name(name), want)
+		for bad in ["", "-x", "x-", "a b", "a/b"]:
+			with self.subTest(bad=bad), self.assertRaises(ValueError):
+				em.pypi_package_name(bad)
+
+	def test_requirements_name_the_namespace_never_the_archive(self):
+		env = dict(em.pep508_environment(), python_version="3.13")
+		got = em.pypi_requirement("PyYAML>=5.1", env)
+		self.assertEqual(got, ("pypi-pyyaml", [], ["pypi-pyyaml (>= 5.1)"]))
+		got = em.pypi_requirement("requests[SOCKS, use_chardet] (>=2.28)", env)
+		self.assertEqual(got[:2], ("pypi-requests", ["socks", "use-chardet"]))
+		self.assertEqual(em.pypi_requirement("six", env),
+		                 ("pypi-six", [], ["pypi-six"]))
+		self.assertIsNone(em.pypi_requirement(
+			'tomli>=1.1; python_version < "3.11"', env))
+		self.assertIsNone(em.pypi_requirement('pytest; extra == "test"', env))
+		self.assertIsNotNone(em.pypi_requirement(
+			'pytest; extra == "Test"', dict(env, extra="test")))
+		for bad in ["x @ https://example.invalid/x.tar.gz", "x===1.0",
+		            "x>=1.0+local", "x~=1", "x==1.0rc1.*", "x; nonsense == '1'",
+		            "x; python_version <", "x>=banana"]:
+			with self.subTest(bad=bad), self.assertRaises(ValueError):
+				em.pypi_requirement(bad, env)
+
+	def test_markers(self):
+		env = dict(em.pep508_environment(), python_version="3.11",
+		           python_full_version="3.11.0", sys_platform="linux")
+		for marker, want in [
+			('python_version >= "3.11"', True),
+			('python_version < "3.9"', False),
+			('python_version > "3.9"', True),      # 3.11 > 3.9 as versions
+			('python_full_version >= "3.11"', True),   # 3.11.0 is 3.11
+			('python_version ~= "3.10"', True),
+			('sys_platform == "win32" or python_version >= "3"', True),
+			('(sys_platform == "win32" or python_version >= "3") and '
+			 'os_name == "nt"', env["os_name"] == "nt"),
+			('"linux" in sys_platform', True),
+			("'arm' not in sys_platform", True),
+		]:
+			with self.subTest(marker=marker):
+				self.assertEqual(em.pep508_marker(marker, env), want)
+
+	def test_a_less_than_takes_no_pre_release_of_its_own(self):
+		"""The two clauses that are not plain comparisons, by hand."""
+		lt = em.pypi_requirement("x<2.0", {})[2]
+		self.assertFalse(self.holds("2.0rc1", lt))
+		self.assertFalse(self.holds("2.0.dev1", lt))
+		self.assertTrue(self.holds("1.9.post3", lt))
+		lt_post = em.pypi_requirement("x<2.0.post1", {})[2]
+		self.assertFalse(self.holds("2.0rc1", lt_post))
+		self.assertTrue(self.holds("2.0", lt_post))
+		gt = em.pypi_requirement("x>2.0", {})[2]
+		self.assertFalse(self.holds("2.0.post1", gt))
+		self.assertTrue(self.holds("2.0.1", gt))
+		self.assertTrue(self.holds("2.1a1", gt))
+
+	@unittest.skipUnless(HAVE_DPKG, "dpkg is not available")
+	def test_dpkg_orders_the_sentinels_as_assumed(self):
+		"""`~~~` below every pre-release, `+post~` and `+postz` around every
+        post-release: the gaps above rest on these, so dpkg, not vercmp,
+        says so."""
+		order = ["1.0~~~", "1.0~~dev0", "1.0~a0~dev0", "1.0~rc9", "1.0",
+		         "1.0+post~", "1.0+post0~dev0", "1.0+post99", "1.0+postz",
+		         "1.0.0~~dev0", "1.0.1~~~"]
+		for a, b in zip(order, order[1:]):
+			with self.subTest(a=a, b=b):
+				self.assertEqual(dpkg_cmp(a, b), -1)
+
+	@unittest.skipUnless(Pep440Version, "python3-packaging is not installed")
+	def test_generated_specifiers_accept_what_pep440_accepts(self):
+		"""Against packaging's SpecifierSet, the reference implementation,
+        with pre-releases allowed: a built pre-release is a choice already
+        made. Pairs apart only by trailing zeros are skipped, as for the
+        versions themselves."""
+		rnd = random.Random(20261128)
+		versions = TestPep440ToDebian.versions(None, rnd, 200)
+		ops = ["<", "<=", ">", ">=", "==", "!=", "~=", "==*", "!=*"]
+		checked = 0
+		for _ in range(6000):
+			op, spec, v = rnd.choice(ops), rnd.choice(versions), rnd.choice(versions)
+			ps, pv = Pep440Version(spec), Pep440Version(v)
+			if zero_padded_apart(ps, pv):
+				continue
+			if op.endswith("*"):
+				spec = ".".join(map(str, ps.release[:rnd.randint(1, len(ps.release))]))
+				if zero_padded_apart(Pep440Version(spec), pv) or \
+				   len(pv.release) < len(Pep440Version(spec).release):
+					continue
+				op, spec = op[:2], spec + ".*"
+			elif op == "~=" and len(ps.release) < 2:
+				continue
+			elif (op == ">" and not ps.is_postrelease and pv.is_postrelease
+			      and pv.pre is not None
+			      and pv.base_version == ps.base_version):
+				continue                # the case _specifier_to_debian admits
+			want = PepSpecifierSet(op + spec).contains(v, prereleases=True)
+			got = self.holds(v, em.pypi_requirement(f"x{op}{spec}", {})[2])
+			with self.subTest(v=v, spec=op + spec):
+				self.assertEqual(got, want)
+			checked += 1
+		self.assertGreater(checked, 3000)
 
 
 class TestMeets(unittest.TestCase):

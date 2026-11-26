@@ -451,6 +451,298 @@ def pep440_to_debian(version):
 		out += f"~dev{n}" if (m["pre"] or m["post"]) else f"~~dev{n}"
 	return out
 
+# A Python package built here is called pypi-<name>, never python3-<name>
+# (holder, 2026-11-26): python3-<name> is the archive's, and a self-built
+# one shadowing Debian's is the mess PEP 668 exists to stop. The name is
+# PEP 503's normalised form, which is what PyPI itself treats as the same
+# project -- PyYAML, pyyaml and py.yaml are one -- and happens to be a
+# legal Debian package name already: lowercase letters, digits, hyphens.
+_PYPI_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+
+def pypi_package_name(name):
+	"""The Debian package a PyPI project is built as: `pypi-` and its
+	PEP 503 name. Refuses what PyPI would not accept as a project name."""
+	if not _PYPI_NAME.fullmatch(name):
+		raise ValueError(f"not a PyPI project name: {name!r}")
+	return "pypi-" + re.sub(r"[-_.]+", "-", name).lower()
+
+def _pep440_split(version):
+	"""(Debian form, Debian form of its epoch and release alone, is a pre-
+	or dev release, is a post-release) -- what a specifier needs to know."""
+	m = _PEP440.fullmatch(version.strip())
+	if not m or m["local"]:
+		pep440_to_debian(version)       # raises, with its reason
+	base = m["release"]
+	if m["epoch"] is not None:
+		base = f"{int(m['epoch'])}:{base}"
+	return (pep440_to_debian(version), base,
+	        bool(m["pre"] or m["dev"]), bool(m["post"]))
+
+def _wildcard_bounds(prefix):
+	"""`==1.2.*` as a half-open Debian range: [1.2~~~, 1.3~~~). `~~~` sorts
+	below `~~dev0`, the lowest thing pep440_to_debian writes, so the range
+	takes in every pre-, dev- and post-release of the prefix."""
+	m = re.fullmatch(r"(?:([0-9]+)!)?([0-9]+(?:\.[0-9]+)*)", prefix.strip())
+	if not m:
+		raise ValueError(f"a wildcard follows a release only: {prefix!r}.*")
+	epoch = f"{int(m[1])}:" if m[1] is not None else ""
+	parts = m[2].split(".")
+	upper = parts[:-1] + [str(int(parts[-1]) + 1)]
+	return f"{epoch}{m[2]}~~~", f"{epoch}{'.'.join(upper)}~~~"
+
+_SPECIFIER = re.compile(r"\s*(~=|===|==|!=|<=|>=|<|>)\s*([^\s,]+)\s*")
+
+def _specifier_to_debian(package, op, version):
+	"""One PEP 440 clause as Debian relations, every one of which must hold.
+
+	Two clauses are not a plain comparison, and PEP 440 says why: `<V`
+	takes in no pre-release of V's release, and `>V` no post-release of
+	it, unless V is one itself. Debian has no "and not", so the gap is an
+	alternative: `x (<< 1.0~~~) | x (>= 1.0)` is everything but 1.0's
+	pre-releases. `+post~` sorts below every post-release and `+postz`
+	above them, as `~~~` does below every pre-release.
+
+	"Post-release of V" is read as pip reads it, through packaging: any
+	post-release sharing V's epoch and release, so `>1.0a1` refuses
+	1.0.post1. One case cannot follow: packaging refuses 1.0b1.post1 too,
+	and a post-release of a pre-release sorts between pre-releases, so no
+	run of ranges excludes them all. It is admitted here -- a version
+	nobody publishes, against a clause that would have to name 1.0's
+	own pre-release to meet it."""
+	rel = lambda o, v: f"{package} ({o} {v})"
+	if op == "===":
+		raise ValueError(f"arbitrary equality has no Debian form: ==={version}")
+	if op in ("==", "!=") and version.endswith(".*"):
+		low, high = _wildcard_bounds(version[:-2])
+		if op == "==":
+			return [rel(">=", low), rel("<<", high)]
+		return [f"{rel('<<', low)} | {rel('>=', high)}"]
+	if op == "~=":
+		release = _PEP440.fullmatch(version.strip())
+		if not release or "." not in release["release"]:
+			raise ValueError(f"~= needs two release numbers: ~={version}")
+		prefix = release["release"].rsplit(".", 1)[0]
+		if release["epoch"] is not None:
+			prefix = f"{int(release['epoch'])}!{prefix}"
+		return (_specifier_to_debian(package, ">=", version)
+		        + _specifier_to_debian(package, "==", prefix + ".*"))
+	deb, base, pre, post = _pep440_split(version)
+	if op == "==":
+		return [rel("=", deb)]
+	if op == "!=":
+		return [f"{rel('<<', deb)} | {rel('>>', deb)}"]
+	if op == "<=":
+		return [rel("<=", deb)]
+	if op == ">=":
+		return [rel(">=", deb)]
+	if op == "<" and deb == base:
+		return [rel("<<", base + "~~~")]
+	if op == ">" and deb == base:
+		return [rel(">=", base + "+postz")]
+	if op == "<":
+		out = [rel("<<", deb)]
+		if not pre:
+			out.append(f"{rel('<<', base + '~~~')} | {rel('>=', base)}")
+		return out
+	out = [rel(">>", deb)]                  # op == ">"
+	if not post:
+		out.append(f"{rel('<<', base + '+post~')} | {rel('>=', base + '+postz')}")
+	return out
+
+def pep508_environment():
+	"""PEP 508's marker variables for the interpreter running this, which
+	is the system's python3: what a package built here is built for."""
+	import platform
+	impl = sys.implementation
+	iv = impl.version
+	impl_version = f"{iv.major}.{iv.minor}.{iv.micro}"
+	if iv.releaselevel != "final":
+		impl_version += iv.releaselevel[0] + str(iv.serial)
+	return {
+		"os_name": os.name, "sys_platform": sys.platform,
+		"platform_machine": platform.machine(),
+		"platform_python_implementation": platform.python_implementation(),
+		"platform_release": platform.release(),
+		"platform_system": platform.system(),
+		"platform_version": platform.version(),
+		"python_version": "%d.%d" % sys.version_info[:2],
+		"python_full_version": platform.python_version(),
+		"implementation_name": impl.name,
+		"implementation_version": impl_version,
+		"extra": "",
+	}
+
+_MARKER_TOKEN = re.compile(r"""\s*(?:
+	(?P<op>~=|===|==|!=|<=|>=|<|>|\(|\))
+	|(?P<str>'[^']*'|"[^"]*")
+	|(?P<word>[A-Za-z_][A-Za-z0-9_.]*)
+	)""", re.VERBOSE)
+
+def _marker_version_key(v):
+	"""A version as dpkg would sort it, trailing zeros dropped: here they
+	ARE the same release, `python_full_version >= "3.11"` on 3.11.0."""
+	m = _PEP440.fullmatch(v.strip())
+	if not m or m["local"]:
+		return None
+	release = m["release"].split(".")
+	while len(release) > 1 and int(release[-1]) == 0:
+		release.pop()
+	return pep440_to_debian(".".join(release) + v.strip()[m.end("release"):])
+
+def pep508_marker(text, env):
+	"""Evaluate a PEP 508 environment marker against `env`. Versions on
+	both sides compare as PEP 440 versions, anything else as strings, as
+	the PEP says; an unknown variable or a malformed marker is an error,
+	not False -- a requirement dropped by a typo is a missing dependency
+	nobody sees until the import fails."""
+	tokens, pos = [], 0
+	text = text.strip()
+	while pos < len(text):
+		m = _MARKER_TOKEN.match(text, pos)
+		if not m or m.end() == pos:
+			raise ValueError(f"malformed marker: {text!r}")
+		pos = m.end()
+		if m["op"]:
+			tokens.append(("op", m["op"]))
+		elif m["str"]:
+			tokens.append(("str", m["str"][1:-1]))
+		elif m["word"] in ("and", "or", "in", "not"):
+			tokens.append(("op", m["word"]))
+		else:
+			if m["word"] not in env:
+				raise ValueError(f"unknown marker variable {m['word']!r}")
+			tokens.append(("var", m["word"]))
+	i = 0
+
+	def take(kind=None, value=None):
+		nonlocal i
+		if i >= len(tokens) or (kind and tokens[i][0] != kind) \
+		   or (value and tokens[i][1] != value):
+			raise ValueError(f"malformed marker: {text!r}")
+		i += 1
+		return tokens[i - 1]
+
+	def peek(value):
+		return i < len(tokens) and tokens[i] == ("op", value)
+
+	def value():
+		kind, v = take()
+		if kind == "var":
+			return v, env[v]
+		if kind == "str":
+			return None, v
+		raise ValueError(f"malformed marker: {text!r}")
+
+	def compare(left, op, right, var):
+		if var == "extra":              # PEP 685: extras compare normalised
+			left, right = (re.sub(r"[-_.]+", "-", s).lower() for s in (left, right))
+		if op == "in":
+			return left in right
+		if op == "not in":
+			return left not in right
+		lk, rk = _marker_version_key(left), _marker_version_key(right)
+		if lk is not None and rk is not None and op != "===":
+			if op == "~=":
+				return bool(_specifier_holds(left, op, right))
+			r = vercmp(lk, rk)
+			return {"==": r == 0, "!=": r != 0, "<": r < 0, "<=": r <= 0,
+			        ">": r > 0, ">=": r >= 0}[op]
+		if op in ("==", "==="):
+			return left == right
+		if op == "!=":
+			return left != right
+		if op in ("<", "<=", ">", ">="):
+			return {"<": left < right, "<=": left <= right,
+			        ">": left > right, ">=": left >= right}[op]
+		raise ValueError(f"{op} needs versions: {left!r} {op} {right!r}")
+
+	def atom():
+		if peek("("):
+			take("op", "(")
+			r = disjunction()
+			take("op", ")")
+			return r
+		lvar, left = value()
+		kind, op = take("op")
+		if op == "not":
+			take("op", "in")
+			op = "not in"
+		rvar, right = value()
+		return compare(left, op, right, lvar or rvar)
+
+	def conjunction():
+		r = atom()
+		while peek("and"):
+			take()
+			r = atom() and r
+		return r
+
+	def disjunction():
+		r = conjunction()
+		while peek("or"):
+			take()
+			r = conjunction() or r
+		return r
+
+	result = disjunction()
+	if i != len(tokens):
+		raise ValueError(f"malformed marker: {text!r}")
+	return result
+
+def _specifier_holds(version, op, spec):
+	"""Does a PEP 440 version satisfy one clause? Answered the way the
+	package would be judged once built: translate both and ask dpkg's
+	order, so the two can never disagree."""
+	package = "x"
+	have = pep440_to_debian(version)
+	for relation in _specifier_to_debian(package, op, spec):
+		if not any(meets(have, o, v) for o, v in
+		           re.findall(r"\((<<|<=|=|>=|>>) ([^)]+)\)", relation)):
+			return False
+	return True
+
+_REQUIREMENT = re.compile(r"""\s*
+	(?P<name>[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\s*
+	(?:\[(?P<extras>[^\]]*)\])?\s*
+	(?P<rest>[^;]*?)\s*
+	(?:;(?P<marker>.*))?$""", re.VERBOSE | re.DOTALL)
+
+def pypi_requirement(text, env=None):
+	"""A PEP 508 requirement -- a `Requires-Dist:` line -- as Debian
+	relations on the pypi- namespace: (package, extras, [relation, ...]),
+	or None when its marker excludes it here.
+
+	Every requirement names a pypi- package, never the archive's python3-
+	one. That is what the namespace buys: no table from PyPI names to
+	Debian's (PyYAML is python3-yaml there), and nothing Debian upgrades
+	can move under a package built from PyPI. The extras are returned
+	rather than expressed -- a Debian relation cannot ask for one -- so
+	whoever builds the closure pulls in what they require.
+
+	Refused rather than guessed: a URL requirement, which no index
+	versions, and `===`, which compares strings dpkg does not have."""
+	env = pep508_environment() if env is None else env
+	m = _REQUIREMENT.fullmatch(text)
+	if not m:
+		raise ValueError(f"not a PEP 508 requirement: {text!r}")
+	if m["marker"] is not None and not pep508_marker(m["marker"], env):
+		return None
+	package = pypi_package_name(m["name"])
+	extras = [re.sub(r"[-_.]+", "-", e.strip()).lower()
+	          for e in (m["extras"] or "").split(",") if e.strip()]
+	rest = m["rest"]
+	if rest.startswith("@"):
+		raise ValueError(f"a URL requirement is not on an index: {text!r}")
+	if rest.startswith("(") and rest.endswith(")"):
+		rest = rest[1:-1]
+	relations = []
+	for clause in filter(None, (c.strip() for c in rest.split(","))):
+		s = _SPECIFIER.fullmatch(clause)
+		if not s:
+			raise ValueError(f"not a version specifier: {clause!r} in {text!r}")
+		relations += _specifier_to_debian(package, s[1], s[2])
+	return package, extras, relations or [package]
+
 def _dep_ok(alt, inst, chosen, iprov, provides_of):
 	"""Is a single dependency alternative (name, op, ver) already satisfied
     by an installed or already-chosen package (or a Provides of one)?

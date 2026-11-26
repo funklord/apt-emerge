@@ -2028,6 +2028,30 @@ write surface ever needs testing.
    **The hard parts, none of them optional:**
    - *Name mapping.* PyPI `PyYAML` is Debian `python3-yaml`. Either keep a
      mapping or vendor everything and accept the duplication.
+     **Settled 2026-11-26 by the namespace below: no mapping for what a
+     package needs at run time.** It is built as `pypi-<PEP 503 name>`
+     (`pypi_package_name()`: `PyYAML` is `pypi-pyyaml`, `zope.interface`
+     `pypi-zope-interface`) and every `Requires-Dist` becomes a relation on
+     another `pypi-` package (`pypi_requirement()`), never on the
+     archive's. Nothing Debian upgrades can then move under it. What a
+     *build* needs is still Debian's: dh-python runs the build backend
+     from the system, so `Build-Depends` maps `build-system.requires` --
+     `python3-<name>` for setuptools, hatchling, poetry-core, pdm-backend,
+     maturin, scikit-build-core, wheel, setuptools-scm and hatch-vcs, and
+     `flit` for `flit_core` (re-measured against trixie 2026-11-26).
+
+     The specifiers translate clause by clause through
+     `pep440_to_debian()`, and two are not plain comparisons: `<V` takes no
+     pre-release of V's release and `>V` no post-release of it, which
+     Debian can only say as an alternative (`x (<< 1.0~~~) | x (>= 1.0)`).
+     "Of V" is read as pip reads it, by epoch and release; the one case
+     that cannot follow is a post-release of a pre-release under `>V`,
+     admitted because no run of ranges excludes it. Markers are evaluated
+     against the system `python3` (`pep508_marker()`); an unknown variable
+     is an error, not False, since a requirement dropped by a typo is a
+     missing dependency. `TestPypiNamespace` holds the translation to
+     `packaging`'s `SpecifierSet` over generated pairs; dropping either
+     gap fails it.
    - *Version translation.* **Done 2026-11-26: `pep440_to_debian()`**,
      beside `vercmp`. PEP 440 `1.0.0rc1` must become `1.0.0~rc1` or it
      sorts **above** the final release — measured above, not feared. `~`
@@ -2046,6 +2070,12 @@ write surface ever needs testing.
      Debian's is no better than pip's mess. Needs a namespace
      (`pypi-requests`) or strict Provides/Conflicts, plus the existing
      `+local1` bump so `@world` will not clobber it.
+     **Settled 2026-11-26 (holder): the `pypi-` namespace.** A name does
+     not keep files apart, though: `pypi-requests` and `python3-requests`
+     both want `/usr/lib/python3/dist-packages/requests`, and dpkg refuses
+     the second. So the next step, the generated `debian/`, has to install
+     into a tree of its own, and the same holds for an entry point in
+     `/usr/bin`. Not yet built.
    - *Transitive closure size*, npm especially.
    - *apt backend only*, like `-b/-B`: it needs build tooling, and the dpkg
      backend is binary-only by design.
