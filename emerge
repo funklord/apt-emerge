@@ -812,7 +812,8 @@ def _pypi_build_package(requirement, env):
 	name = pypi_package_name(m["name"])[len("pypi-"):]
 	return _PYPI_BUILD_PACKAGES.get(name, f"python3-{name}")
 
-def pypi_debian_files(meta, arch="all", env=None, when=None):
+def pypi_debian_files(meta, arch="all", env=None, when=None,
+                      extra_requires=None):
 	"""The debian/ directory that builds `meta` as a pypi- package with
 	dh-python: {path under debian/: content}. `arch` is `any` where the
 	sdist compiles something; dh-python does the rest either way.
@@ -820,7 +821,13 @@ def pypi_debian_files(meta, arch="all", env=None, when=None):
 	Versions in build-system.requires are not carried over: the build
 	runs the archive's backend whatever it is, and a bound it cannot meet
 	is better found by the backend than turned into an unbuildable
-	package. Run-time requirements are translated exactly."""
+	package. Run-time requirements are translated exactly.
+
+	A requirement naming an extra (`requests[socks]`) cannot say so in a
+	relation, so the extra's own requirements become this package's: with
+	`extra_requires`, a callable giving a pypi- package's Requires-Dist,
+	each line that only the extra switches on is added here. Without it,
+	`--depclean` would see nothing holding pypi-pysocks and take it."""
 	env = pep508_environment() if env is None else env
 	package = pypi_package_name(meta["name"])
 	version = pep440_to_debian(meta["version"])
@@ -832,6 +839,15 @@ def pypi_debian_files(meta, arch="all", env=None, when=None):
 			depends += got[2]
 			if got[1]:
 				extras[got[0]] = got[1]
+	for dependency, names in extras.items():
+		for line in (extra_requires(dependency) if extra_requires else []):
+			if pypi_requirement(line, dict(env, extra="")):
+				continue                # the dependency's own, not the extra's
+			for extra in names:
+				got = pypi_requirement(line, dict(env, extra=extra))
+				if got:
+					depends += [r for r in got[2] if r not in depends]
+					break
 	build = ["debhelper-compat (= 13)", "dh-python",
 	         "pybuild-plugin-pyproject", "python3-all"]
 	for line in meta["requires_build"]:
@@ -3827,6 +3843,29 @@ class AptBackend:
 		print(f"{ARROW} Completed ({i} of {total}) {BGREEN(pv)}")
 		return True
 
+	def _pypi_requires(self, package):
+		"""A pypi- package's Requires-Dist: from the release this run
+		chose, or else from the METADATA of the one installed."""
+		for p, version, *_ in getattr(self, "_pypi_plan", []):
+			if p == package:
+				return pypi_release_requires(p[len("pypi-"):], version)
+		import email.parser
+		normal = package[len("pypi-"):].replace("-", "_")
+		try:
+			names = os.listdir(PYPI_TREE)
+		except OSError:
+			return []
+		for d in names:
+			if (d.endswith(".dist-info")
+			    and re.sub(r"[-_.]+", "_",
+			               d[:-len(".dist-info")].rsplit("-", 1)[0]).lower()
+			        == normal):
+				with open(os.path.join(PYPI_TREE, d, "METADATA"),
+				          encoding="utf-8") as f:
+					info = email.parser.Parser().parse(f, headersonly=True)
+				return info.get_all("Requires-Dist") or []
+		return []
+
 	def _build_pypi(self, entry, env, use, opts, i, total):
 		"""Fetch a PyPI sdist, give it the debian/ pypi_debian_files()
 		writes, and build it as -b builds an archive source package."""
@@ -3850,7 +3889,8 @@ class AptBackend:
 				       or n == "Cargo.toml" for n in names):
 					arch = "any"
 					break
-			files, _ = pypi_debian_files(meta, arch)
+			files, _ = pypi_debian_files(meta, arch,
+			                             extra_requires=self._pypi_requires)
 		except (RuntimeError, ValueError, OSError) as e:
 			efail(e)
 			sys.exit(1)

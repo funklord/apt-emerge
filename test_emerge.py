@@ -29,6 +29,7 @@ import importlib.util
 import io
 import itertools
 import json
+from unittest import mock
 import os
 import pty
 import random
@@ -721,6 +722,21 @@ class TestPypiDebianFiles(unittest.TestCase):
 				with self.subTest(line=line):
 					self.assertTrue(line.startswith("\t"))
 
+	def test_an_extra_s_requirements_become_this_package_s(self):
+		meta = {"name": "app", "version": "1.0", "summary": "",
+		        "requires_dist": ["requests[socks]>=2"], "requires_build": []}
+		requests_requires = ["urllib3<3", "PySocks>=1.5.6; extra == 'socks'",
+		                     "chardet; extra == 'use-chardet'"]
+		files, _ = em.pypi_debian_files(
+			meta, env=self.env,
+			extra_requires={"pypi-requests": requests_requires}.get)
+		depends = re.search(r"^Depends: (.*)$", files["control"], re.M)[1]
+		self.assertIn("pypi-pysocks (>= 1.5.6)", depends)
+		self.assertNotIn("urllib3", depends)    # requests' own, not the extra's
+		self.assertNotIn("chardet", depends)
+		files, _ = em.pypi_debian_files(meta, env=self.env)
+		self.assertNotIn("pysocks", files["control"])
+
 	def test_no_pyproject_means_setuptools(self):
 		meta = em.pypi_sdist_metadata(self.sdist(
 			"Metadata-Version: 2.1\nName: old\nVersion: 1.0\n"))
@@ -857,6 +873,19 @@ class TestPypiFetch(unittest.TestCase):
 		with self.assertRaises(RuntimeError) as cm:
 			self.closure(["pypi-x"])
 		self.assertIn("cycle", str(cm.exception))
+
+	def test_requires_of_an_installed_package_come_from_its_metadata(self):
+		tree = os.path.join(self.root, "tree")
+		info = os.path.join(tree, "PySocks-1.7.1.dist-info")
+		os.makedirs(info)
+		with open(os.path.join(info, "METADATA"), "w") as f:
+			f.write("Metadata-Version: 2.1\nName: PySocks\nVersion: 1.7.1\n"
+			        "Requires-Dist: win-inet-pton; sys_platform == 'win32'\n")
+		be = em.AptBackend.__new__(em.AptBackend)
+		with mock.patch.object(em, "PYPI_TREE", tree):
+			self.assertEqual(be._pypi_requires("pypi-pysocks"),
+			                 ["win-inet-pton; sys_platform == 'win32'"])
+			self.assertEqual(be._pypi_requires("pypi-absent"), [])
 
 	def test_a_member_outside_the_tree_is_refused(self):
 		f = self.sdist("evil", "1.0", extra=[("../escaped", "x")])

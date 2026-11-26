@@ -2162,10 +2162,12 @@ write surface ever needs testing.
        into their own scripts; only the `pypi-` commands see the tree
        first. Whose call: the holder's, since it decides what the
        feature is for.
-     - *Extras are built, not depended on.* `requests[socks]` builds
-       `pypi-pysocks`, but no Depends line says so (a relation cannot
-       name an extra), so `--depclean` could take it. The fix is to add
-       the extra's requirements to the dependent's own Depends.
+     - ~~*Extras are built, not depended on.*~~ **Fixed 2026-11-26:** a
+       requirement naming an extra adds the extra's own requirements to
+       the dependent's Depends (`requests[socks]` gives the dependent
+       `pypi-pysocks`), read from the release this run chose or else
+       from the installed `dist-info/METADATA`. Shown by unit tests only;
+       no container run met a real extra.
      - *Build backends newer than the archive's.* The classifier switch
        covers the case met; a release needing a newer backend outright
        fails in `apt-get build-dep` or the build. Building backends as
