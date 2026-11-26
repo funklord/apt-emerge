@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="630" height="248" viewBox="0 0 630 248" role="img">
+<title>emerge -pv -b pypi-requests</title>
+<rect width="100%" height="100%" rx="6" fill="#1e1e1e"/>
+<g font-family="DejaVu Sans Mono, Menlo, Consolas, monospace" font-size="14">
+<text x="16" y="30" xml:space="preserve"><tspan fill="#23d18b" font-weight="bold">$ </tspan><tspan fill="#d4d4d4" font-weight="bold">emerge -pv -b pypi-requests</tspan></text>
+<text x="16" y="48" xml:space="preserve"><tspan fill="#d4d4d4">Calculating dependencies... </tspan><tspan fill="#0dbc79">done!</tspan></text>
+<text x="16" y="66" xml:space="preserve"></text>
+<text x="16" y="84" xml:space="preserve"><tspan fill="#d4d4d4">These are the packages that would be merged, in order:</tspan></text>
+<text x="16" y="102" xml:space="preserve"></text>
+<text x="16" y="120" xml:space="preserve"><tspan fill="#d4d4d4">[</tspan><tspan fill="#0dbc79">ebuild</tspan><tspan fill="#d4d4d4">  </tspan><tspan fill="#0dbc79">N</tspan><tspan fill="#d4d4d4">    ] </tspan><tspan fill="#23d18b" font-weight="bold">pypi-charset-normalizer-3.5.3</tspan><tspan fill="#d4d4d4"> USE=&quot;</tspan><tspan fill="#f14c4c" font-weight="bold">nocheck parallel=24</tspan><tspan fill="#d4d4d4">&quot;</tspan></text>
+<text x="16" y="138" xml:space="preserve"><tspan fill="#d4d4d4">[</tspan><tspan fill="#0dbc79">ebuild</tspan><tspan fill="#d4d4d4">  </tspan><tspan fill="#0dbc79">N</tspan><tspan fill="#d4d4d4">    ] </tspan><tspan fill="#23d18b" font-weight="bold">pypi-idna-3.20</tspan><tspan fill="#d4d4d4"> USE=&quot;</tspan><tspan fill="#f14c4c" font-weight="bold">nocheck parallel=24</tspan><tspan fill="#d4d4d4">&quot;</tspan></text>
+<text x="16" y="156" xml:space="preserve"><tspan fill="#d4d4d4">[</tspan><tspan fill="#0dbc79">ebuild</tspan><tspan fill="#d4d4d4">  </tspan><tspan fill="#0dbc79">N</tspan><tspan fill="#d4d4d4">    ] </tspan><tspan fill="#23d18b" font-weight="bold">pypi-urllib3-2.8.0</tspan><tspan fill="#d4d4d4"> USE=&quot;</tspan><tspan fill="#f14c4c" font-weight="bold">nocheck parallel=24</tspan><tspan fill="#d4d4d4">&quot;</tspan></text>
+<text x="16" y="174" xml:space="preserve"><tspan fill="#d4d4d4">[</tspan><tspan fill="#0dbc79">ebuild</tspan><tspan fill="#d4d4d4">  </tspan><tspan fill="#0dbc79">N</tspan><tspan fill="#d4d4d4">    ] </tspan><tspan fill="#23d18b" font-weight="bold">pypi-certifi-2026.11.20</tspan><tspan fill="#d4d4d4"> USE=&quot;</tspan><tspan fill="#f14c4c" font-weight="bold">nocheck parallel=24</tspan><tspan fill="#d4d4d4">&quot;</tspan></text>
+<text x="16" y="192" xml:space="preserve"><tspan fill="#d4d4d4">[</tspan><tspan fill="#0dbc79">ebuild</tspan><tspan fill="#d4d4d4">  </tspan><tspan fill="#0dbc79">N</tspan><tspan fill="#d4d4d4">    ] </tspan><tspan fill="#23d18b" font-weight="bold">pypi-requests-2.34.2</tspan><tspan fill="#d4d4d4"> USE=&quot;</tspan><tspan fill="#f14c4c" font-weight="bold">nocheck parallel=24</tspan><tspan fill="#d4d4d4">&quot;</tspan></text>
+<text x="16" y="210" xml:space="preserve"></text>
+<text x="16" y="228" xml:space="preserve"><tspan fill="#d4d4d4">Total: 5 packages (0 upgrades, 5 new)</tspan></text>
+</g>
+</svg>

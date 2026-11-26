@@ -57,7 +57,7 @@ ALIASES = dispatch-conf etc-update
 
 .PHONY: all check check-unit check-integration check-isolation check-tty \
         style style-source style-tool style-docs install uninstall deb clean \
-        version-check help test veryclean distclean hooks
+        version-check help test veryclean distclean hooks screenshots
 
 all:
 	@:
@@ -77,6 +77,7 @@ help:
 	@echo '  install     install into $$(DESTDIR)$$(prefix)'
 	@echo '  deb         build a binary package into $$(BUILD_DIR)'
 	@echo '  clean       remove build products'
+	@echo '  screenshots the README picture, from real pretend runs'
 
 # -- tests -------------------------------------------------------------------
 
@@ -322,6 +323,12 @@ distclean: veryclean
 # returns the MAIN repository's hooks directory -- which is the one git
 # actually runs.
 #
+# The README's picture: real `emerge -p` runs under a pty, rendered as
+# SVG into doc/screenshot/. Pretend only, so no root; it asks this
+# machine's apt and PyPI, so run it when the output changes, not per build.
+screenshots:
+	$(PYTHON) tool/screenshot.py
+
 # git's absence is reported as its own thing rather than as "not a git
 # repository", which would be a message naming a cause nothing tested.
 hooks:

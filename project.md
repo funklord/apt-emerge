@@ -20,6 +20,8 @@ installed.
 | `code-style.md` | copy of the global style source, plus this project's own |
 | `tool/style_gate.py` | the shared indentation gate, copied verbatim |
 | `tool/hooks/commit-msg` | the shared commit-msg hook; `make hooks` installs it |
+| `tool/screenshot.py` | `make screenshots`: real `emerge -p` runs under a pty, rendered as SVG |
+| `doc/screenshot/` | the README's picture, committed; replaced when the output changes |
 | `.style-gate.toml` | the gate's scope here, see `code-style.md` |
 | `LICENSE` | GPL-3, verbatim from `/usr/share/common-licenses/GPL-3` |
 | `.github/workflows/tests.yml` | CI: interpreters, Debian, package, style, stdlib-only |
