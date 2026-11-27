@@ -803,6 +803,28 @@ class TestPypiDebianFiles(unittest.TestCase):
 		control = em.pypi_debian_files(meta, env=self.env)[0]["control"]
 		self.assertNotIn("cargo", control)
 
+	def test_a_backend_from_pypi_runs_its_own_commands(self):
+		# maturin's module runs the `maturin` command it installed.
+		meta = {"name": "x", "version": "1", "summary": "",
+		        "requires_dist": [], "requires_build": ["maturin>=1.9"]}
+		rules = em.pypi_debian_files(meta, "any", env=self.env,
+		                             from_pypi=["maturin>=1.9"])[0]["rules"]
+		self.assertIn(f"\nexport PATH := {em.PYPI_BIN}:$(PATH)\n", rules)
+		rules = em.pypi_debian_files(meta, "any", env=self.env)[0]["rules"]
+		self.assertNotIn("PATH :=", rules)
+
+	def test_the_sdists_egg_info_survives_the_clean(self):
+		# setuptools finds its own egg_info command in it; dh-python's
+		# clean would delete it.
+		meta = {"name": "setuptools", "version": "84.2.1", "summary": "",
+		        "requires_dist": [], "requires_build": []}
+		rules = em.pypi_debian_files(meta, env=self.env)[0]["rules"]
+		recipe = re.search(r"^override_dh_auto_clean:\n((?:\t.*\n)*)",
+		                   rules, re.M)
+		self.assertIsNotNone(recipe, rules)
+		self.assertNotIn("dh_auto_clean", recipe[1])
+		self.assertNotIn("egg", recipe[1])
+
 	def test_the_rust_version_an_sdist_needs(self):
 		with tempfile.TemporaryDirectory() as tree:
 			self.assertIsNone(em.pypi_rust_version(tree))

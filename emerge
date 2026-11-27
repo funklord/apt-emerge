@@ -1017,6 +1017,14 @@ def pypi_debian_files(meta, arch="all", env=None, when=None,
 	                  "export HATCH_METADATA_CLASSIFIERS_NO_VERIFY=1\n"
 	                  "export VALIDATE_PYPROJECT_NO_NETWORK=1\n"
 	                  f"export PYTHONPATH={build_path}\n"
+	                  # Backends built from PyPI import from PYPI_TREE, and
+	                  # their commands run from PYPI_BIN, ahead of the
+	                  # archive's: maturin's module runs the `maturin` it
+	                  # installed, which was on no PATH (rpds-py,
+	                  # 2026-11-27) -- and would have been the archive's
+	                  # older one wherever python3-maturin is installed.
+	                  + (f"export PATH := {PYPI_BIN}:$(PATH)\n"
+	                     if from_pypi else "") +
 	                  f"export PYBUILD_DESTDIR=debian/{package}\n"
 	                  + (abi_rules if arch == "any" else "")
 	                  + (rust_rules if rust else "") +
@@ -1041,6 +1049,17 @@ def pypi_debian_files(meta, arch="all", env=None, when=None,
 	                  f"\t    mv \"$$f\" {d}{PYPI_BIN}/ || exit 1; \\\n"
 	                  f"\t  done && rmdir {d}/usr/bin; \\\n"
 	                  "\tfi\n"
+	                  # dh-python's clean deletes every *.egg-info, and an
+	                  # sdist setuptools made ships one. setuptools needs
+	                  # its own: it finds the egg_info command through the
+	                  # entry points listed there, so with no
+	                  # python3-setuptools installed 84.2.1 stopped at
+	                  # "invalid command 'egg_info'" (trixie, 2026-11-27).
+	                  # Debian's setuptools package skips dh_auto_clean for
+	                  # the same reason. The tree is a fresh unpack, so
+	                  # nothing the build made is there to clean.
+	                  "override_dh_auto_clean:\n"
+	                  "\trm -rf .pybuild\n"
 	                  "override_dh_auto_test:\n"),
 	        }, extras
 

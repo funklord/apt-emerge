@@ -2232,12 +2232,23 @@ write surface ever needs testing.
        states rustc 1.85. pip-audit still cannot be built there:
        cachecontrol 0.15.0 wants uv_build >= 0.9.6, and every such
        release wants rustc 1.91 or newer.
-     - **Open: setuptools does not build from its own sdist.**
-       `emerge -b pypi-setuptools` (84.2.1, trixie) fails with
-       `error: invalid command 'egg_info'` -- setuptools is its own
-       backend, and Debian bootstraps it specially. It is what stops
-       rpds-py now: maturin 1.11.5 needs a newer setuptools than
-       trixie's, so the plan builds one from PyPI and fails there.
+     - ~~*setuptools does not build from its own sdist.*~~ **Fixed
+       2026-11-27.** setuptools finds its `egg_info` command through
+       the entry points in the `setuptools.egg-info` its sdist ships,
+       and dh-python's clean deletes every `*.egg-info` before the
+       build, so with no python3-setuptools installed 84.2.1 stopped
+       at `invalid command 'egg_info'`. That is Debian's whole
+       bootstrap: its setuptools package build-depends on no
+       setuptools and overrides `dh_auto_clean` for this reason
+       (`debian/rules` of 78.1.1 and 84.2.0). Every pypi- build now
+       does the same, the tree being a fresh unpack. The next fault
+       was one step on: a backend built from PyPI runs its commands
+       too, and maturin's module runs the `maturin` it installed, so
+       `PYPI_BIN` goes first on such a build's PATH. In a bare trixie
+       container `emerge -b pypi-setuptools` built 84.2.1 into the
+       tree, and `emerge -b pypi-rpds-py` built rpds-py 2026.9.1 over
+       maturin 1.11.5, setuptools-rust 1.13.0 and that setuptools,
+       and it imports.
      - **Open, and deliberately not worked around: a Cargo.lock that
        disagrees with its manifest.** uv_build 0.6.17 (a git
        dependency on pubgrub) fails `cargo fetch --locked`. Dropping
