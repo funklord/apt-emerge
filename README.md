@@ -89,8 +89,9 @@ How it differs from what you would otherwise use:
   `--depclean`, `-C`, sets, Portage-style output -- on a Debian system, with
   Debian's packages and Debian's own state.
 
-![emerge -pv -b pypi-requests listing five pypi- packages to build, in
-Portage's colours](doc/screenshot/pypi-build.svg)
+![emerge -pv -b pypi-requests cargo-ripgrep npm-prettier gem-rubocop
+listing a pypi-, cargo-, npm- and gem- package to build, with requests'
+four dependencies, in Portage's colours](doc/screenshot/registry-build.svg)
 
 ```console
 $ emerge -pv sl

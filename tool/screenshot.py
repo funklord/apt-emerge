@@ -25,9 +25,12 @@ ROOT = os.path.dirname(HERE)
 OUT = os.path.join(ROOT, "doc", "screenshot")
 
 # name, command line shown, argv. Chosen to show what the README claims.
+# One build from each registry the README describes, in one plan.
 SCENES = [
-	("pypi-build", "emerge -pv -b pypi-requests",
-	 ["-pv", "-b", "pypi-requests"]),
+	("registry-build",
+	 "emerge -pv -b pypi-requests cargo-ripgrep npm-prettier gem-rubocop",
+	 ["-pv", "-b", "pypi-requests", "cargo-ripgrep", "npm-prettier",
+	  "gem-rubocop"]),
 ]
 
 # xterm's 16 colours, as most dark terminal themes draw them
