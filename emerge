@@ -1160,11 +1160,29 @@ def debian_relations_hold(version, relations):
 PYPI_INDEX = os.environ.get("EMERGE_PYPI_INDEX", "https://pypi.org/pypi")
 MAX_SDIST_BYTES = 256 * 1024 * 1024
 
-def pypi_choose(name, relations=(), index=None):
+def pypi_python_fits(spec, python):
+	"""Does Python `python` (a version string) meet a Requires-Python
+	specifier? One that does not parse is taken as met, as pip takes it:
+	a release is not refused over a typo in metadata nothing else reads."""
+	spec = (spec or "").strip()
+	if not re.match(r"(~=|===|==|!=|<=|>=|<|>)", spec):
+		return True
+	try:
+		relations = pypi_requirement("python" + spec)[2]
+		return debian_relations_hold(pep440_to_debian(python), relations)
+	except ValueError:
+		return True
+
+def pypi_choose(name, relations=(), index=None, python=None):
 	"""The release of a PyPI project to build: the newest whose sdist is
-	not yanked and whose version meets `relations`, a final release over
-	a pre-release as PEP 440 orders installers to. Returns (version, url,
-	sha256, filename); raises LookupError when none qualifies.
+	not yanked, whose version meets `relations` and whose Requires-Python
+	the system's python3 (`python`, this interpreter's by default) meets,
+	a final release over a pre-release as PEP 440 orders installers to.
+	Returns (version, url, sha256, filename); raises LookupError when none
+	qualifies, naming the newest that wanted another Python.
+
+	Requires-Python is what pip chooses by: on bookworm's 3.11, Django
+	6.0 (>=3.12) would otherwise be built and fail at its first import.
 
 	Only an sdist will do: a wheel is somebody else's build, and the point
 	is that this machine builds what it installs. A release without a
@@ -1173,7 +1191,10 @@ def pypi_choose(name, relations=(), index=None):
 	import json
 	url = f"{index or PYPI_INDEX}/{pypi_package_name(name)[5:]}/json"
 	data = json.loads(fetch(url, limit=MAX_INDEX_BYTES))
-	candidates = []
+	if python is None:
+		import platform
+		python = platform.python_version()
+	candidates, too_new = [], None
 	for version, files in data.get("releases", {}).items():
 		try:
 			deb = pep440_to_debian(version)
@@ -1184,13 +1205,19 @@ def pypi_choose(name, relations=(), index=None):
 			if (f.get("packagetype") == "sdist" and not f.get("yanked")
 			    and sha and f.get("filename", "").endswith(".tar.gz")
 			    and debian_relations_hold(deb, relations)):
+				if not pypi_python_fits(f.get("requires_python"), python):
+					if too_new is None or vercmp(deb, too_new[0]) > 0:
+						too_new = (deb, version, f["requires_python"])
+					break
 				pre = _pep440_split(version)[2]
 				candidates.append((not pre, deb, version, f["url"], sha,
 				                   f["filename"]))
 				break
 	if not candidates:
+		why = (f"; {too_new[1]} needs Python {too_new[2].strip()}, this"
+		       f" system has {python}" if too_new else "")
 		raise LookupError(f"{name}: no sdist on {index or PYPI_INDEX} "
-		                  f"meets {', '.join(relations) or 'nothing'}")
+		                  f"meets {', '.join(relations) or 'nothing'}{why}")
 	key = functools.cmp_to_key(lambda a, b: (a[0] - b[0]) or vercmp(a[1], b[1]))
 	best = max(candidates, key=key)
 	return best[2], best[3], best[4], best[5]

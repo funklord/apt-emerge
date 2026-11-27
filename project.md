@@ -2266,6 +2266,17 @@ write surface ever needs testing.
        (`hatchling>=1.29`, `python-sbom`) built 19 packages, among them
        hatchling 1.33, setuptools 84 and two projects the archive does
        not carry, and put only `pypi-platformdirs` in @world.
+     - ~~*Requires-Python was not read.*~~ **Fixed 2026-11-27.**
+       `pypi_choose` took the newest sdist meeting the relations
+       whatever Python it asked for, so on bookworm (3.11) `emerge -pv
+       -b pypi-django` planned 6.1.3, which requires 3.12, and would
+       have built a package failing at its first import. It now skips
+       a release whose `requires_python` the system's python3 does not
+       meet, as pip does and as `cargo_choose`, `npm_choose` and
+       `gem_choose` already did with rust-version and engines; the same
+       plan takes 5.2.19. A specifier that does not parse is taken as
+       met, as pip takes it, and a refusal names the newest release
+       that wanted another Python.
      - *Architecture by heuristic.* A `.c` file anywhere in the sdist
        makes the package `any`; setuptools, poetry-core and python-sbom
        came out `amd64` from sources they ship but do not compile. A

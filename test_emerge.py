@@ -987,6 +987,29 @@ class TestPypiFetch(unittest.TestCase):
 		with self.assertRaises(LookupError):
 			em.pypi_choose("foo", rel, index)
 
+	def test_the_newest_release_this_python_can_run(self):
+		index = self.index("dj", {
+			"5.2": [dict(self.sdist("dj", "5.2"), requires_python=">=3.10")],
+			"6.0": [dict(self.sdist("dj", "6.0"), requires_python=">=3.12")],
+			"6.1": [dict(self.sdist("dj", "6.1"),
+			             requires_python=">= 3.6.*")],    # does not parse
+		})
+		self.assertEqual(em.pypi_choose("dj", (), index, "3.11.2")[0], "6.1")
+		self.assertEqual(em.pypi_choose("dj", (), index, "3.13.5")[0], "6.1")
+		rel = em.pypi_requirement("dj<6.1", {})[2]
+		self.assertEqual(em.pypi_choose("dj", rel, index, "3.11.2")[0], "5.2")
+		self.assertEqual(em.pypi_choose("dj", rel, index, "3.12.0")[0], "6.0")
+		rel = em.pypi_requirement("dj>=6.0,<6.1", {})[2]
+		with self.assertRaisesRegex(LookupError,
+		                            r"6\.0 needs Python >=3\.12, this system "
+		                            r"has 3\.11\.2"):
+			em.pypi_choose("dj", rel, index, "3.11.2")
+		self.assertTrue(em.pypi_python_fits(None, "3.11.2"))
+		self.assertTrue(em.pypi_python_fits("3.8", "3.11.2"))
+		self.assertFalse(em.pypi_python_fits(">=3.9,<3.11", "3.11.2"))
+		self.assertTrue(em.pypi_python_fits(
+			">=2.7, !=3.0.*, !=3.1.*", "3.11.2"))
+
 	def test_fetch_checks_the_digest_before_unpacking(self):
 		f = self.sdist("bar", "2.0")
 		dest = os.path.join(self.root, "work")
