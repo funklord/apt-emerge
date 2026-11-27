@@ -772,9 +772,10 @@ _PYPI_BUILD_PACKAGES = {"flit-core": "flit", "cython": "cython3",
 
 def pypi_sdist_metadata(tree):
 	"""What an unpacked sdist says about itself: its PKG-INFO, and the
-	build requirements from pyproject.toml. A Requires-Dist marked Dynamic
-	is not known until the backend runs, and a guess at it would be a
-	package with dependencies nobody declared, so that is refused."""
+	build requirements and backend from pyproject.toml. A Requires-Dist
+	marked Dynamic is not known until the backend runs: `requires_dist`
+	is then None, for pypi_backend_requires() to answer once the build
+	dependencies are installed."""
 	import email.parser
 	with open(os.path.join(tree, "PKG-INFO"), encoding="utf-8") as f:
 		info = email.parser.Parser().parse(f, headersonly=True)
@@ -791,10 +792,8 @@ def pypi_sdist_metadata(tree):
 			with open(path, encoding="utf-8", errors="replace") as f:
 				texts.append(f"{n}:\n\n{f.read().rstrip()}\n")
 	dynamic = {d.strip().lower() for d in info.get_all("Dynamic") or []}
-	if "requires-dist" in dynamic:
-		raise ValueError(f"{info['Name']}: Requires-Dist is dynamic in "
-		                 "PKG-INFO, so its dependencies are not known")
 	build = ["setuptools>=40.8.0"]      # PEP 517's default backend
+	system = {}
 	pyproject = os.path.join(tree, "pyproject.toml")
 	if os.path.exists(pyproject):
 		try:
@@ -802,8 +801,8 @@ def pypi_sdist_metadata(tree):
 		except ImportError:
 			raise ValueError("reading pyproject.toml needs Python 3.11")
 		with open(pyproject, "rb") as f:
-			build = (tomllib.load(f).get("build-system", {})
-			         .get("requires", build))
+			system = tomllib.load(f).get("build-system", {})
+		build = system.get("requires", build)
 	requires = info.get_all("Requires-Dist") or []
 	# Before metadata 2.2 an sdist's PKG-INFO need not list its
 	# requirements, and setuptools did not: requests 2.25.1, Flask 1.1.4
@@ -813,15 +812,54 @@ def pypi_sdist_metadata(tree):
 	# no egg-info, so with none the PKG-INFO is what there is.
 	version = tuple(int(x) for x in re.findall(
 		r"\d+", info["Metadata-Version"] or "")[:2])
-	if not requires and version < (2, 2):
+	if "requires-dist" in dynamic:
+		requires = None
+	elif not requires and version < (2, 2):
 		requires = pypi_egg_info_requires(tree, info["Name"])
 	return {"name": info["Name"], "version": info["Version"],
 	        "summary": (info["Summary"] or "").strip(),
 	        "requires_dist": requires,
 	        "requires_build": build,
+	        "backend": system.get("build-backend",
+	                              "setuptools.build_meta:__legacy__"),
+	        "backend_path": system.get("backend-path", []),
 	        "copyright": (f"{info['Name']} {info['Version']}, from PyPI, as its"
 	                      " distribution states it.\n\n" + "\n".join(texts)
 	                      if texts else None)}
+
+# Asks a PEP 517 backend for the metadata it would put in a wheel; run
+# with the sdist's own environment, in a child, as pybuild runs it.
+_PYPI_METADATA_HOOK = """
+import sys, pyproject_hooks
+tree, backend, out, *path = sys.argv[1:]
+hooks = pyproject_hooks.BuildBackendHookCaller(tree, backend, path or None)
+print(hooks.prepare_metadata_for_build_wheel(out))
+"""
+
+def pypi_backend_requires(tree, meta, environ, timeout=1800):
+	"""A dynamic Requires-Dist, as the sdist's backend computes it: the
+	PEP 517 metadata hook (or, where a backend lacks it, a wheel built
+	and read), run once the build dependencies are installed. sentry-sdk,
+	nltk, gevent and azure-storage-blob mark it dynamic: setuptools does
+	for any setup.py that passes install_requires (2026-11-27)."""
+	import email.parser
+	out = tempfile.mkdtemp(prefix="metadata-", dir=os.path.dirname(tree))
+	try:
+		r = subprocess.run(["python3", "-c", _PYPI_METADATA_HOOK, tree,
+		                    meta["backend"], out, *meta["backend_path"]],
+		                   cwd=tree, env=environ, stdout=subprocess.PIPE,
+		                   text=True, timeout=timeout)
+		name = (r.stdout.strip().splitlines() or [""])[-1]
+		path = os.path.join(out, name, "METADATA")
+		if r.returncode != 0 or not name or not os.path.isfile(path):
+			raise RuntimeError(f"{meta['name']}: its backend did not say"
+			                   " what it depends on (Requires-Dist is"
+			                   " dynamic)")
+		with open(path, encoding="utf-8") as f:
+			info = email.parser.Parser().parse(f, headersonly=True)
+		return info.get_all("Requires-Dist") or []
+	finally:
+		shutil.rmtree(out, ignore_errors=True)
 
 def pypi_egg_info_requires(tree, name):
 	"""The requirements setuptools recorded in an sdist's
@@ -931,7 +969,7 @@ def pypi_debian_files(meta, arch="all", env=None, when=None,
 	version = pep440_to_debian(meta["version"])
 	depends = ["python3"]
 	extras = {}
-	for line in meta["requires_dist"]:
+	for line in meta["requires_dist"] or []:
 		got = pypi_requirement(line, env)
 		if got:
 			depends += got[2]
@@ -5398,6 +5436,33 @@ class AptBackend:
 			print(r.stderr, file=sys.stderr)
 			efail(f"build-dep failed for {package}")
 			sys.exit(1)
+		if meta["requires_dist"] is None:
+			# The environment debian/rules exports, for the same backend.
+			environ = dict(os.environ,
+			               HATCH_METADATA_CLASSIFIERS_NO_VERIFY="1",
+			               VALIDATE_PYPROJECT_NO_NETWORK="1",
+			               CARGO_HOME=os.path.join(srcdir, "debian",
+			                                       "cargo-home"),
+			               PYTHONPATH=os.path.join(srcdir, "debian",
+			                                       "pypi-build")
+			               + (":" + PYPI_TREE if from_pypi else ""))
+			if from_pypi:
+				environ["PATH"] = PYPI_BIN + ":" + environ.get("PATH", "")
+			print(f"{ARROW} Asking {meta['backend']} what {meta['name']}"
+			      " depends on (Requires-Dist is dynamic)...")
+			try:
+				meta["requires_dist"] = pypi_backend_requires(
+					srcdir, meta, environ)
+				files, _ = pypi_debian_files(
+					meta, arch, extra_requires=self._pypi_requires,
+					from_pypi=from_pypi)
+			except (RuntimeError, ValueError, OSError,
+			        subprocess.TimeoutExpired) as e:
+				efail(e)
+				sys.exit(1)
+			with open(os.path.join(srcdir, "debian", "control"), "w",
+			          encoding="utf-8") as f:
+				f.write(files["control"])
 		return self._compile_and_merge(package, newver, srcdir, workdir, env,
 		                               use, opts, pv, i, total)
 

@@ -893,11 +893,49 @@ class TestPypiDebianFiles(unittest.TestCase):
 			f.write(pkg_info.replace("2.1", "2.2"))
 		self.assertEqual(em.pypi_sdist_metadata(tree2)["requires_dist"], [])
 
-	def test_dynamic_dependencies_are_refused(self):
-		tree = self.sdist("Metadata-Version: 2.2\nName: dyn\nVersion: 1.0\n"
-		                  "Dynamic: Requires-Dist\n")
-		with self.assertRaises(ValueError):
-			em.pypi_sdist_metadata(tree)
+	def test_dynamic_dependencies_are_asked_of_the_backend(self):
+		try:
+			import pyproject_hooks  # noqa: F401 -- what the build brings
+		except ImportError:
+			self.skipTest("python3-pyproject-hooks is not installed")
+		# A backend that decides its dependency when it runs, as a
+		# setup.py passing install_requires does.
+		backend = (
+			"import os\n"
+			"def prepare_metadata_for_build_wheel(out, config=None):\n"
+			"\td = os.path.join(out, 'dyn-1.0.dist-info')\n"
+			"\tos.makedirs(d)\n"
+			"\twith open(os.path.join(d, 'METADATA'), 'w') as f:\n"
+			"\t\tf.write('Metadata-Version: 2.4\\nName: dyn\\n'\n"
+			"\t\t        'Version: 1.0\\nRequires-Dist: idna>=' +\n"
+			"\t\t        os.environ['DYN_WANTS'] + '\\n'\n"
+			"\t\t        'Requires-Dist: six; extra == \"old\"\\n')\n"
+			"\treturn 'dyn-1.0.dist-info'\n")
+		tree = self.sdist(
+			"Metadata-Version: 2.2\nName: dyn\nVersion: 1.0\n"
+			"Dynamic: Requires-Dist\n",
+			'[build-system]\nrequires = []\nbuild-backend = "dyn_backend"\n'
+			'backend-path = ["."]\n', files=[("dyn_backend.py", backend)])
+		meta = em.pypi_sdist_metadata(tree)
+		self.assertIsNone(meta["requires_dist"])
+		self.assertEqual((meta["backend"], meta["backend_path"]),
+		                 ("dyn_backend", ["."]))
+		environ = dict(os.environ, DYN_WANTS="3.4")
+		meta["requires_dist"] = em.pypi_backend_requires(tree, meta, environ)
+		self.assertEqual(meta["requires_dist"],
+		                 ["idna>=3.4", 'six; extra == "old"'])
+		control = em.pypi_debian_files(meta, env=self.env)[0]["control"]
+		self.assertIn("pypi-idna (>= 3.4)", control)
+		self.assertNotIn("six", control)
+		# A backend that cannot answer stops the build, saying why.
+		with open(os.path.join(tree, "dyn_backend.py"), "w") as f:
+			f.write("raise ImportError('broken')\n")
+		left = lambda: {n for n in os.listdir(os.path.dirname(tree))
+		                if n.startswith("metadata-")}
+		before = left()
+		with self.assertRaisesRegex(RuntimeError, "did not say"):
+			em.pypi_backend_requires(tree, meta, environ)
+		self.assertEqual(left(), before)
 
 
 class TestPypiFetch(unittest.TestCase):

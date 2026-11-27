@@ -2107,9 +2107,9 @@ write surface ever needs testing.
      prerm running `py3clean -p` (what `dh_python3` writes for
      `dist-packages`, said for the tree), upstream's licence files as
      `copyright`, and `DEBFULLNAME`/`DEBEMAIL` as maintainer, as `dch`
-     takes them. A dynamic `Requires-Dist` is refused: its dependencies
-     are unknown until the backend runs. Tests are not run, an sdist's
-     suite wanting its test extras.
+     takes them. A dynamic `Requires-Dist` is asked of the backend once
+     the build dependencies are in (below). Tests are not run, an
+     sdist's suite wanting its test extras.
 
      Proven 2026-11-26 in a `debian:trixie` container: `tomli` 2.4.1 and
      `iniconfig` 2.1.0 from PyPI built as `pypi-tomli` and
@@ -2282,7 +2282,26 @@ write surface ever needs testing.
        index's list. Without an egg-info PKG-INFO is taken as it
        stands: flit, poetry and distutils wrote no egg-info, and the
        first two did write Requires-Dist.
-     - A dynamic `Requires-Dist`, a URL requirement and `===` are refused.
+     - ~~*A dynamic `Requires-Dist` is refused.*~~ **Built 2026-11-27.**
+       setuptools marks it dynamic for any `setup.py` passing
+       `install_requires`, so the refusal turned away sentry-sdk, nltk,
+       gevent, azure-storage-blob and grpcio-tools -- five of about
+       twenty popular projects sampled. The backend is what knows: once
+       the build dependencies are installed, PEP 517's
+       `prepare_metadata_for_build_wheel` is called through
+       `pyproject_hooks` (which `pybuild-plugin-pyproject` brings), in
+       the environment `debian/rules` exports, and `debian/control` is
+       rewritten from the `Requires-Dist` it returns. A backend that
+       cannot answer stops the build naming the package. The plan
+       still comes from the index's list; where the backend says more,
+       apt refuses the install naming what is missing, as for any
+       difference between the two. Rejected: taking the index's list
+       for the package's Depends, which describes whichever file was
+       uploaded first rather than this sdist on this Python. Proven in
+       trixie: `pypi-sentry-sdk` 3.0.1 depends on `pypi-urllib3 (>=
+       1.26.11)` and `pypi-certifi` and imports; `pypi-nltk` 3.10.4 on
+       defusedxml, click, joblib, regex and tqdm, and its command runs.
+     - A URL requirement and `===` are refused.
    - **Rust from crates.io: `cargo-<name>`** (holder, 2026-11-26, chosen
      as the second ecosystem because a crate's dependencies are compiled
      into it: no runtime closure to plan, no namespace of libraries to
