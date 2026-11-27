@@ -985,8 +985,16 @@ class TestPypiFetch(unittest.TestCase):
 		roots = em.pypi_upgrade_roots(installed, index)
 		self.assertEqual(roots, [("pypi-lib", ["pypi-lib (<< 2~~~)",
 		                                       "pypi-lib (>= 1.0)"])])
-		plan = em.pypi_closure(roots, {}.get, env={"extra": ""}, index=index)
+		seen = {}
+		plan = em.pypi_closure(roots, {}.get, env={"extra": ""}, index=index,
+		                       relations_out=seen)
 		self.assertEqual([(p, v) for p, v, *_ in plan], [("pypi-lib", "1.5")])
+		# what an older release, taken when rustc is too old, must meet
+		self.assertEqual(seen, {"pypi-lib": ["pypi-lib (<< 2~~~)",
+		                                     "pypi-lib (>= 1.0)"]})
+		self.assertEqual(em.pypi_choose("lib", seen["pypi-lib"]
+		                                + ["pypi-lib (<< 1.5)"], index)[0],
+		                 "1.0")
 		installed["pypi-lib"] = ("1.5", "")
 		self.assertEqual(em.pypi_upgrade_roots(installed, index), [])
 		del installed["pypi-app"]

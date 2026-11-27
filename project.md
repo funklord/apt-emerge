@@ -2218,17 +2218,31 @@ write surface ever needs testing.
        `CARGO_NET_OFFLINE`. rpds-py 0.20.0 built that way and
        imports. A Rust sdist stating a rust-version the archive's
        rustc is below is refused before building, naming both.
-     - **Open: a build backend's release is not chosen for the
-       archive's rustc.** `emerge -b pypi-rpds-py` needs maturin
-       >= 1.9 (trixie has 1.8.3), takes maturin 1.16.0, and is refused
-       because that needs rustc 1.89 (trixie: 1.85); an older maturin
-       would fit. The cargo- namespace already chooses by
-       rust-version; PyPI's metadata does not state it, so doing the
-       same here means reading each candidate sdist. Where no release
-       fits there is nothing to choose: pip-audit cannot be built on
-       trixie, since cachecontrol 0.15.0 builds with uv_build >=
-       0.9.6, and every uv_build release from 0.10 on wants rustc
-       1.91 or newer.
+     - ~~*A build backend's release is not chosen for the archive's
+       rustc.*~~ **Done 2026-11-27.** PyPI does not state a release's
+       rust-version, so a Rust sdist that wants a newer rustc than the
+       archive's steps down to the newest release of the previous
+       minor series that still meets every relation the plan asked of
+       it (`pypi_closure`'s `relations_out`), at most
+       `PYPI_RUST_FALLBACKS` (8) downloads, then refuses naming both
+       versions. By minor because projects raise rust-version between
+       minors: stepping one patch release at a time spent all eight
+       tries inside maturin 1.13 to 1.15. In trixie, rpds-py's maturin
+       went 1.16.0, 1.15.0, 1.14.1, 1.13.3, 1.12.6 to 1.11.5, which
+       states rustc 1.85. pip-audit still cannot be built there:
+       cachecontrol 0.15.0 wants uv_build >= 0.9.6, and every such
+       release wants rustc 1.91 or newer.
+     - **Open: setuptools does not build from its own sdist.**
+       `emerge -b pypi-setuptools` (84.2.1, trixie) fails with
+       `error: invalid command 'egg_info'` -- setuptools is its own
+       backend, and Debian bootstraps it specially. It is what stops
+       rpds-py now: maturin 1.11.5 needs a newer setuptools than
+       trixie's, so the plan builds one from PyPI and fails there.
+     - **Open, and deliberately not worked around: a Cargo.lock that
+       disagrees with its manifest.** uv_build 0.6.17 (a git
+       dependency on pubgrub) fails `cargo fetch --locked`. Dropping
+       `--locked` would build crate versions upstream never locked;
+       the cargo- namespace keeps it for the same reason.
      - ~~*Build backends newer than the archive's.*~~ **Built
        2026-11-26.** `pypi_build_shortfalls()` finds the build
        requirements the archive's candidate cannot meet;

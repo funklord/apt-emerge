@@ -812,6 +812,10 @@ def pypi_sdist_metadata(tree):
 	                      " distribution states it.\n\n" + "\n".join(texts)
 	                      if texts else None)}
 
+# How many older releases a pypi- build fetches looking for one the
+# archive's rustc can build, before refusing.
+PYPI_RUST_FALLBACKS = 8
+
 def pypi_rust_version(tree):
 	"""The newest rust-version any Cargo.toml in an sdist states, or None.
 	A workspace member inherits its root's with `{ workspace = true }`,
@@ -1145,7 +1149,8 @@ def pypi_release_requires(name, version, index=None):
 	info = json.loads(fetch(url, limit=MAX_INDEX_BYTES)).get("info") or {}
 	return info.get("requires_dist") or []
 
-def pypi_closure(roots, installed_version, env=None, index=None):
+def pypi_closure(roots, installed_version, env=None, index=None,
+                 relations_out=None):
 	"""Everything to build so that `roots` (pypi- package names) install:
 	[(package, pep440 version, url, sha256, filename)], dependencies
 	before what needs them. A dependency already installed at a version
@@ -1153,11 +1158,19 @@ def pypi_closure(roots, installed_version, env=None, index=None):
 
 	No backtracking: a release chosen for one dependent that a second
 	refuses is reported with both, rather than searched around -- the
-	same honesty as the resolver's walls, in a first version."""
+	same honesty as the resolver's walls, in a first version.
+
+	`relations_out`, a dict, gathers every relation each package was
+	asked to meet, so a build that has to take an older release than the
+	one chosen here can stay inside them."""
 	env = pep508_environment() if env is None else env
 	chosen, order = {}, []
 
 	def visit(package, relations, extras, path, root):
+		if relations_out is not None:
+			relations_out.setdefault(package, []).extend(
+				r for r in relations
+				if r not in relations_out.get(package, []))
 		if package in path:
 			raise RuntimeError("dependency cycle: "
 			                   + " -> ".join(path + [package]))
@@ -4713,8 +4726,9 @@ class AptBackend:
 		atoms = [a for a in atoms if a not in pypi_roots]
 		if pypi_roots:
 			try:
-				self._pypi_plan = pypi_closure(pypi_roots,
-				                               self._installed_version)
+				self._pypi_plan = pypi_closure(
+					pypi_roots, self._installed_version,
+					relations_out=self._pypi_relations)
 			except (LookupError, ValueError, OSError) as e:
 				raise RuntimeError(str(e))
 			for package, version, *_ in self._pypi_plan:
@@ -4965,7 +4979,8 @@ class AptBackend:
 		roots = pypi_upgrade_roots(installed)
 		if not roots:
 			return []
-		self._pypi_plan = pypi_closure(roots, self._installed_version)
+		self._pypi_plan = pypi_closure(roots, self._installed_version,
+		                               relations_out=self._pypi_relations)
 		use = self._build_use()
 		return [(package, pep440_to_debian(version),
 		         self._installed_version(package), 0, "ebuild", use)
@@ -5023,7 +5038,9 @@ class AptBackend:
 			      + "; building it from PyPI")
 			if not (mine and debian_relations_hold(mine, got[2])):
 				roots.append((got[0], got[2]))
-		plan = pypi_closure(roots, self._installed_version) if roots else []
+		plan = (pypi_closure(roots, self._installed_version,
+		                     relations_out=self._pypi_relations)
+		        if roots else [])
 		building.add(package)
 		try:
 			for n, entry in enumerate(plan, 1):
@@ -5228,6 +5245,12 @@ class AptBackend:
 		return [(p, semver_to_debian(v), self._installed_version(p), 0,
 		         "ebuild", use) for p, v, *_ in self._cargo_plan]
 
+	@property
+	def _pypi_relations(self):
+		"""What each pypi- package was chosen to meet: pypi_closure()'s
+		relations_out, kept for the run."""
+		return self.__dict__.setdefault("_pypi_relations_seen", {})
+
 	def _build_pypi(self, entry, env, use, opts, i, total):
 		"""Fetch a PyPI sdist, give it the debian/ pypi_debian_files()
 		writes, and build it as -b builds an archive source package."""
@@ -5235,33 +5258,62 @@ class AptBackend:
 		newver = pep440_to_debian(version)
 		pv = f"{package}-{newver}"
 		print(f"\n{ARROW} Emerging ({i} of {total}) {BGREEN(pv)}")
-		portage_dir = os.path.join(PORTAGE_TMPDIR, f"{package}-{version}")
-		workdir = os.path.join(portage_dir, "work")
-		shutil.rmtree(portage_dir, ignore_errors=True)
-		os.makedirs(workdir)
-		print(f"{ARROW} Fetching {filename} from PyPI...")
+		tries = 0
 		try:
-			srcdir = pypi_fetch_sdist(url, sha, filename, workdir)
-			meta = pypi_sdist_metadata(srcdir)
-			# Compiled code makes the package architecture-dependent; the
-			# sources say so before the build does.
-			arch = "all"
-			for _, _, names in os.walk(srcdir):
-				if any(n.endswith((".c", ".cc", ".cpp", ".pyx", ".rs"))
-				       or n == "Cargo.toml" for n in names):
-					arch = "any"
+			while True:
+				portage_dir = os.path.join(PORTAGE_TMPDIR,
+				                           f"{package}-{version}")
+				workdir = os.path.join(portage_dir, "work")
+				shutil.rmtree(portage_dir, ignore_errors=True)
+				os.makedirs(workdir)
+				print(f"{ARROW} Fetching {filename} from PyPI...")
+				srcdir = pypi_fetch_sdist(url, sha, filename, workdir)
+				meta = pypi_sdist_metadata(srcdir)
+				# Compiled code makes the package architecture-dependent;
+				# the sources say so before the build does.
+				arch = "all"
+				for _, _, names in os.walk(srcdir):
+					if any(n.endswith((".c", ".cc", ".cpp", ".pyx", ".rs"))
+					       or n == "Cargo.toml" for n in names):
+						arch = "any"
+						break
+				# Asked before any build: uv_build 0.13.10 wants rustc
+				# 1.98, and found out only after fetching 200 crates and
+				# compiling against trixie's 1.85 (2026-11-27).
+				rust = pypi_rust_version(srcdir) if arch == "any" else None
+				have = self._candidate("rustc") if rust else None
+				if not rust or _rust_version_fits(rust, have):
 					break
-			# Asked before any build: uv_build 0.13.10 wants rustc 1.98,
-			# and found out only after fetching 200 crates and compiling
-			# against trixie's 1.85 (2026-11-27).
-			rust = pypi_rust_version(srcdir) if arch == "any" else None
-			if rust:
-				have = self._candidate("rustc")
-				if not _rust_version_fits(rust, have):
-					raise RuntimeError(
-						f"{meta['name']} {meta['version']} needs rustc {rust};"
-						" the archive has "
-						+ (f"rustc {have}" if have else "no rustc"))
+				short = (f"{meta['name']} {meta['version']} needs rustc"
+				         f" {rust}; the archive has "
+				         + (f"rustc {have}" if have else "no rustc"))
+				# PyPI does not state a release's rust-version, so an
+				# older release that still meets every dependent is
+				# fetched and read: rpds-py needs maturin >= 1.9, 1.16.0
+				# wants rustc 1.89 and 1.11 fits trixie's 1.85. Each try
+				# is the newest of the previous minor series, since a
+				# project raises rust-version between minors and patch
+				# releases keep it -- one at a time spent all eight tries
+				# inside 1.13 to 1.15. Bounded, each try a download.
+				tries += 1
+				older = None
+				series = ".".join(re.findall(r"\d+", version)[:2])
+				if tries <= PYPI_RUST_FALLBACKS and series:
+					try:
+						older = pypi_choose(
+							package[len("pypi-"):],
+							self._pypi_relations.get(package, [])
+							+ [f"{package} (<< {series}~)"])
+					except LookupError:
+						pass
+				if older is None:
+					raise RuntimeError(short + ", and no older release"
+					                   " that fits was found")
+				print(f"{ARROW} {short}; trying {older[0]}")
+				shutil.rmtree(portage_dir, ignore_errors=True)
+				version, url, sha, filename = older
+				newver = pep440_to_debian(version)
+				pv = f"{package}-{newver}"
 			from_pypi = self._pypi_backends(package, meta, env, use, opts)
 			files, _ = pypi_debian_files(meta, arch,
 			                             extra_requires=self._pypi_requires,
