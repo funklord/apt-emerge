@@ -23,6 +23,7 @@ own. The whole file skips if that turns out not to work here.
 Run with:  python3 -m unittest test_integration
 """
 
+import collections
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -92,6 +93,46 @@ def tearDownModule():
 		      "with addCleanup, or the damage lands in whatever runs next.")
 
 
+class Narrated(unittest.TestCase):
+	"""A test that mutes emerge's narration, and shows it when it fails.
+
+	These tests load emerge in-process and replace its `print`, because a
+	passing run's Portage-style narration is noise. They used to replace it
+	with a no-op, which also discarded what emerge prints when apt fails:
+	stream_apt prints the failure lines and the apt output buffered before
+	them, and efail is a print too. So six tests failing on an etckeeper
+	hook reported a bare `SystemExit: 100`, and the cause sat four days
+	before somebody re-ran the command by hand (project.md, *Closed: the
+	integration suite fails 6 of 48 under apt 3*). Now the narration is
+	kept, its last lines bounded, and appended to the report of a test
+	that fails or errors; a passing test prints nothing.
+	"""
+	NARRATION_LINES = 400
+
+	def mute(self, m):
+		self.narration = collections.deque(maxlen=self.NARRATION_LINES)
+		def keep(*args, sep=" ", end="\n", file=None, flush=False):
+			self.narration.append(sep.join(str(a) for a in args))
+		m.print = keep
+
+	def run(self, result=None):
+		if result is None:
+			return super().run()
+		marks = [(entries, len(entries))
+		         for entries in (result.errors, result.failures)]
+		outcome = super().run(result)
+		lines = getattr(self, "narration", None)
+		if lines:
+			tail = ("\nemerge's own output, muted while the test ran"
+			        f" (last {len(lines)} lines):\n"
+			        + "\n".join("  " + line for line in lines) + "\n")
+			for entries, start in marks:
+				for i in range(start, len(entries)):
+					test, text = entries[i]
+					entries[i] = (test, text + tail)
+		return outcome
+
+
 def _rootless_dpkg_works():
 	"""Can we unpack into a directory we own, without being root?"""
 	if not (shutil.which("dpkg") and shutil.which("dpkg-deb")):
@@ -122,7 +163,7 @@ HAVE_DPKG_ROOT = _rootless_dpkg_works()
 
 
 @unittest.skipUnless(HAVE_DPKG_ROOT, "rootless `dpkg --root` unavailable")
-class DpkgBackendEndToEnd(unittest.TestCase):
+class DpkgBackendEndToEnd(Narrated):
 	"""One ordered scenario: the state each step leaves is the next step's
     input, so this is a single test using subTest per assertion rather than
     a method per phase."""
@@ -273,8 +314,8 @@ class DpkgBackendEndToEnd(unittest.TestCase):
 		self.assertEqual(self.installed().get("emtest-fetch"), "1.0")
 
 	def quiet(self):
-		"""Silence the Portage-style narration; failures still surface."""
-		self.m.print = lambda *a, **k: None
+		"""Silence the Portage-style narration; a failing test shows it."""
+		self.mute(self.m)
 
 	# -- the scenario ------------------------------------------------------
 
@@ -566,7 +607,7 @@ HAVE_APT_ROOT = _rootless_apt_works()
 
 @unittest.skipUnless(HAVE_APT_ROOT, "rootless apt-into-scratch-root "
                                     "unavailable")
-class AptBackendEndToEnd(unittest.TestCase):
+class AptBackendEndToEnd(Narrated):
 	"""The apt backend against a real apt driving a real dpkg, both aimed at
     a scratch tree. Every piece of apt state -- status, lists, cache, logs
     and extended_states -- is redirected, so this needs no privileges and
@@ -678,7 +719,7 @@ class AptBackendEndToEnd(unittest.TestCase):
 		loader.exec_module(m)
 		m.STATUS = os.path.join(self.admin, "status")
 		m.need_root = lambda: None
-		m.print = lambda *a, **k: None
+		self.mute(m)
 		# never let session detection touch the real desktop
 		m._session_critical_cache = set()
 		m._session_blind = False
@@ -889,7 +930,7 @@ class AptBackendEndToEnd(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_DPKG_ROOT, "rootless `dpkg --root` unavailable")
-class AptlessHttpEndToEnd(unittest.TestCase):
+class AptlessHttpEndToEnd(Narrated):
 	"""The dpkg backend as an apt-less box actually meets it.
 
 	Three things nothing else covers, and none of them needed hardware:
@@ -981,7 +1022,7 @@ class AptlessHttpEndToEnd(unittest.TestCase):
 		m.DISTFILES = os.path.join(self.state, "distfiles")
 		m.STATUS = os.path.join(self.sysroot, "var/lib/dpkg/status")
 		m.need_root = lambda: None
-		m.print = lambda *a, **k: None
+		self.mute(m)
 		m.read_sources = lambda: [(self.base, "./", ["main"], None)]
 
 		# The point of the class: no apt-get anywhere, so pick_backend has to
@@ -1173,7 +1214,7 @@ class AptlessHttpEndToEnd(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_DPKG_ROOT, "rootless `dpkg --root` unavailable")
-class ConfigMergingEndToEnd(unittest.TestCase):
+class ConfigMergingEndToEnd(Narrated):
 	"""The config-merging feature against real dpkg, from both ends.
 
 	Everything in this feature rests on one assumption about dpkg that
@@ -1242,7 +1283,7 @@ class ConfigMergingEndToEnd(unittest.TestCase):
 		loader.exec_module(m)
 		m.STATUS = os.path.join(self.sysroot, "var/lib/dpkg/status")
 		m.need_root = lambda: None
-		m.print = lambda *a, **k: None
+		self.mute(m)
 		admin = os.path.join(self.sysroot, "var/lib/dpkg")
 		real_capture = m.capture
 
@@ -1512,7 +1553,7 @@ HAVE_LOCAL_DEB_INSTALL = _local_deb_install_resolves()
 
 
 @unittest.skipUnless(HAVE_SOURCE_BUILD, "source-build tooling (dpkg-dev, build-essential) unavailable")
-class SourceBuildEndToEnd(unittest.TestCase):
+class SourceBuildEndToEnd(Narrated):
 	"""`emerge -b` / `-B`, which had never executed.
 
 	The README and the man page both advertise building from the Debian
@@ -1660,7 +1701,7 @@ binary: binary-indep
 		m.BINPKGS = os.path.join(self.dir, "binpkgs")
 		m.PORTAGE_TMPDIR = os.path.join(self.dir, "portage")
 		m.need_root = lambda: None
-		m.print = lambda *a, **k: None
+		self.mute(m)
 		m._session_critical_cache = set()
 		m._session_blind = False
 
@@ -1813,7 +1854,7 @@ HAVE_DPKG_DEB = bool(shutil.which("dpkg-deb"))
 
 
 @unittest.skipUnless(HAVE_GPG, "gpg/gpgv unavailable")
-class SignatureVerificationEndToEnd(unittest.TestCase):
+class SignatureVerificationEndToEnd(Narrated):
 	"""The dpkg backend's trust anchor, against real gpg and real gpgv.
 
 	Everything else on this backend is checked against a SHA256 taken from
@@ -1912,7 +1953,7 @@ class SignatureVerificationEndToEnd(unittest.TestCase):
 		m.TRUSTED_DIR = self.trusted
 		m.TRUSTED_LEGACY = os.path.join(self.dir, "nonexistent.gpg")
 		m.need_root = lambda: None
-		m.print = lambda *a, **k: None
+		self.mute(m)
 		m.read_sources = lambda: [("file://" + self.repo, "./", ["main"],
 		                           self.signed_by)]
 		self.warnings = []
@@ -2081,7 +2122,7 @@ class SignatureVerificationEndToEnd(unittest.TestCase):
 
 @unittest.skipUnless(HAVE_GPG, "gpg/gpgv unavailable")
 @unittest.skipUnless(HAVE_DPKG_DEB, "dpkg-deb unavailable")
-class AncestorRecoveryEndToEnd(unittest.TestCase):
+class AncestorRecoveryEndToEnd(Narrated):
 	"""Recovering the previously shipped config file, whole chain, no fakes.
 
     The unit tests stub the verifier and the fetch, which covers the
@@ -2197,7 +2238,7 @@ class AncestorRecoveryEndToEnd(unittest.TestCase):
 		m.capture = lambda cmd, env=None: types.SimpleNamespace(
 		    stdout=self.ARCH + "\n", returncode=0)
 		m.need_root = lambda: None
-		m.print = lambda *a, **k: None
+		self.mute(m)
 		m.einfo = m.ewarn = lambda msg: None
 		return m
 

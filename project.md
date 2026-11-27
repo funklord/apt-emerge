@@ -3209,9 +3209,16 @@ never loaded. `_rootless_apt_works` now builds, scans and installs a
 package into a scratch root, as item 1 below asks, and a host whose
 own package state apt cannot satisfy is a skip. The suite has passed
 48 of 48 since, most recently in a debian:trixie container on
-2026-11-27. Not followed up: why the failing test showed none of apt's
-output (the paragraph below opening *One thing remains genuinely
-unexplained*). The investigation as it was recorded:
+2026-11-27. Why the failing test showed none of apt's output (the
+paragraph below opening *One thing remains genuinely unexplained*) was
+answered the same day: every end-to-end class replaced emerge's `print`
+with a no-op, and `stream_apt`'s failure lines, its buffered apt
+output and `efail` are all prints. They are now kept and appended to a
+failing test's report (`Narrated` in `test_integration.py`); a
+`DPkg::Pre-Invoke` hook that fails, added to the apt test's scratch
+`apt.conf.d`, reproduced the bare `SystemExit: 100` with the old file
+and shows apt's `E: Problem executing scripts` line with the new. The
+investigation as it was recorded:
 
 **Mechanism found 2026-08-31: the skip guard tests for binaries, not for
 the capability it names.** Written by the guidelines tree, which has no
