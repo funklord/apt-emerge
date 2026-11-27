@@ -189,12 +189,25 @@ its commands in
 .BI @ scope / name
 is
 .BI npm- scope -- name\fR).
+A
+.BI gem- name
+atom installs a gem's programs with their dependencies into a
+.B GEM_HOME
+of its own under
+.IR /usr/lib/gem ,
+commands in
+.I /usr/lib/gem/bin
+(a gem's
+.B _
+is
+.BR - ).
 .B -u
 on a set also rebuilds installed
 .BR pypi- ,
-.B cargo-
-and
+.BR cargo- ,
 .B npm-
+and
+.B gem-
 packages with newer releases.
 .TP
 .BR --buildpkgonly ", " -B

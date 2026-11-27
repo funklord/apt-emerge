@@ -1322,6 +1322,272 @@ class TestNpmNamespace(unittest.TestCase):
 		                 [("npm-prettier", "3.10.1", "3.0.0")])
 		self.assertEqual(be._npm_plan[0][0], "npm-prettier")
 
+class TestGemNamespace(unittest.TestCase):
+	"""A Ruby program built as gem-<name> (holder, 2026-11-27)."""
+
+	# What RubyGems' Gem::Requirement (ruby 3.3.8, trixie's) answers for
+	# each requirement at each of these Ruby versions, one digit per
+	# version: constructs by hand, then a sample of the required_ruby_version
+	# values real gems published (rubocop, rails, jekyll, fastlane, ...).
+	VERSIONS = "1.8.7 1.9.3 2.0.0 2.3.0 2.5.0 2.6.10 2.7.0 2.7.2 3.0.0 3.0.7 3.1.0 3.1.2 3.1.9 3.2.0 3.3.0 3.3.8 3.3.9 3.4.0 4.0.0".split()
+	TABLE = [
+		('!= 3.3.8',                   "1111111111111110111"),
+		('< 3.3.9',                    "1111111111111111000"),
+		('<= 3.3',                     "1111111111111110000"),
+		('= 3.3',                      "0000000000000010000"),
+		('> 3.3',                      "0000000000000001111"),
+		('>= 2.3.0, < 2.7.0.preview1', "0001110000000000000"),
+		('>= 2.5, < 4',                "0000111111111111110"),
+		('~> 2.7, >= 2.7.2',           "0000000100000000000"),
+		('~> 3',                       "0000000011111111110"),
+		('~> 3.0',                     "0000000011111111110"),
+		('~> 3.1',                     "0000000000111111110"),
+		('~> 3.1.2',                   "0000000000011000000"),
+		('< 2.3, >= 1.9.2',            "0110000000000000000"),
+		('< 2.5, >= 2.2',              "0001000000000000000"),
+		('< 2.7.dev, >= 2.3',          "0001110000000000000"),
+		('> 1.8.3',                    "1111111111111111111"),
+		('>= 1.8.7',                   "1111111111111111111"),
+		('>= 1.9.3',                   "0111111111111111111"),
+		('>= 2.1',                     "0001111111111111111"),
+		('>= 2.2.0',                   "0001111111111111111"),
+		('>= 2.3, < 2.7.dev',          "0001110000000000000"),
+		('>= 2.3.3',                   "0000111111111111111"),
+		('>= 2.4, < 2.8.dev',          "0000111100000000000"),
+		('>= 2.5',                     "0000111111111111111"),
+		('>= 2.6',                     "0000011111111111111"),
+		('>= 2.6.0',                   "0000011111111111111"),
+		('>= 2.7, < 3.3.dev',          "0000001111111100000"),
+		('>= 3.0, < 3.1.dev',          "0000000011000000000"),
+		('>= 3.1',                     "0000000000111111111"),
+		('>= 3.1, < 3.4.dev',          "0000000000111111100"),
+		('>= 3.2',                     "0000000000000111111"),
+		("> 2.7.0.preview1", "0000001111111111111"),
+		("<= 3.0.0.rc1", "1111111100000000000"),
+		(">= 3.3.0.dev", "0000000000000011111"),
+	]
+
+	def setUp(self):
+		self.root = tempfile.mkdtemp()
+		self.addCleanup(shutil.rmtree, self.root)
+
+	def test_names(self):
+		self.assertEqual(em.gem_package_name("rubocop"), "gem-rubocop")
+		self.assertEqual(em.gem_package_name("github_changelog_generator"),
+		                 "gem-github-changelog-generator")
+		self.assertEqual(em.gem_registry_names("gem-github-changelog-generator"),
+		                 ["github-changelog-generator",
+		                  "github_changelog_generator"])
+		self.assertEqual(em.gem_registry_names("gem-rake"), ["rake"])
+		for bad in ["", "RedCloth", "a b", "-a", "a/b", "x" * 101]:
+			with self.subTest(bad=bad), self.assertRaises(ValueError):
+				em.gem_package_name(bad)
+
+	def test_versions_sort_as_rubygems_says_for_what_is_built(self):
+		order = ["0.9", "1.0.0.beta1", "1.0.0.rc1", "1.0.0", "1.0.1",
+		         "1.2.0", "1.10.0", "2.0.0-rc1", "2.0.0"]
+		debs = [em.gem_version_to_debian(v) for v in order]
+		self.assertEqual(debs[1], "1.0.0~beta1")
+		for a, b in zip(debs, debs[1:]):
+			with self.subTest(a=a, b=b):
+				self.assertLess(em.vercmp(a, b), 0)
+				if HAVE_DPKG:
+					self.assertEqual(dpkg_cmp(a, b), -1)
+		for bad in ["", "v1", "1..2", "1.0 2"]:
+			with self.subTest(bad=bad), self.assertRaises(ValueError):
+				em.gem_version_to_debian(bad)
+
+	def test_requirements_as_rubygems_reads_them(self):
+		versions = [list(map(int, v.split("."))) for v in self.VERSIONS]
+		for text, want in self.TABLE:
+			with self.subTest(requirement=text):
+				got = "".join("1" if em.gem_requirement_holds(text, v) else "0"
+				              for v in versions)
+				self.assertEqual(got, want)
+		with self.assertRaises(ValueError):
+			em.gem_requirement_holds(">= banana", [3, 3, 8])
+
+	@unittest.skipUnless(shutil.which("ruby"), "ruby not installed")
+	def test_requirements_against_rubygems_itself(self):
+		"""The same table asked of Gem::Requirement now, so a table that
+        drifted from what RubyGems says cannot pass."""
+		script = ("require 'json'; vs, rs = JSON.parse(ARGV[0]); puts JSON.dump("
+		          "rs.map { |r| q = Gem::Requirement.new(*r.split(',').map(&:strip));"
+		          " vs.map { |v| q.satisfied_by?(Gem::Version.new(v)) ? '1' : '0'"
+		          " }.join })")
+		r = subprocess.run(["ruby", "-e", script, json.dumps(
+		    [self.VERSIONS, [t for t, _ in self.TABLE]])],
+		    capture_output=True, text=True, timeout=60)
+		self.assertEqual(r.returncode, 0, r.stderr)
+		self.assertEqual(json.loads(r.stdout), [w for _, w in self.TABLE])
+
+	def index(self, name, versions):
+		path = os.path.join(self.root, "api", "v1", "versions", name + ".json")
+		os.makedirs(os.path.dirname(path), exist_ok=True)
+		with open(path, "w") as f:
+			json.dump(versions, f)
+		return "file://" + self.root
+
+	def test_the_newest_release_this_ruby_can_run(self):
+		def v(num, **kw):
+			return dict({"number": num, "platform": "ruby", "prerelease": False,
+			             "ruby_version": ">= 2.7.0", "sha": "ab" * 32,
+			             "summary": "Code style"}, **kw)
+		index = self.index("rubocop", [
+		    v("2.0.0", ruby_version=">= 3.4"), v("1.94.0.rc1", prerelease=True),
+		    v("1.93.0"), v("1.93.1", platform="java"), v("1.93.2", sha=None),
+		    v("1.50.2", ruby_version=">= 2.6.0"), v("1.9")])
+		got = em.gem_choose("rubocop", "3.3.8-2", index)
+		self.assertEqual(got, ("1.93.0", index + "/downloads/rubocop-1.93.0.gem",
+		                       "ab" * 32, "rubocop-1.93.0.gem", "Code style"))
+		self.assertEqual(em.gem_choose("rubocop", "2.6.10", index)[0], "1.50.2")
+		with self.assertRaises(LookupError) as cm:
+			em.gem_choose("rubocop", "2.5.0", index)
+		self.assertIn("needs ruby", str(cm.exception))
+
+	def test_an_atom_tries_both_spellings(self):
+		import urllib.error
+		asked = []
+		def fake(url, **kw):
+			asked.append(url)
+			if "/github_changelog_generator.json" in url:
+				return json.dumps([{"number": "1.18.0", "platform": "ruby",
+				                    "sha": "cd" * 32}]).encode()
+			raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+		with mock.patch.object(em, "fetch", fake):
+			got = em.gem_choose_package("gem-github-changelog-generator",
+			                            "3.3.8", "https://r")
+			self.assertEqual(got[:2], ("github_changelog_generator", "1.18.0"))
+			with self.assertRaises(LookupError):
+				em.gem_choose_package("gem-nothing-here", "3.3.8", "https://r")
+		self.assertEqual(len(asked), 4)
+
+	SPEC = """--- !ruby/object:Gem::Specification
+name: github_changelog_generator
+version: !ruby/object:Gem::Version
+  version: 1.18.0
+platform: ruby
+authors:
+- Petr Korolev
+dependencies:
+- !ruby/object:Gem::Dependency
+  name: octokit
+  version: !ruby/object:Gem::Requirement
+    requirements:
+    - - "~>"
+      - !ruby/object:Gem::Version
+        version: '4.6'
+executables:
+- git-generate-changelog
+- github_changelog_generator
+licenses:
+- MIT
+summary: 'Script that automatically generates a changelog'
+"""
+
+	def test_spec_fields(self):
+		self.assertEqual(em.gem_spec_fields(self.SPEC), {
+		    "name": "github_changelog_generator", "version": "1.18.0",
+		    "executables": ["git-generate-changelog",
+		                    "github_changelog_generator"],
+		    "licenses": ["MIT"]})
+		self.assertEqual(em.gem_spec_fields(
+		    "name: x\nexecutables: []\nlicenses: ['MIT', 'BSD']\n")
+		    ["licenses"], ["MIT", "BSD"])
+
+	def test_fetch_checks_sha256_and_keeps_the_gem(self):
+		import io
+		import tarfile
+		buf = io.BytesIO()
+		with tarfile.open(fileobj=buf, mode="w") as tar:
+			data = gzip.compress(self.SPEC.encode())
+			info = tarfile.TarInfo("metadata.gz")
+			info.size = len(data)
+			tar.addfile(info, io.BytesIO(data))
+		path = os.path.join(self.root, "g-1.18.0.gem")
+		with open(path, "wb") as f:
+			f.write(buf.getvalue())
+		dest = os.path.join(self.root, "work")
+		os.makedirs(dest)
+		with self.assertRaises(RuntimeError):
+			em.gem_fetch("file://" + path, "00" * 32, "g-1.18.0.gem", dest)
+		self.assertEqual(os.listdir(dest), [])
+		meta = em.gem_fetch("file://" + path,
+		                    hashlib.sha256(buf.getvalue()).hexdigest(),
+		                    "g-1.18.0.gem", dest)
+		self.assertEqual(meta["version"], "1.18.0")
+		self.assertEqual(os.listdir(dest), ["g-1.18.0.gem"])
+
+	def test_debian_files(self):
+		meta = em.gem_spec_fields(self.SPEC)
+		files = em.gem_debian_files(meta, "github_changelog_generator",
+		                            "github_changelog_generator-1.18.0.gem",
+		                            "Script  that generates",
+		                            when="Fri, 27 Nov 2026 12:00:00 +0000",
+		                            needs=["octokit", "openssl", "zlib"])
+		pkg = "gem-github-changelog-generator"
+		self.assertIn(f"Package: {pkg}\n", files["control"])
+		self.assertIn("XB-Gem: github_changelog_generator\n", files["control"])
+		self.assertIn("Build-Depends: debhelper-compat (= 13), ruby, ruby-dev, "
+		              "libssl-dev, zlib1g-dev\n", files["control"])
+		self.assertIn("Description: Script that generates\n", files["control"])
+		self.assertTrue(files["changelog"].startswith(f"{pkg} (1.18.0)"))
+		self.assertIn(f"\tgem install --no-document --install-dir $(CURDIR)/"
+		              f"debian/{pkg}/usr/lib/gem/{pkg} --bindir $(CURDIR)/"
+		              f"debian/gem-binstubs $(CURDIR)/../github_changelog_"
+		              f"generator-1.18.0.gem\n", files["rules"])
+		self.assertIn(f"\tinstall -D -m 0755 debian/gem-bin/git-generate-"
+		              f"changelog $(CURDIR)/debian/{pkg}/usr/lib/gem/bin/git-"
+		              f"generate-changelog\n", files["rules"])
+		wrapper = files["gem-bin/github_changelog_generator"]
+		self.assertTrue(wrapper.startswith("#!/usr/bin/ruby\n"))
+		self.assertIn(f'Gem.paths = {{ "GEM_HOME" => "/usr/lib/gem/{pkg}", '
+		              f'"GEM_PATH" => "/usr/lib/gem/{pkg}" }}', wrapper)
+		self.assertIn('load Gem.activate_bin_path("github_changelog_generator", '
+		              '"github_changelog_generator", ">= 0.a")', wrapper)
+		self.assertIn("licenses = MIT", files["copyright"])
+		with self.assertRaises(ValueError):
+			em.gem_debian_files(dict(meta, executables=[]), "lib", "lib-1.gem")
+		with self.assertRaises(ValueError):
+			em.gem_debian_files(dict(meta, executables=["../x"]), "x", "x-1.gem")
+
+	def test_dependency_names(self):
+		deps = {"top": ["a", "b"], "a": ["c"], "b": ["c", "gone"], "c": ["a"]}
+		import urllib.error
+		def fake(url, **kw):
+			name = url.rsplit("/", 1)[1][:-len(".json")]
+			if name not in deps:
+				raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+			return json.dumps({"dependencies": {"runtime": [
+			    {"name": n, "requirements": ">= 0"} for n in deps[name]],
+			    "development": [{"name": "rspec"}]}}).encode()
+		with mock.patch.object(em, "fetch", fake):
+			self.assertEqual(em.gem_dependency_names("top", "https://r"),
+			                 ["a", "b", "c", "gone"])
+
+	def test_upgrades_installed_gem_packages(self):
+		index = self.index("github_changelog_generator", [
+		    {"number": "1.18.0", "platform": "ruby", "sha": "ab" * 32}])
+		dpkg = ("gem-github-changelog-generator\t1.16.4\tii \t"
+		        "github_changelog_generator\n"
+		        "gem-github-changelog-generator-dbgsym\t1.16.4\tii \t\n"
+		        "gem-gone\t1.0\trc \tgone\n"
+		        "gem-handmade\t1.0\tii \t\n")
+		be = em.AptBackend.__new__(em.AptBackend)
+		with mock.patch.object(em, "GEM_INDEX", index), \
+		     mock.patch.object(em, "capture", return_value=mock.Mock(
+		         stdout=dpkg, returncode=0)), \
+		     mock.patch.object(em.AptBackend, "_candidate",
+		                       side_effect=lambda p: {"ruby": "1:3.3+b1",
+		                                              "ruby3.3": "3.3.8-2"}[p]), \
+		     mock.patch.object(em.AptBackend, "_installed_version",
+		                       return_value="1.16.4"):
+			got = be.resolve_gem_upgrades()
+			self.assertEqual(be._ruby_version(), "3.3.8-2")
+		self.assertEqual([g[:3] for g in got],
+		                 [("gem-github-changelog-generator", "1.18.0", "1.16.4")])
+		self.assertEqual(be._gem_plan[0][1], "github_changelog_generator")
+
 class TestBuildDepMarks(unittest.TestCase):
 	"""apt 3's build-dep marks what it installs manual, so a -b build's
     build dependencies joined @world and --depclean kept them for ever

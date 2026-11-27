@@ -75,6 +75,16 @@ How it differs from what you would otherwise use:
   an `npm-*` package holding its dependencies inside it; its commands go
   to `/usr/lib/npm/bin`, the archive's `node-*` libraries are never
   touched, and `-u @world` moves it when a newer release appears.
+- **gem install** writes into `/var/lib/gems` beside Debian's own Ruby
+  libraries, or into a home directory, and the two mix on every
+  `require`. `emerge -b gem-rubocop` installs the newest release
+  Debian's own `ruby` meets the `required_ruby_version` of, from
+  RubyGems' sha256-checked `.gem`, as a `gem-*` package that is its
+  own gem home, dependencies and compiled extensions inside it and
+  their C libraries' `-dev` packages fetched for the build; its
+  commands go to `/usr/lib/gem/bin`, the archive's `ruby-*` libraries
+  are never touched, and `-u @world` moves it when a newer release
+  appears.
 - **Portage** is Gentoo's. This is its vocabulary -- `-av`, `-uD @world`,
   `--depclean`, `-C`, sets, Portage-style output -- on a Debian system, with
   Debian's packages and Debian's own state.

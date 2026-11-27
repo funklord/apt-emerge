@@ -1955,13 +1955,10 @@ write surface ever needs testing.
    (PEP 668 `externally-managed-environment`) precisely because of the
    conflict this would avoid.
 
-   **State, 2026-11-27: three of the four are built** -- PyPI as `pypi-`,
-   crates.io as `cargo-`, npm as `npm-`, each in its entry below, each
-   proven in a trixie container including `-u @world`. **Open, and the
-   holder's: whether RubyGems follows, and under what name.** Each
-   namespace so far was the holder's choice; `gem-<name>` is the
-   pattern's guess, beside the archive's `ruby-*`. Nothing else in this
-   item waits on it.
+   **State, 2026-11-27: all four are built** -- PyPI as `pypi-`,
+   crates.io as `cargo-`, npm as `npm-`, RubyGems as `gem-`, each
+   namespace the holder's choice, each in its entry below, each proven
+   in a trixie container including `-u @world`.
 
    **Shape.** emerge orchestrates; it does not become a packager. Converters
    already exist and are packaged: `stdeb`/`pybuild` (Python), `gem2deb`,
@@ -2328,6 +2325,60 @@ write surface ever needs testing.
      built as for a node 18, then `emerge -u @world` listed
      `npm-vite-8.4.0 [6.4.6]` among eight archive upgrades, built it,
      `vite --version` ran, and a second `-pu` found nothing outdated.
+   - **Ruby programs from RubyGems: `gem-<name>`** (holder, 2026-11-27).
+     The archive's own Ruby libraries are `ruby-*` and its programs carry
+     their plain names; neither is touched. A gem's `_` is `-`, which
+     Debian cannot spell otherwise and gem2deb maps the same way; an atom
+     looks the gem up as spelled and then with every `-` as `_`
+     (`gem-github-changelog-generator` is `github_changelog_generator`),
+     and the package records the gem it came from in a `Gem` field,
+     which `-u` reads rather than guessing again. A capital, which only
+     old gems carry, is refused.
+
+     `gem_choose()` reads RubyGems' versions API and takes the newest
+     release that is not a pre-release, is the source (`ruby` platform)
+     build, and whose `required_ruby_version` the archive's interpreter
+     meets -- `ruby` is only `1:3.3+b1`, so the version asked is that of
+     the `ruby3.3` it stands for. `gem_requirement_holds()` agrees with
+     RubyGems' own `Gem::Requirement` (ruby 3.3.8) on 69 requirements,
+     58 of them real gems' `required_ruby_version`, at 19 Ruby versions;
+     the suite keeps 34 as a table and re-asks Ruby where it is
+     installed. Its first version took `1` from `2.7.0.preview1` as a
+     fourth number; a pre-release bound sits just below its release.
+     Whether a release has a program is known only from the `.gem`: its
+     metadata is read (`gem_spec_fields()`, the top-level keys Psych
+     writes, since stdlib Python has no YAML) and a library is refused.
+
+     The `.gem` is checked against RubyGems' sha256 and installed byte
+     for byte with `gem install --install-dir /usr/lib/gem/<package>`:
+     each package is its own GEM_HOME with its dependencies, and
+     compiled extensions, inside it -- one more namespace with nothing to
+     share, so no closure to plan. RubyGems' own binstubs would need
+     GEM_PATH set; each command in `/usr/lib/gem/bin` (`GEM_BIN`) is
+     instead four lines of Ruby that set `Gem.paths` for that process
+     alone and load the command as a binstub would, so no environment
+     variable leaks into what the program runs. `Depends: ruby` plus
+     what `dh_shlibdeps` finds in an extension (`libruby3.3`).
+
+     **A native gem gets its C library** (2026-11-27), as a `-sys` crate
+     does: github_changelog_generator 1.18.0 pulled `openssl` 4.0.2,
+     newer than ruby's own, whose extconf stopped at "OpenSSL library
+     could not be found". The build walks the gem's runtime dependencies
+     by name (`gem_dependency_names()`, a level at a time with eight
+     requests in flight: 44 names in 0.3 s, 21 s serially) and maps the
+     native ones through `_GEM_NATIVE_PACKAGES`, sixteen names checked
+     against trixie, to `-dev` Build-Depends.
+
+     Proven 2026-11-27 in a trixie container: `emerge -b gem-rubocop`
+     (1.93.0; fifteen gems, racc's and json's extensions compiled)
+     linted a file, and `gem-github-changelog-generator` (1.18.0, 44
+     gems, openssl against `libssl-dev`, `Depends` naming `libssl3t64`)
+     printed its version; both in @world, `ruby` and `ruby-dev` left
+     auto, and neither in the system's `gem list`. The upgrade:
+     asciidoctor 2.0.20 built by hand, then `emerge -u @world` listed
+     `gem-asciidoctor-2.0.26 [2.0.20]` among eight archive upgrades,
+     built it, it rendered a document, and a second `-pu` found nothing
+     outdated.
    - *Transitive closure size*, npm especially -- answered for `npm-` by
      installing each package's closure inside it, above.
    - *apt backend only*, like `-b/-B`: it needs build tooling, and the dpkg
