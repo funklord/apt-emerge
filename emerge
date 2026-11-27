@@ -762,9 +762,13 @@ PYPI_TREE = "/usr/lib/pypi/python3"
 PYPI_BIN = "/usr/lib/pypi/bin"
 
 # build-system.requires names a PyPI project; dh-python runs the backend
-# from the system, so Build-Depends names the archive's package. Every
-# common backend is python3-<name> but this one (trixie, 2026-11-26).
-_PYPI_BUILD_PACKAGES = {"flit-core": "flit"}
+# from the system, so Build-Depends names the archive's package. Most
+# are python3-<name>; these are not (trixie, measured with apt-cache over
+# the common backends and build helpers, 2026-11-27). Without the entry
+# the requirement names no archive package and is built from PyPI --
+# Cython, a large compiled build, in place of the archive's cython3.
+_PYPI_BUILD_PACKAGES = {"flit-core": "flit", "cython": "cython3",
+                        "meson-python": "python3-mesonpy"}
 
 def pypi_sdist_metadata(tree):
 	"""What an unpacked sdist says about itself: its PKG-INFO, and the

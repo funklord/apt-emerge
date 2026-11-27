@@ -763,6 +763,14 @@ class TestPypiDebianFiles(unittest.TestCase):
 		self.assertNotIn(em.PYPI_TREE + "\n", files["rules"].split(
 			"PYTHONPATH=")[1].split("\n")[0] + "\n")
 
+	def test_backends_the_archive_spells_differently(self):
+		for requirement, package in (("flit_core>=3.2", "flit"),
+		                             ("Cython>=3.0", "cython3"),
+		                             ("meson-python", "python3-mesonpy"),
+		                             ("hatchling", "python3-hatchling")):
+			self.assertEqual(em._pypi_build_package(requirement, self.env),
+			                 package)
+
 	def test_no_pyproject_means_setuptools(self):
 		meta = em.pypi_sdist_metadata(self.sdist(
 			"Metadata-Version: 2.1\nName: old\nVersion: 1.0\n"))
