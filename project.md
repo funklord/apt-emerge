@@ -1918,7 +1918,7 @@ write surface ever needs testing.
    a real upstream change keeps `(session)` and the restart warning. The
    derived set is still broad, but breadth now costs a mild note rather than a
    false alarm. See "Session-critical detection".
-7. **The dpkg backend on real apt-less hardware.** Deprioritised by the owner
+7. ~~The dpkg backend on real apt-less hardware~~ -- **done**. Deprioritised by the owner
    — rare case, mostly works. Both things this entry called
    hardware-specific have since been closed without any, which is the second
    time that has happened (see config merging in the testing notes):
@@ -1938,10 +1938,18 @@ write surface ever needs testing.
    install → world file finally runs as one path, including `-p`, `-1` and
    `-C`.
 
-   What genuinely remains is only this: nobody has run it on a machine that
-   has no `apt-get` *installed*, where the difference is the box, not the
-   program. That is worth doing once for confidence and is not blocking
-   anything.
+   What remained was a machine that has no `apt-get` *installed*, where
+   the difference is the box, not the program. **Done 2026-11-27**, on a
+   trixie container with apt purged (`dpkg --purge
+   --force-remove-essential apt`; the purge removes `/usr/bin/apt-get`,
+   checked in a fresh container) against the real archive over the
+   network: `emerge --info` chose the dpkg backend unforced, `--sync`
+   fetched three indexes and verified all three against their signed
+   Release files with the image's keyring and `gpgv`, `-pv hello`
+   planned it, `emerge hello` installed it and `hello` ran, world held
+   it, `-s` searched the synced tree, and `-C hello` removed it. Two
+   things a container is not: a non-amd64 box, and one whose dpkg is
+   older than trixie's; neither was asked for.
 8. ~~`-1`/`--oneshot` on the apt backend~~ — **done**. The owner relaxed hard
    rule 3 (see it: the version-pin ban is intact, only the blanket `apt-mark`
    ban was too broad). `--oneshot` now marks the newly-added atoms back to
