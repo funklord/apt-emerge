@@ -5428,6 +5428,14 @@ class AptBackend:
 		newver = pep440_to_debian(version)
 		pv = f"{package}-{newver}"
 		print(f"\n{ARROW} Emerging ({i} of {total}) {BGREEN(pv)}")
+		# A plan is computed before it runs, and a backend built for one
+		# of its packages can bring another of them with it: on bookworm
+		# setuptools-scm, built for pluggy, was built again two steps on
+		# for hatch-vcs (2026-11-27). Once per run is enough.
+		built = self.__dict__.setdefault("_pypi_built", {})
+		if (package, version) in built:
+			print(f"{ARROW} {pv} was built earlier in this run")
+			return built[(package, version)]
 		tries = 0
 		try:
 			while True:
@@ -5531,8 +5539,10 @@ class AptBackend:
 			with open(os.path.join(srcdir, "debian", "control"), "w",
 			          encoding="utf-8") as f:
 				f.write(files["control"])
-		return self._compile_and_merge(package, newver, srcdir, workdir, env,
-		                               use, opts, pv, i, total)
+		merged = self._compile_and_merge(package, newver, srcdir, workdir,
+		                                 env, use, opts, pv, i, total)
+		built[(package, version)] = merged
+		return merged
 
 	@staticmethod
 	def _manual_set():
