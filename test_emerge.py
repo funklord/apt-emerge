@@ -1258,6 +1258,8 @@ class TestNpmNamespace(unittest.TestCase):
 		              "$(CURDIR)/debian/npm-s--tool/usr/lib/npm "
 		              "$(CURDIR)/../tool-2.1.0-rc.1.tgz\n", files["rules"])
 		self.assertIn("export npm_config_cache=$(CURDIR)/debian/", files["rules"])
+		self.assertIn("\noverride_dh_strip:\noverride_dh_auto_install:\n",
+		              files["rules"])
 		self.assertIn('license = "MIT"', files["copyright"])
 		self.assertIn("upstream's words", files["copyright"])
 		self.assertIn("\tpython3 debian/npm-prune-libc $(CURDIR)/debian/"

@@ -1686,6 +1686,14 @@ def npm_debian_files(meta, tarball, when=None):
 	                  "override_dh_auto_build:\n"
 	                  "override_dh_auto_test:\n"
 	                  "override_dh_dwz:\n"
+	                  # Nothing is stripped: a program published as one
+	                  # executable (Bun's, Deno's, pkg's) carries its code
+	                  # after the ELF sections, which strip removes.
+	                  # @anthropic-ai/claude-code's claude.exe, stripped,
+	                  # was the bare Bun runtime and printed Bun's version
+	                  # (measured 2026-11-27). Prebuilt modules come
+	                  # stripped already.
+	                  "override_dh_strip:\n"
 	                  "override_dh_auto_install:\n"
 	                  f"\tnpm install --global --omit=dev"
 	                  f" --prefix $(CURDIR)/{d}{NPM_PREFIX}"

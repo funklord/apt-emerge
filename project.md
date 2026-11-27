@@ -2289,6 +2289,18 @@ write surface ever needs testing.
        one (`bin/vite.js`): the targets of the command links, and of
        npm's `.bin` links for dependencies, get their mode back.
 
+     **And nothing is stripped** (2026-11-27). A program published as
+     one executable -- Bun's, Deno's, `pkg`'s -- carries its code after
+     the ELF sections, and `dh_strip` cut it off: built that way,
+     `@anthropic-ai/claude-code` 2.1.197 installed a `claude` that was
+     the bare Bun runtime and answered `--version` with Bun's `1.4.0`,
+     exit 0, every check green. Unstripped it prints `2.1.197 (Claude
+     Code)`. Prebuilt native modules come stripped already, so the cost
+     is the symbols of a module node-gyp compiles, and no `-dbgsym`.
+     That build also proved the scoped path: `npm-anthropic-ai--claude-code`,
+     its musl variant pruned, the glibc binary hardlinked into place by
+     its postinstall, `Depends: nodejs, libc6 (>= 2.34)`.
+
      Proven 2026-11-27 in a trixie container: `emerge -b npm-prettier`
      (3.10.1, no dependencies) and `npm-http-server` (14.1.1, 844 files
      with its dependencies) built and ran from `/usr/lib/npm/bin`, both
