@@ -1254,7 +1254,8 @@ class TestNpmNamespace(unittest.TestCase):
 		              files["control"])
 		self.assertTrue(files["changelog"].startswith(
 		    "npm-s--tool (2.1.0~rc.1)"))
-		self.assertIn("npm install --global --omit=dev --prefix "
+		self.assertIn("npm install --global --omit=dev --foreground-scripts "
+		              "--prefix "
 		              "$(CURDIR)/debian/npm-s--tool/usr/lib/npm "
 		              "$(CURDIR)/../tool-2.1.0-rc.1.tgz\n", files["rules"])
 		self.assertIn("export npm_config_cache=$(CURDIR)/debian/", files["rules"])

@@ -1695,7 +1695,10 @@ def npm_debian_files(meta, tarball, when=None):
 	                  # stripped already.
 	                  "override_dh_strip:\n"
 	                  "override_dh_auto_install:\n"
-	                  f"\tnpm install --global --omit=dev"
+	                  # --foreground-scripts: a native module's compiler
+	                  # errors reach the build log, where npm otherwise
+	                  # prints only `gyp ERR! not ok` (2026-11-27).
+	                  f"\tnpm install --global --omit=dev --foreground-scripts"
 	                  f" --prefix $(CURDIR)/{d}{NPM_PREFIX}"
 	                  f" $(CURDIR)/../{tarball}\n"
 	                  f"\tpython3 debian/npm-prune-libc $(CURDIR)/{d}{NPM_PREFIX}\n"

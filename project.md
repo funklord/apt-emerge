@@ -2301,6 +2301,18 @@ write surface ever needs testing.
      its musl variant pruned, the glibc binary hardlinked into place by
      its postinstall, `Depends: nodejs, libc6 (>= 2.34)`.
 
+     **A native module compiles, and says why when it cannot**
+     (2026-11-27). trixie's `npm` depends on `node-gyp`, which depends on
+     `libnode-dev`, so `Build-Depends: npm` brings the headers and gyp
+     uses `/usr/include/nodejs` without downloading any. Tried with
+     `sqlite3-cli` 1.0.0: gyp configured and compiled sqlite3.c, then
+     better-sqlite3 5.x's C++ failed on V8 API that Node 20 no longer
+     has (`v8::AccessorSignature`, `Object::CreationContext`) --
+     upstream's incompatibility, and an older Node is not on offer. npm
+     printed only `gyp ERR! not ok` for it until the install ran with
+     `--foreground-scripts`, which puts the compiler's errors in the
+     build log.
+
      Proven 2026-11-27 in a trixie container: `emerge -b npm-prettier`
      (3.10.1, no dependencies) and `npm-http-server` (14.1.1, 844 files
      with its dependencies) built and ran from `/usr/lib/npm/bin`, both
