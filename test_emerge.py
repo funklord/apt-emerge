@@ -681,6 +681,8 @@ class TestPypiDebianFiles(unittest.TestCase):
 		self.env = dict(em.pep508_environment(), python_version="3.13",
 		                python_full_version="3.13.5")
 
+	@unittest.skipUnless(sys.version_info >= (3, 11),
+	                     "reading the TOML needs tomllib, Python 3.11")
 	def test_a_package_with_dependencies(self):
 		tree = self.sdist(
 			"Metadata-Version: 2.1\nName: Foo.Bar\nVersion: 1.2rc1\n"
@@ -1005,6 +1007,8 @@ class TestCargoNamespace(unittest.TestCase):
 		with self.assertRaises(LookupError):
 			em.cargo_choose("lib", "1.85.1", index)
 
+	@unittest.skipUnless(sys.version_info >= (3, 11),
+	                     "reading the TOML needs tomllib, Python 3.11")
 	def test_debian_files(self):
 		tree = os.path.join(self.root, "fd-find-10.3.0")
 		os.makedirs(tree)

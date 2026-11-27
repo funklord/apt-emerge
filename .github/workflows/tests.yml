@@ -10,7 +10,10 @@ jobs:
   # ship -- an embedded Debian is not necessarily current.
   unit:
     name: python ${{ matrix.python }}
-    runs-on: ubuntu-latest
+    # Not ubuntu-latest: that became 26.04 in November 2026, which
+    # setup-python has no 3.9 for, and every run since failed in setup
+    # with the 3.9 leg testing nothing.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
