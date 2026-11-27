@@ -68,6 +68,13 @@ How it differs from what you would otherwise use:
   source with the lock file it was published with, as a `cargo-*`
   package whose programs go to `/usr/lib/cargo/bin`; `-u @world`
   rebuilds it when a newer buildable release appears.
+- **npm install --global** writes into `/usr/local` or a home directory,
+  again where dpkg cannot see it and nothing upgrades it. `emerge -b
+  npm-prettier` installs the newest release that Debian's own `nodejs`
+  meets the `engines` of, from the registry's sha512-checked tarball, as
+  an `npm-*` package holding its dependencies inside it; its commands go
+  to `/usr/lib/npm/bin`, the archive's `node-*` libraries are never
+  touched, and `-u @world` moves it when a newer release appears.
 - **Portage** is Gentoo's. This is its vocabulary -- `-av`, `-uD @world`,
   `--depclean`, `-C`, sets, Portage-style output -- on a Debian system, with
   Debian's packages and Debian's own state.

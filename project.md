@@ -2244,7 +2244,60 @@ write surface ever needs testing.
      (`openssl-sys`, `curl-sys`, `libssh2-sys`, `libz-sys`): built, its
      programs link the system's libcurl, libssl, libz and libssh2, and
      `Depends` names them.
-   - *Transitive closure size*, npm especially.
+   - **Node programs from npm: `npm-<name>`** (holder, 2026-11-27). The
+     archive's own Node libraries are `node-*` and its programs carry
+     their plain names; neither is touched. A scope's `@scope/name` is
+     `npm-scope--name`: Debian has no `@` or `/`, and a `--` inside
+     either part is refused so the mapping reads back
+     (`npm_registry_name()`), which `-u` needs. Names Debian cannot spell
+     -- `_`, `~`, the capitals only pre-2017 names carry -- are refused.
+
+     `npm_choose()` reads the registry's abbreviated metadata and takes
+     the newest release no newer than the `latest` tag (what `npm install`
+     takes), not a pre-release, with a `bin`, whose `engines.node` the
+     archive's `nodejs` meets -- the `rust-version` rule again; a
+     deprecated release only when nothing else qualifies. An
+     `engines.node` npm itself could not read does not stop the choice,
+     since it does not stop npm. `npm_range_holds()` reads node-semver's
+     range grammar (`^`, `~`, x-ranges, hyphens, `||`), checked against
+     trixie's node-semver 7.6.1 on 128 ranges, 120 of them real
+     packages' `engines.node`, at 29 Node versions; the unit suite holds
+     52 of them as a table and re-asks node-semver where it is installed.
+
+     The tarball is checked against the registry's sha512 integrity and
+     kept, and the build installs exactly those bytes with `npm install
+     --global --omit=dev --prefix /usr/lib/npm` -- the way npm's users
+     install a program -- so the package lands in
+     `lib/node_modules/<name>` with its dependencies nested inside it and
+     its commands as links in `/usr/lib/npm/bin` (`NPM_BIN`). That is why
+     npm needs no closure planning, the item this list once warned of:
+     two `npm-` packages can share no file, and none is a `node-*`.
+     Dependencies are fetched during the build, with their install
+     scripts, as `npm install` runs them; npm's cache and configuration
+     live inside the build tree. `Depends: nodejs` plus what
+     `dh_shlibdeps` finds in a native module, so `Architecture: any`.
+
+     Two things the build undoes, both measured on vite 8:
+     - *Foreign-libc binaries.* trixie's npm 9 installs an optional
+       dependency matching `os` and `cpu` without reading `libc`, so
+       vite came with rolldown's and lightningcss's musl builds beside
+       glibc's, and `dpkg-shlibdeps` refused the build for
+       `libc.musl-x86_64.so.1`. The build removes every package whose
+       `libc` rules glibc out (`NPM_PRUNE_LIBC`), and the links that
+       pointed into it.
+     - *`dh_fixperms`* sets every `*.js` to 0644, and a command is often
+       one (`bin/vite.js`): the targets of the command links, and of
+       npm's `.bin` links for dependencies, get their mode back.
+
+     Proven 2026-11-27 in a trixie container: `emerge -b npm-prettier`
+     (3.10.1, no dependencies) and `npm-http-server` (14.1.1, 844 files
+     with its dependencies) built and ran from `/usr/lib/npm/bin`, both
+     in @world, `nodejs` and `npm` left auto. The upgrade: vite 6.4.6
+     built as for a node 18, then `emerge -u @world` listed
+     `npm-vite-8.4.0 [6.4.6]` among eight archive upgrades, built it,
+     `vite --version` ran, and a second `-pu` found nothing outdated.
+   - *Transitive closure size*, npm especially -- answered for `npm-` by
+     installing each package's closure inside it, above.
    - *apt backend only*, like `-b/-B`: it needs build tooling, and the dpkg
      backend is binary-only by design.
 

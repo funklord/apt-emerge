@@ -1046,6 +1046,275 @@ class TestCargoNamespace(unittest.TestCase):
 		self.assertNotIn("--locked", files["rules"])
 
 
+class TestNpmNamespace(unittest.TestCase):
+	"""A Node program built as npm-<name> (holder, 2026-11-27)."""
+
+	# What node-semver 7.6.1 (trixie's node-semver) answers for each range
+	# at each of these Node versions, one digit per version: the ranges
+	# probe each construct, then a sample of the engines.node values real
+	# packages published (prettier, typescript, vite, eslint, ...).
+	VERSIONS = "0.0.0 0.0.3 0.0.4 0.1.0 0.2.5 0.8.0 1.2.0 1.2.3 1.2.9 1.9.0 2.3.4 2.9.0 4.0.0 10.0.0 12.22.0 14.17.0 16.0.0 18.0.0 18.17.0 18.17.1 19.0.0 20.0.0 20.5.0 20.19.2 20.19.3 20.20.0 21.0.0 22.12.0 24.0.0".split()
+	TABLE = [
+		('^1.2.3',                           "00000001110000000000000000000"),
+		('^0.2.3',                           "00001000000000000000000000000"),
+		('^0.0.3',                           "01000000000000000000000000000"),
+		('^0.0',                             "11100000000000000000000000000"),
+		('^0',                               "11111100000000000000000000000"),
+		('^1.2',                             "00000011110000000000000000000"),
+		('~1.2.3',                           "00000001100000000000000000000"),
+		('~1.2',                             "00000011100000000000000000000"),
+		('~1',                               "00000011110000000000000000000"),
+		('>1',                               "00000000001111111111111111111"),
+		('>1.2',                             "00000000011111111111111111111"),
+		('<=1.2',                            "11111111100000000000000000000"),
+		('<1.2',                             "11111100000000000000000000000"),
+		('>=1.2',                            "00000011111111111111111111111"),
+		('1.2 - 2.3.4',                      "00000011111000000000000000000"),
+		('1.2.3 - 2',                        "00000001111100000000000000000"),
+		('1.x',                              "00000011110000000000000000000"),
+		('*',                                "11111111111111111111111111111"),
+		('',                                 "11111111111111111111111111111"),
+		('>= 18',                            "00000000000000000111111111111"),
+		('^18.17.0 || >=20.5.0',             "00000000000000000011001111111"),
+		('>=18.0.0-0',                       "00000000000000000111111111111"),
+		('<20.19.2',                         "11111111111111111111111000000"),
+		('<=20.19',                          "11111111111111111111111110000"),
+		('20',                               "00000000000000000000011111000"),
+		('20.19.2',                          "00000000000000000000000100000"),
+		('=20.19.2',                         "00000000000000000000000100000"),
+		('v20',                              "00000000000000000000011111000"),
+		('>=14 <21',                         "00000000000000011111111111000"),
+		('~20.19.3',                         "00000000000000000000000010000"),
+		('^20.20',                           "00000000000000000000000001000"),
+		('>*',                               "00000000000000000000000000000"),
+		('x',                                "11111111111111111111111111111"),
+		('^0.0.0',                           "10000000000000000000000000000"),
+		('1.2.x || >=20 <20.19',             "00000011100000000000011000000"),
+		('20.x',                             "00000000000000000000011111000"),
+		('0.4',                              "00000000000000000000000000000"),
+		('18 || 20 || >=22',                 "00000000000000000111011111011"),
+		('>= 12.17.0',                       "00000000000000111111111111111"),
+		('>= 16.0.0',                        "00000000000000001111111111111"),
+		('>=0.8.0',                          "00000111111111111111111111111"),
+		('>=10.16',                          "00000000000000111111111111111"),
+		('>=12.20',                          "00000000000000111111111111111"),
+		('>=14.19',                          "00000000000000001111111111111"),
+		('>=16.14',                          "00000000000000000111111111111"),
+		('>=18.12.0',                        "00000000000000000011111111111"),
+		('>=22.12.0',                        "00000000000000000000000000011"),
+		('>=6',                              "00000000000001111111111111111"),
+		('>=8.10.0',                         "00000000000001111111111111111"),
+		('^12.13.0 || ^14.15.0 || >=16.0.0', "00000000000000111111111111111"),
+		('^18.18.0 || ^20.9.0 || >=21.1.0',  "00000000000000000000000111011"),
+		('^8.10.0 || ^10.13.0 || >=11.10.1', "00000000000000111111111111111"),
+	]
+
+	def setUp(self):
+		self.root = tempfile.mkdtemp()
+		self.addCleanup(shutil.rmtree, self.root)
+
+	def test_names(self):
+		self.assertEqual(em.npm_package_name("prettier"), "npm-prettier")
+		self.assertEqual(em.npm_package_name("@anthropic-ai/claude-code"),
+		                 "npm-anthropic-ai--claude-code")
+		for name in ["prettier", "@anthropic-ai/claude-code", "a.b", "x-1"]:
+			with self.subTest(name=name):
+				self.assertEqual(
+				    em.npm_registry_name(em.npm_package_name(name)), name)
+		for bad in ["", "Foo", "a_b", "a~b", "-a", ".a", "@a/", "@/a",
+		            "@a--b/c", "x--y", "@a/b/c", "x" * 215]:
+			with self.subTest(bad=bad), self.assertRaises(ValueError):
+				em.npm_package_name(bad)
+		with self.assertRaises(ValueError):
+			em.npm_registry_name("npm-x---y")
+
+	def test_ranges_as_node_semver_reads_them(self):
+		versions = [tuple(map(int, v.split("."))) for v in self.VERSIONS]
+		for text, want in self.TABLE:
+			with self.subTest(range=text):
+				got = "".join("1" if em.npm_range_holds(text, v) else "0"
+				              for v in versions)
+				self.assertEqual(got, want)
+
+	@unittest.skipUnless(shutil.which("node") and
+	                     os.path.isdir("/usr/share/nodejs/semver"),
+	                     "node and node-semver not installed")
+	def test_ranges_against_node_semver_itself(self):
+		"""The same table asked of node-semver now, so a table that drifted
+        from what node says cannot pass."""
+		script = ("const s = require('/usr/share/nodejs/semver');"
+		          "const [vs, rs] = JSON.parse(process.argv[1]);"
+		          "console.log(JSON.stringify(rs.map(r => vs.map("
+		          "v => s.satisfies(v, r) ? '1' : '0').join(''))))")
+		r = subprocess.run(["node", "-e", script, json.dumps(
+		    [self.VERSIONS, [t for t, _ in self.TABLE]])],
+		    capture_output=True, text=True, timeout=60)
+		self.assertEqual(r.returncode, 0, r.stderr)
+		self.assertEqual(json.loads(r.stdout), [w for _, w in self.TABLE])
+
+	def test_engines(self):
+		node = "20.19.2+dfsg-1"
+		self.assertTrue(em._npm_node_fits(None, node))
+		self.assertTrue(em._npm_node_fits({"npm": ">=99"}, node))
+		self.assertTrue(em._npm_node_fits({"node": ">=18"}, node))
+		self.assertFalse(em._npm_node_fits({"node": ">=22"}, node))
+		self.assertTrue(em._npm_node_fits({"node": "not a range"}, node))
+		self.assertFalse(em._npm_node_fits({"node": ">=18"}, None))
+
+	def registry(self, name, versions, latest):
+		path = os.path.join(self.root, "registry", name)
+		os.makedirs(os.path.dirname(path), exist_ok=True)
+		with open(path, "w") as f:
+			json.dump({"name": name, "dist-tags": {"latest": latest},
+			           "versions": versions}, f)
+		return "file://" + os.path.join(self.root, "registry")
+
+	def test_the_newest_release_this_node_can_run(self):
+		def v(num, **kw):
+			out = {"bin": {"vite": "bin/vite.js"}, "engines": {"node": ">=18"},
+			       "dist": {"integrity": "sha512-" + "A" * 86 + "==",
+			                "tarball": f"https://r/vite/-/vite-{num}.tgz"}}
+			out.update(kw)
+			return out
+		index = self.registry("vite", {
+		    "8.4.0": v("8.4.0", engines={"node": "^20.19.0 || >=22.12.0"}),
+		    "9.0.0": v("9.0.0"),                      # above latest
+		    "8.5.0-beta.1": v("8.5.0-beta.1"),
+		    "8.3.0": v("8.3.0", deprecated="broken"),
+		    "6.4.6": v("6.4.6"),
+		    "6.4.7": v("6.4.7", bin=None),
+		    "6.4.8": v("6.4.8", dist={"tarball": "x", "shasum": "ab"})},
+		    "8.4.0")
+		got = em.npm_choose("vite", "20.19.2+dfsg-1", index)
+		self.assertEqual(got[:2], ("8.4.0", "https://r/vite/-/vite-8.4.0.tgz"))
+		self.assertEqual(got[2], "00" * 64)
+		self.assertEqual(got[3], "vite-8.4.0.tgz")
+		self.assertEqual(em.npm_choose("vite", "18.0.0", index)[0], "6.4.6")
+		with self.assertRaises(LookupError) as cm:
+			em.npm_choose("vite", "16.0.0", index)
+		self.assertIn("needs node ^20.19.0 || >=22.12.0", str(cm.exception))
+		index = self.registry("old", {"1.0.0": v("1.0.0", deprecated="x"),
+		                              "0.9.0": v("0.9.0")}, "1.0.0")
+		self.assertEqual(em.npm_choose("old", "20.0.0", index)[0], "0.9.0")
+		index = self.registry("dead", {"1.0.0": v("1.0.0", deprecated="x")},
+		                      "1.0.0")
+		self.assertEqual(em.npm_choose("dead", "20.0.0", index)[0], "1.0.0")
+		index = self.registry("@s/tool", {"1.0.0": v("1.0.0")}, "1.0.0")
+		self.assertEqual(em.npm_choose("@s/tool", "20.0.0", index)[0], "1.0.0")
+
+	def tarball(self, files):
+		import io
+		import tarfile
+		buf = io.BytesIO()
+		with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+			for name, text in files.items():
+				data = text.encode()
+				info = tarfile.TarInfo(name)
+				info.size = len(data)
+				tar.addfile(info, io.BytesIO(data))
+		path = os.path.join(self.root, "t-1.0.0.tgz")
+		with open(path, "wb") as f:
+			f.write(buf.getvalue())
+		return path, hashlib.sha512(buf.getvalue()).hexdigest()
+
+	def test_fetch_checks_sha512_and_keeps_the_tarball(self):
+		path, digest = self.tarball({"package/package.json":
+		                             '{"name": "t", "version": "1.0.0"}'})
+		dest = os.path.join(self.root, "work")
+		os.makedirs(dest)
+		with self.assertRaises(RuntimeError):
+			em.npm_fetch_tarball("file://" + path, "00" * 64, "t-1.0.0.tgz",
+			                     dest)
+		self.assertEqual(os.listdir(dest), [])
+		tree = em.npm_fetch_tarball("file://" + path, digest, "t-1.0.0.tgz",
+		                            dest)
+		self.assertEqual(tree, os.path.join(dest, "package"))
+		with open(os.path.join(dest, "t-1.0.0.tgz"), "rb") as f, \
+		     open(path, "rb") as g:
+			self.assertEqual(f.read(), g.read())
+
+	def test_debian_files(self):
+		tree = os.path.join(self.root, "package")
+		os.makedirs(tree)
+		with open(os.path.join(tree, "package.json"), "w") as f:
+			json.dump({"name": "@s/tool", "version": "2.1.0-rc.1",
+			           "description": "A  tool", "license": "MIT",
+			           "bin": "cli.js"}, f)
+		with open(os.path.join(tree, "LICENSE"), "w") as f:
+			f.write("upstream's words\n")
+		meta = em.npm_package_metadata(tree)
+		self.assertEqual(meta["bin"], {"tool": "cli.js"})
+		files = em.npm_debian_files(meta, "tool-2.1.0-rc.1.tgz",
+		                            when="Fri, 27 Nov 2026 12:00:00 +0000")
+		self.assertIn("Package: npm-s--tool\n", files["control"])
+		self.assertIn("Depends: nodejs, ${shlibs:Depends}", files["control"])
+		self.assertIn("Description: A tool\n", files["control"])
+		self.assertIn("Build-Depends: debhelper-compat (= 13), nodejs, npm, "
+		              "python3\n",
+		              files["control"])
+		self.assertTrue(files["changelog"].startswith(
+		    "npm-s--tool (2.1.0~rc.1)"))
+		self.assertIn("npm install --global --omit=dev --prefix "
+		              "$(CURDIR)/debian/npm-s--tool/usr/lib/npm "
+		              "$(CURDIR)/../tool-2.1.0-rc.1.tgz\n", files["rules"])
+		self.assertIn("export npm_config_cache=$(CURDIR)/debian/", files["rules"])
+		self.assertIn('license = "MIT"', files["copyright"])
+		self.assertIn("upstream's words", files["copyright"])
+		self.assertIn("\tpython3 debian/npm-prune-libc $(CURDIR)/debian/"
+		              "npm-s--tool/usr/lib/npm\n", files["rules"])
+		self.assertIn("override_dh_fixperms:\n\tdh_fixperms\n\tfind $(CURDIR)/"
+		              "debian/npm-s--tool/usr/lib/npm -type l \\( -path "
+		              "'*/node_modules/.bin/*' -o -path '*/usr/lib/npm/bin/*' "
+		              "\\) -exec chmod 755 {} +\n", files["rules"])
+
+	def test_prune_removes_what_glibc_cannot_load(self):
+		"""vite 8 under npm 9: musl builds of its native bindings beside
+        glibc's, which dpkg-shlibdeps refused (2026-11-27)."""
+		root = os.path.join(self.root, "usr", "lib", "npm")
+		mods = os.path.join(root, "lib", "node_modules", "vite", "node_modules")
+		for name, libc in [("x-gnu", ["glibc"]), ("x-musl", ["musl"]),
+		                   ("@r/b-musl", ["musl"]), ("not-musl", ["!musl"]),
+		                   ("any", None), ("odd", "glibc")]:
+			os.makedirs(os.path.join(mods, name))
+			with open(os.path.join(mods, name, "package.json"), "w") as f:
+				json.dump({"name": name} if libc is None
+				          else {"name": name, "libc": libc}, f)
+		os.makedirs(os.path.join(mods, ".bin"))
+		os.symlink("../x-musl/cli.js", os.path.join(mods, ".bin", "xm"))
+		os.symlink("../x-gnu/package.json", os.path.join(mods, ".bin", "xg"))
+		script = os.path.join(self.root, "prune")
+		with open(script, "w") as f:
+			f.write(em.NPM_PRUNE_LIBC)
+		r = subprocess.run([sys.executable, script, root],
+		                   capture_output=True, text=True, timeout=60)
+		self.assertEqual(r.returncode, 0, r.stderr)
+		self.assertEqual(sorted(os.listdir(mods)),
+		                 [".bin", "@r", "any", "not-musl", "odd", "x-gnu"])
+		self.assertEqual(os.listdir(os.path.join(mods, "@r")), [])
+		self.assertEqual(os.listdir(os.path.join(mods, ".bin")), ["xg"])
+
+	def test_upgrades_installed_npm_packages(self):
+		index = self.registry("prettier", {"3.10.1": {
+		    "bin": {"prettier": "bin/prettier.cjs"},
+		    "dist": {"integrity": "sha512-" + "A" * 86 + "==",
+		             "tarball": "https://r/p.tgz"}}}, "3.10.1")
+		dpkg = ("npm-prettier\t3.0.0\tii \n"
+		        "npm-prettier-dbgsym\t3.0.0\tii \n"
+		        "npm-gone\t1.0\trc \n"
+		        "npm-Bad_name\t1.0\tii \n")
+		be = em.AptBackend.__new__(em.AptBackend)
+		with mock.patch.object(em, "NPM_INDEX", index), \
+		     mock.patch.object(em, "capture", return_value=mock.Mock(
+		         stdout=dpkg, returncode=0)), \
+		     mock.patch.object(em.AptBackend, "_candidate",
+		                       return_value="20.19.2+dfsg-1"), \
+		     mock.patch.object(em.AptBackend, "_installed_version",
+		                       return_value="3.0.0"):
+			got = be.resolve_npm_upgrades()
+		self.assertEqual([g[:3] for g in got],
+		                 [("npm-prettier", "3.10.1", "3.0.0")])
+		self.assertEqual(be._npm_plan[0][0], "npm-prettier")
+
 class TestBuildDepMarks(unittest.TestCase):
 	"""apt 3's build-dep marks what it installs manual, so a -b build's
     build dependencies joined @world and --depclean kept them for ever

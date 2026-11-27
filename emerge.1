@@ -178,12 +178,23 @@ packages; its commands go to
 A
 .BI cargo- name
 atom builds a crate's programs from crates.io into
-.IR /usr/lib/cargo/bin .
+.IR /usr/lib/cargo/bin ,
+and an
+.BI npm- name
+atom installs an npm package with its dependencies into
+.IR /usr/lib/npm ,
+its commands in
+.I /usr/lib/npm/bin
+(a scope's
+.BI @ scope / name
+is
+.BI npm- scope -- name\fR).
 .B -u
 on a set also rebuilds installed
-.B pypi-
-and
+.BR pypi- ,
 .B cargo-
+and
+.B npm-
 packages with newer releases.
 .TP
 .BR --buildpkgonly ", " -B
