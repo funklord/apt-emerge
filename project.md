@@ -1950,10 +1950,18 @@ write surface ever needs testing.
 
 
 9. **Packaging from language package managers (pip / npm / gem / cargo).**
-   Not started; recorded because it addresses a live problem rather than a
+   Recorded because it addresses a live problem rather than a
    hypothetical one — modern Debian refuses `pip install` into the system
    (PEP 668 `externally-managed-environment`) precisely because of the
    conflict this would avoid.
+
+   **State, 2026-11-27: three of the four are built** -- PyPI as `pypi-`,
+   crates.io as `cargo-`, npm as `npm-`, each in its entry below, each
+   proven in a trixie container including `-u @world`. **Open, and the
+   holder's: whether RubyGems follows, and under what name.** Each
+   namespace so far was the holder's choice; `gem-<name>` is the
+   pattern's guess, beside the archive's `ruby-*`. Nothing else in this
+   item waits on it.
 
    **Shape.** emerge orchestrates; it does not become a packager. Converters
    already exist and are packaged: `stdeb`/`pybuild` (Python), `gem2deb`,
