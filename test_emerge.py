@@ -763,6 +763,21 @@ class TestPypiDebianFiles(unittest.TestCase):
 		self.assertNotIn(em.PYPI_TREE + "\n", files["rules"].split(
 			"PYTHONPATH=")[1].split("\n")[0] + "\n")
 
+	def test_compiled_code_builds_with_headers_and_records_its_abi(self):
+		meta = {"name": "msgpack", "version": "1.2.4", "summary": "",
+		        "requires_dist": [], "requires_build": ["setuptools>=78"]}
+		control = em.pypi_debian_files(meta, "any", env=self.env)[0]["control"]
+		build = re.search(r"^Build-Depends: (.*)$", control, re.M)[1]
+		depends = re.search(r"^Depends: (.*)$", control, re.M)[1]
+		self.assertIn("python3-all-dev", build.split(", "))
+		self.assertIn("${pypi:Python}", depends)
+		rules = em.pypi_debian_files(meta, "any", env=self.env)[0]["rules"]
+		self.assertIn("-Vpypi:Python=python3 (>= ", rules)
+		self.assertIn("${shlibs:Depends}", depends)
+		control = em.pypi_debian_files(meta, env=self.env)[0]["control"]
+		self.assertNotIn("python3-all-dev", control)
+		self.assertNotIn("shlibs", control)
+
 	def test_backends_the_archive_spells_differently(self):
 		for requirement, package in (("flit_core>=3.2", "flit"),
 		                             ("Cython>=3.0", "cython3"),
@@ -770,6 +785,44 @@ class TestPypiDebianFiles(unittest.TestCase):
 		                             ("hatchling", "python3-hatchling")):
 			self.assertEqual(em._pypi_build_package(requirement, self.env),
 			                 package)
+
+	def test_a_rust_backend_brings_cargo(self):
+		for backend in ("maturin>=1.0,<2.0", "setuptools-rust"):
+			meta = {"name": "x", "version": "1", "summary": "",
+			        "requires_dist": [], "requires_build": [backend]}
+			control = em.pypi_debian_files(meta, "any", env=self.env)[0][
+				"control"]
+			build = re.search(r"^Build-Depends: (.*)$", control, re.M)[1]
+			self.assertIn("cargo", build.split(", "), backend)
+			self.assertIn("rustc", build.split(", "), backend)
+		meta["requires_build"] = ["maturin>=1.0"]
+		control = em.pypi_debian_files(meta, "any", env=self.env,
+		                               from_pypi=["maturin>=1.0"])[0]["control"]
+		self.assertIn(", cargo, rustc\n", control)
+		meta["requires_build"] = ["hatchling"]
+		control = em.pypi_debian_files(meta, env=self.env)[0]["control"]
+		self.assertNotIn("cargo", control)
+
+	def test_the_rust_version_an_sdist_needs(self):
+		with tempfile.TemporaryDirectory() as tree:
+			self.assertIsNone(em.pypi_rust_version(tree))
+			os.makedirs(os.path.join(tree, "crates", "a"))
+			os.makedirs(os.path.join(tree, "target", "x"))
+			with open(os.path.join(tree, "Cargo.toml"), "w") as f:
+				f.write('[workspace.package]\nrust-version = "1.91"\n')
+			with open(os.path.join(tree, "crates", "a", "Cargo.toml"),
+			          "w") as f:
+				f.write('[package]\nrust-version = { workspace = true }\n')
+			with open(os.path.join(tree, "target", "x", "Cargo.toml"),
+			          "w") as f:
+				f.write('[package]\nrust-version = "1.200"\n')
+			self.assertEqual(em.pypi_rust_version(tree), "1.91")
+			self.assertFalse(em._rust_version_fits(
+				em.pypi_rust_version(tree), "1.85.1+dfsg1-1+deb13u1"))
+			with open(os.path.join(tree, "crates", "a", "Cargo.toml"),
+			          "w") as f:
+				f.write('[package]\nrust-version = "1.9"\n')
+			self.assertEqual(em.pypi_rust_version(tree), "1.91")
 
 	def test_no_pyproject_means_setuptools(self):
 		meta = em.pypi_sdist_metadata(self.sdist(

@@ -812,6 +812,21 @@ def pypi_sdist_metadata(tree):
 	                      " distribution states it.\n\n" + "\n".join(texts)
 	                      if texts else None)}
 
+def pypi_rust_version(tree):
+	"""The newest rust-version any Cargo.toml in an sdist states, or None.
+	A workspace member inherits its root's with `{ workspace = true }`,
+	which states no number, so the root's quoted one is what is read."""
+	found = []
+	for top, dirs, names in os.walk(tree):
+		dirs[:] = [d for d in dirs if d not in ("target", "debian", ".git")]
+		if "Cargo.toml" in names:
+			with open(os.path.join(top, "Cargo.toml"), encoding="utf-8",
+			          errors="replace") as f:
+				found += re.findall(r'^\s*rust-version\s*=\s*"([^"]+)"',
+				                    f.read(), re.M)
+	key = lambda v: [int(x) for x in re.findall(r"\d+", v)[:3]]
+	return max(found, key=key) if found else None
+
 def _pypi_build_package(requirement, env):
 	m = _REQUIREMENT.fullmatch(requirement)
 	if not m:
@@ -885,6 +900,14 @@ def pypi_debian_files(meta, arch="all", env=None, when=None,
 					break
 	build = ["debhelper-compat (= 13)", "dh-python",
 	         "pybuild-plugin-pyproject", "python3-all"]
+	if arch == "any":
+		# Compiled code includes Python.h, which python3-all does not
+		# carry: msgpack 1.2.4, pulled in by pip-audit, failed on it
+		# (2026-11-27). And a module built against this Python's ABI
+		# and libraries says so, so the next python3 does not import a
+		# .so built for the last.
+		build.append("python3-all-dev")
+		depends += ["${pypi:Python}", "${shlibs:Depends}"]
 	# A build requirement the archive is too old for (from_pypi, lines of
 	# requires_build) is met by a pypi- build of it instead, which the
 	# build then has to import ahead of dist-packages.
@@ -897,6 +920,15 @@ def pypi_debian_files(meta, arch="all", env=None, when=None,
 		b = _pypi_build_package(line, env)
 		if b and b not in build:
 			build.append(b)
+	# A Rust backend runs cargo, which the archive's python3-maturin does
+	# not depend on: uv_build 0.13.10, a backend pip-audit's tree needed,
+	# failed with "Do you have cargo in your PATH?" (2026-11-27).
+	rust = any(r in ("python3-maturin", "python3-setuptools-rust",
+	                 "pypi-maturin", "pypi-setuptools-rust")
+	           or r.startswith(("pypi-maturin ", "pypi-setuptools-rust "))
+	           for r in build)
+	if rust:
+		build += [r for r in ("cargo", "rustc") if r not in build]
 	build_path = "$(CURDIR)/debian/pypi-build"
 	if from_pypi:
 		build_path += ":" + PYPI_TREE
@@ -908,6 +940,31 @@ def pypi_debian_files(meta, arch="all", env=None, when=None,
 	              f" <{os.environ.get('DEBEMAIL') or 'root@localhost'}>")
 	pth = f"{package}.pth"
 	d = f"debian/{package}"
+	# dh_python3 writes ${python3:Depends} only for dist-packages, so a
+	# module in the tree compiled as _cmsgpack.cpython-313-*.so said
+	# nothing about 3.13 (msgpack, 2026-11-27) and the next python3 would
+	# install over it and fail its import. Bound it to the versions
+	# python3-all built it for.
+	abi_rules = ("PY_SUPPORTED := $(shell py3versions -vs | tr ' ' '\\n'"
+	             " | sort -V)\n"
+	             "override_dh_gencontrol:\n"
+	             "\tdh_gencontrol -- \"-Vpypi:Python=python3"
+	             " (>= $(firstword $(PY_SUPPORTED))~), python3 (<< $(shell"
+	             " echo $(lastword $(PY_SUPPORTED)) |"
+	             " awk -F. '{print $$1 \".\" $$2 + 1}'))\"\n")
+	# pybuild points every proxy at 127.0.0.1:9, so cargo cannot reach
+	# crates.io from inside it: uv_build failed on index.crates.io
+	# (2026-11-27). Fetch every lockfile's crates first, into a CARGO_HOME
+	# that is the build's, and build offline from that cache.
+	rust_rules = ("export CARGO_HOME=$(CURDIR)/debian/cargo-home\n"
+	              "export CARGO_NET_OFFLINE=true\n"
+	              "override_dh_auto_configure:\n"
+	              "\tfind . -path ./debian -prune -o -name Cargo.lock -print |"
+	              " while read -r lock; do \\\n"
+	              "\t  CARGO_NET_OFFLINE=false cargo fetch --locked"
+	              " --manifest-path \"$${lock%.lock}.toml\" || exit 1; \\\n"
+	              "\tdone\n"
+	              "\tdh_auto_configure\n")
 	return {"source/format": "3.0 (native)\n",
 	        "control": (f"Source: {package}\n"
 	                    "Section: python\n"
@@ -957,6 +1014,8 @@ def pypi_debian_files(meta, arch="all", env=None, when=None,
 	                  "export VALIDATE_PYPROJECT_NO_NETWORK=1\n"
 	                  f"export PYTHONPATH={build_path}\n"
 	                  f"export PYBUILD_DESTDIR=debian/{package}\n"
+	                  + (abi_rules if arch == "any" else "")
+	                  + (rust_rules if rust else "") +
 	                  "%:\n"
 	                  "\tdh $@ --buildsystem=pybuild\n"
 	                  "override_dh_auto_install:\n"
@@ -5192,6 +5251,17 @@ class AptBackend:
 				       or n == "Cargo.toml" for n in names):
 					arch = "any"
 					break
+			# Asked before any build: uv_build 0.13.10 wants rustc 1.98,
+			# and found out only after fetching 200 crates and compiling
+			# against trixie's 1.85 (2026-11-27).
+			rust = pypi_rust_version(srcdir) if arch == "any" else None
+			if rust:
+				have = self._candidate("rustc")
+				if not _rust_version_fits(rust, have):
+					raise RuntimeError(
+						f"{meta['name']} {meta['version']} needs rustc {rust};"
+						" the archive has "
+						+ (f"rustc {have}" if have else "no rustc"))
 			from_pypi = self._pypi_backends(package, meta, env, use, opts)
 			files, _ = pypi_debian_files(meta, arch,
 			                             extra_requires=self._pypi_requires,

@@ -2201,8 +2201,34 @@ write surface ever needs testing.
        requirement naming an extra adds the extra's own requirements to
        the dependent's Depends (`requests[socks]` gives the dependent
        `pypi-pysocks`), read from the release this run chose or else
-       from the installed `dist-info/METADATA`. Shown by unit tests only;
-       no container run met a real extra.
+       from the installed `dist-info/METADATA`. Met for real 2026-11-27:
+       `pypi-httpie` 3.2.4 depends on `requests[socks]`, its Depends
+       carries `pypi-pysocks (>= 1.5.6)`, and pysocks was installed.
+     - ~~*Compiled sdists.*~~ **Fixed 2026-11-27**, found building
+       pip-audit in a trixie container. An `Architecture: any` build
+       lacked `Python.h` (msgpack 1.2.4): it now build-depends on
+       `python3-all-dev`, and depends on `${shlibs:Depends}` and on
+       the Python versions it was compiled for, `python3 (>= 3.13~),
+       python3 (<< 3.14)` -- dh_python3 writes `${python3:Depends}`
+       only for dist-packages, so it came out empty for the tree. A
+       maturin or setuptools-rust backend brings `cargo` and `rustc`,
+       which the archive's python3-maturin does not depend on, and
+       its crates are fetched before pybuild starts, which points
+       every proxy at 127.0.0.1:9; the build then runs with
+       `CARGO_NET_OFFLINE`. rpds-py 0.20.0 built that way and
+       imports. A Rust sdist stating a rust-version the archive's
+       rustc is below is refused before building, naming both.
+     - **Open: a build backend's release is not chosen for the
+       archive's rustc.** `emerge -b pypi-rpds-py` needs maturin
+       >= 1.9 (trixie has 1.8.3), takes maturin 1.16.0, and is refused
+       because that needs rustc 1.89 (trixie: 1.85); an older maturin
+       would fit. The cargo- namespace already chooses by
+       rust-version; PyPI's metadata does not state it, so doing the
+       same here means reading each candidate sdist. Where no release
+       fits there is nothing to choose: pip-audit cannot be built on
+       trixie, since cachecontrol 0.15.0 builds with uv_build >=
+       0.9.6, and every uv_build release from 0.10 on wants rustc
+       1.91 or newer.
      - ~~*Build backends newer than the archive's.*~~ **Built
        2026-11-26.** `pypi_build_shortfalls()` finds the build
        requirements the archive's candidate cannot meet;
