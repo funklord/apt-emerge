@@ -1511,7 +1511,7 @@ def _local_deb_install_resolves():
 HAVE_LOCAL_DEB_INSTALL = _local_deb_install_resolves()
 
 
-@unittest.skipUnless(HAVE_SOURCE_BUILD, "source-build tooling unavailable")
+@unittest.skipUnless(HAVE_SOURCE_BUILD, "source-build tooling (dpkg-dev, build-essential) unavailable")
 class SourceBuildEndToEnd(unittest.TestCase):
 	"""`emerge -b` / `-B`, which had never executed.
 
@@ -2298,7 +2298,7 @@ class TestEveryCapabilityIsPresent(unittest.TestCase):
 		missing = [name for name, ok in (
 		    ("rootless dpkg --root", HAVE_DPKG_ROOT),
 		    ("rootless apt", HAVE_APT_ROOT),
-		    ("source-build tooling (dpkg-dev)", HAVE_SOURCE_BUILD),
+		    ("source-build tooling (dpkg-dev, build-essential)", HAVE_SOURCE_BUILD),
 		    ("a local .deb install resolving against host state",
 		     HAVE_LOCAL_DEB_INSTALL),
 		    ("gpg and gpgv", HAVE_GPG),

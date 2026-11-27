@@ -167,22 +167,36 @@ style-docs:
 version-check:
 	@file=$$(cat VERSION); \
 	script=$$(sed -n 's/^APT_EMERGE_VERSION *= *"\(.*\)"/\1/p' emerge); \
-	changelog=$$(dpkg-parsechangelog -SVersion 2>/dev/null); \
 	if [ "$$file" != "$$script" ]; then \
 		echo "version-check: VERSION says $$file but"; \
 		echo "               emerge says $$script"; \
 		exit 1; \
 	fi; \
+	if [ ! -f debian/changelog ]; then \
+		echo "version-check: $$file, script in step (no debian/changelog)"; \
+		exit 0; \
+	fi; \
+	changelog=$$(sed -n '1s/^[^ ]* (\([^)]*\)).*/\1/p' debian/changelog); \
 	if [ -z "$$changelog" ]; then \
-		echo "version-check: $$file, script in step "; \
-		echo "               (changelog skipped, no dpkg-parsechangelog)"; \
-	elif [ "$$file" != "$$changelog" ]; then \
+		echo "version-check: debian/changelog line 1 names no version"; \
+		exit 1; \
+	fi; \
+	how="read line 1"; \
+	if command -v dpkg-parsechangelog >/dev/null 2>&1; then \
+		parsed=$$(dpkg-parsechangelog -SVersion) || exit 1; \
+		if [ "$$parsed" != "$$changelog" ]; then \
+			echo "version-check: debian/changelog line 1 says $$changelog but"; \
+			echo "               dpkg-parsechangelog says $$parsed"; \
+			exit 1; \
+		fi; \
+		how="dpkg-parsechangelog agrees"; \
+	fi; \
+	if [ "$$file" != "$$changelog" ]; then \
 		echo "version-check: VERSION says $$file but"; \
 		echo "               debian/changelog says $$changelog"; \
 		exit 1; \
-	else \
-		echo "version-check: $$file, in step"; \
-	fi
+	fi; \
+	echo "version-check: $$file, in step ($$how)"
 
 # -- install -----------------------------------------------------------------
 

@@ -1590,8 +1590,11 @@ Layout decisions worth not re-litigating:
   one script somebody scp'd onto a box where no `VERSION` file exists, and
   a bug report opened with `--info` is exactly where the answer is needed.
   Three hand-written strings now (file, changelog, script), and
-  `make version-check` compares all three; the script/file half needs no
-  `dpkg-parsechangelog`, so it still runs where the changelog check skips.
+  `make version-check` compares all three. It reads the changelog's
+  version from line 1 itself and uses `dpkg-parsechangelog`, where
+  installed, only as a cross-check that must agree; a line 1 naming no
+  version is a failure, and only a tree with no `debian/changelog` skips
+  that half, saying so.
 - **`emerge.1`** is hand-written, and `TestPackaging` checks it against
   `--help` in *both* directions: every option documented in `--help` must have
   its own `.TP` entry, and every option the man page gives an entry must exist
@@ -3369,6 +3372,14 @@ a check that cannot fail and a reason that cannot be doubted.** Grepping
 for the old string finds the message and stops.
 
 ## Two more messages that name a cause the code never tested
+
+**Both fixed 2026-11-27.** `version-check` now reads line 1 with `sed`,
+as situ's `814eb47` does, fails when it names no version, and uses
+`dpkg-parsechangelog` only as a cross-check that must agree; checked
+against a garbage changelog (fails), a mismatched version (fails), no
+dpkg-dev on PATH (passes, "read line 1") and no `debian/` (passes,
+"no debian/changelog"). The census and the skip reason now name
+build-essential beside dpkg-dev. The report as it arrived:
 
 Reported from claude-guidelines 2026-09-03, from a second sweep of all
 seventeen trees. Recorded, not fixed. Separate from the `tools/` typo
