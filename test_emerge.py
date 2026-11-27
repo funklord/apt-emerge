@@ -853,6 +853,46 @@ class TestPypiDebianFiles(unittest.TestCase):
 		self.assertIn(", python3-setuptools\n", files["control"])
 		self.assertIn("names no licence file", files["copyright"])
 
+	def test_setuptools_kept_old_requirements_in_its_egg_info(self):
+		# requests 2.25.1: metadata 2.1, no Requires-Dist in PKG-INFO.
+		pkg_info = "Metadata-Version: 2.1\nName: requests\nVersion: 2.25.1\n"
+		tree = self.sdist(pkg_info)
+		self.assertEqual(em.pypi_sdist_metadata(tree)["requires_dist"], [])
+		os.makedirs(os.path.join(tree, "src", "requests.egg-info"))
+		os.makedirs(os.path.join(tree, "src", "other.egg-info"))
+		with open(os.path.join(tree, "src", "other.egg-info",
+		                       "requires.txt"), "w") as f:
+			f.write("wrong\n")
+		with open(os.path.join(tree, "src", "requests.egg-info",
+		                       "requires.txt"), "w") as f:
+			f.write("idna<3,>=2.5\ncertifi>=2017.4.17\n\n[security]\n"
+			        "pyOpenSSL>=0.14\n\n[:python_version < \"3\"]\nsix\n\n"
+			        '[socks:sys_platform == "win32"]\nwin_inet_pton\n')
+		requires = em.pypi_sdist_metadata(tree)["requires_dist"]
+		self.assertEqual(requires, [
+			"idna<3,>=2.5", "certifi>=2017.4.17",
+			'pyOpenSSL>=0.14; extra == "security"',
+			'six; python_version < "3"',
+			'win_inet_pton; (sys_platform == "win32") and extra == "socks"'])
+		depends = em.pypi_debian_files(em.pypi_sdist_metadata(tree),
+		                               env=self.env)[0]["control"]
+		self.assertIn("pypi-idna (>= 2.5)", depends)
+		self.assertIn("pypi-certifi (>= 2017.4.17)", depends)
+		self.assertNotIn("six", depends)
+		self.assertNotIn("inet", depends)
+		# What PKG-INFO lists wins, and from 2.2 on it is complete.
+		tree2 = self.sdist(pkg_info + "Requires-Dist: idna\n")
+		os.makedirs(os.path.join(tree2, "requests.egg-info"))
+		with open(os.path.join(tree2, "requests.egg-info",
+		                       "requires.txt"), "w") as f:
+			f.write("certifi\n")
+		self.assertEqual(em.pypi_sdist_metadata(tree2)["requires_dist"],
+		                 ["idna"])
+		os.remove(os.path.join(tree2, "PKG-INFO"))
+		with open(os.path.join(tree2, "PKG-INFO"), "w") as f:
+			f.write(pkg_info.replace("2.1", "2.2"))
+		self.assertEqual(em.pypi_sdist_metadata(tree2)["requires_dist"], [])
+
 	def test_dynamic_dependencies_are_refused(self):
 		tree = self.sdist("Metadata-Version: 2.2\nName: dyn\nVersion: 1.0\n"
 		                  "Dynamic: Requires-Dist\n")

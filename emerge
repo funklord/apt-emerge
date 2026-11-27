@@ -804,13 +804,57 @@ def pypi_sdist_metadata(tree):
 		with open(pyproject, "rb") as f:
 			build = (tomllib.load(f).get("build-system", {})
 			         .get("requires", build))
+	requires = info.get_all("Requires-Dist") or []
+	# Before metadata 2.2 an sdist's PKG-INFO need not list its
+	# requirements, and setuptools did not: requests 2.25.1, Flask 1.1.4
+	# and pyOpenSSL 19.1.0 say nothing there, and were built depending on
+	# nothing (2026-11-27). setuptools kept them in the egg-info it ships
+	# in every sdist. The other tools of that era wrote Requires-Dist and
+	# no egg-info, so with none the PKG-INFO is what there is.
+	version = tuple(int(x) for x in re.findall(
+		r"\d+", info["Metadata-Version"] or "")[:2])
+	if not requires and version < (2, 2):
+		requires = pypi_egg_info_requires(tree, info["Name"])
 	return {"name": info["Name"], "version": info["Version"],
 	        "summary": (info["Summary"] or "").strip(),
-	        "requires_dist": info.get_all("Requires-Dist") or [],
+	        "requires_dist": requires,
 	        "requires_build": build,
 	        "copyright": (f"{info['Name']} {info['Version']}, from PyPI, as its"
 	                      " distribution states it.\n\n" + "\n".join(texts)
 	                      if texts else None)}
+
+def pypi_egg_info_requires(tree, name):
+	"""The requirements setuptools recorded in an sdist's
+	*.egg-info/requires.txt, as Requires-Dist lines: [] where the egg-info
+	has none or there is no egg-info. A section `[extra:marker]` is the
+	condition on the lines under it, either half optional."""
+	want = re.sub(r"[-_.]+", "_", name).lower()
+	found = []
+	for top in (tree, os.path.join(tree, "src")):
+		if os.path.isdir(top):
+			found += [os.path.join(top, d) for d in sorted(os.listdir(top))
+			          if d.endswith(".egg-info")]
+	mine = [d for d in found if re.sub(r"[-_.]+", "_", os.path.basename(
+		d)[:-len(".egg-info")]).lower() == want] or found[:1]
+	path = mine and os.path.join(mine[0], "requires.txt")
+	if not path or not os.path.isfile(path):
+		return []
+	out, marker = [], None
+	with open(path, encoding="utf-8") as f:
+		for line in f:
+			line = line.strip()
+			if not line or line.startswith("#"):
+				continue
+			if line.startswith("[") and line.endswith("]"):
+				extra, _, condition = line[1:-1].partition(":")
+				parts = ([f"({condition})" if extra else condition]
+				         if condition else [])
+				if extra:
+					parts.append(f'extra == "{extra}"')
+				marker = " and ".join(parts) or None
+				continue
+			out.append(f"{line}; {marker}" if marker else line)
+	return out
 
 # How many older releases a pypi- build fetches looking for one the
 # archive's rustc can build, before refusing.

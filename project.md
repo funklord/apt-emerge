@@ -2270,6 +2270,18 @@ write surface ever needs testing.
        makes the package `any`; setuptools, poetry-core and python-sbom
        came out `amd64` from sources they ship but do not compile. A
        per-architecture package of pure Python is wasteful, not wrong.
+     - ~~*An old sdist's dependencies.*~~ **Fixed 2026-11-27.** Before
+       metadata 2.2 PKG-INFO need not list Requires-Dist, and
+       setuptools left it out: requests 2.25.1, Flask 1.1.4 and
+       pyOpenSSL 19.1.0 (all 2.1) list none, so each would have been
+       packaged depending on nothing, its dependencies installed as
+       auto and left for `--depclean`. setuptools kept them in the
+       `*.egg-info/requires.txt` every sdist of its carries, with
+       `[extra:marker]` sections; that is read where PKG-INFO is older
+       than 2.2 and lists nothing. For requests it gives exactly the
+       index's list. Without an egg-info PKG-INFO is taken as it
+       stands: flit, poetry and distutils wrote no egg-info, and the
+       first two did write Requires-Dist.
      - A dynamic `Requires-Dist`, a URL requirement and `===` are refused.
    - **Rust from crates.io: `cargo-<name>`** (holder, 2026-11-26, chosen
      as the second ecosystem because a crate's dependencies are compiled
