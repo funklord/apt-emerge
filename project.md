@@ -2266,6 +2266,30 @@ write surface ever needs testing.
        (`hatchling>=1.29`, `python-sbom`) built 19 packages, among them
        hatchling 1.33, setuptools 84 and two projects the archive does
        not carry, and put only `pypi-platformdirs` in @world.
+     - ~~*Nothing built on bookworm.*~~ **Fixed 2026-11-27.** Every
+       proof until then was trixie. On bookworm (Python 3.11,
+       setuptools 66, hatchling 1.12.2) `emerge -b pypi-requests`
+       failed three ways, each hiding the next. setuptools 77 and later
+       need packaging 24.2 and prefer an installed one to the copy they
+       vendor, so bookworm's 23.0 broke setuptools' own build and every
+       build on it: `setuptools/_vendor` now goes on such a build's
+       PYTHONPATH, the versions setuptools chose, which is what pip's
+       clean build environment amounts to. hatchling builds itself and
+       imports its own dependencies while it does, so a package that is
+       its own backend (`backend-path`) imports `PYPI_TREE` first, where
+       pypi-packaging 26.4 had just been put for it. And the archive's
+       hatchling 1.12.2 checks classifiers against a list compiled into
+       it, which `HATCH_METADATA_CLASSIFIERS_NO_VERIFY` turns off only
+       from 1.26.0 (measured in the sdists): a floor per backend
+       (`_PYPI_BACKEND_FLOORS`) makes an archive release below it a
+       shortfall, built from PyPI like any bound it misses. bookworm
+       calls `pyproject_hooks` `pep517`, which the metadata hook now
+       falls back to. `pypi_build_path()` is the one answer the rules
+       and the hook share. Proven in a bookworm container: requests
+       2.34.2 over 17 packages built from PyPI, among them setuptools
+       84.2.1, flit-core 4.2.0 and hatchling 1.33.0, and sentry-sdk
+       3.0.1 with its dynamic dependencies, both import; the unit suite
+       passes there.
      - ~~*Requires-Python was not read.*~~ **Fixed 2026-11-27.**
        `pypi_choose` took the newest sdist meeting the relations
        whatever Python it asked for, so on bookworm (3.11) `emerge -pv

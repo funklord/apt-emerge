@@ -767,6 +767,14 @@ PYPI_BIN = "/usr/lib/pypi/bin"
 # the common backends and build helpers, 2026-11-27). Without the entry
 # the requirement names no archive package and is built from PyPI --
 # Cython, a large compiled build, in place of the archive's cython3.
+# The oldest release of a backend that honours what debian/rules sets:
+# hatchling verifies classifiers against a list compiled into it, and
+# only from 1.26.0 does HATCH_METADATA_CLASSIFIERS_NO_VERIFY turn that
+# off. bookworm's 1.12.2 refused hatch-vcs 0.5.0 over `Python :: 3.13`
+# (2026-11-27). An archive release below the floor is a shortfall like
+# any other bound it misses.
+_PYPI_BACKEND_FLOORS = {"hatchling": "hatchling>=1.26.0"}
+
 _PYPI_BUILD_PACKAGES = {"flit-core": "flit", "cython": "cython3",
                         "meson-python": "python3-mesonpy"}
 
@@ -830,9 +838,13 @@ def pypi_sdist_metadata(tree):
 # Asks a PEP 517 backend for the metadata it would put in a wheel; run
 # with the sdist's own environment, in a child, as pybuild runs it.
 _PYPI_METADATA_HOOK = """
-import sys, pyproject_hooks
+import sys
+try:
+	from pyproject_hooks import BuildBackendHookCaller
+except ImportError:                     # bookworm: the module's old name
+	from pep517.wrappers import Pep517HookCaller as BuildBackendHookCaller
 tree, backend, out, *path = sys.argv[1:]
-hooks = pyproject_hooks.BuildBackendHookCaller(tree, backend, path or None)
+hooks = BuildBackendHookCaller(tree, backend, path or None)
 print(hooks.prepare_metadata_for_build_wheel(out))
 """
 
@@ -946,7 +958,39 @@ def pypi_build_shortfalls(meta, candidate_of, env=None):
 			upstream = have.split(":", 1)[-1].rsplit("-", 1)[0]
 		if have is None or not debian_relations_hold(upstream, got[2]):
 			out.append((line.strip(), package, have))
+			continue
+		floor = _PYPI_BACKEND_FLOORS.get(got[0][len("pypi-"):])
+		if floor and not debian_relations_hold(
+				upstream, pypi_requirement(floor, env)[2]):
+			out.append((floor, package, have))
 	return out
+
+def pypi_build_path(meta, from_pypi, srcdir):
+	"""PYTHONPATH for building `meta` in `srcdir`: what the build imports
+	ahead of dist-packages. debian/rules exports it and the metadata hook
+	runs under it, so both see one answer.
+
+	Backends built from PyPI come from PYPI_TREE, and so do the
+	dependencies of a package that is its own backend. setuptools 77 and later
+	also need packaging 24.2, and prefer an installed one to the copy
+	they vendor, so on bookworm (python3-packaging 23.0) its own build
+	and every build on it stopped at "Cannot import packaging.licenses"
+	(2026-11-27). pip never meets it, building in an environment with no
+	older packaging; its _vendor directory first is the same answer,
+	the versions setuptools itself chose."""
+	path = [f"{srcdir}/debian/pypi-build"]
+	# An in-tree backend (backend-path) imports the package's own
+	# dependencies while it builds, and those are pypi- builds: hatchling
+	# 1.33 needs packaging 24.2, and on bookworm found the archive's 23.0
+	# though pypi-packaging 26.4 had just been built for it.
+	if from_pypi or meta.get("backend_path"):
+		path.append(PYPI_TREE)
+	if pypi_package_name(meta["name"]) == "pypi-setuptools":
+		path.append(f"{srcdir}/setuptools/_vendor")
+	if any((pypi_requirement(line) or [None])[0] == "pypi-setuptools"
+	       for line in from_pypi):
+		path.append(f"{PYPI_TREE}/setuptools/_vendor")
+	return ":".join(path)
 
 def pypi_debian_files(meta, arch="all", env=None, when=None,
                       extra_requires=None, from_pypi=()):
@@ -1015,9 +1059,7 @@ def pypi_debian_files(meta, arch="all", env=None, when=None,
 	           for r in build)
 	if rust:
 		build += [r for r in ("cargo", "rustc") if r not in build]
-	build_path = "$(CURDIR)/debian/pypi-build"
-	if from_pypi:
-		build_path += ":" + PYPI_TREE
+	build_path = pypi_build_path(meta, from_pypi, "$(CURDIR)")
 	summary = re.sub(r"\s+", " ", meta["summary"]) or meta["name"]
 	when = when or email.utils.formatdate(localtime=True)
 	# Whoever builds it maintains it: dch's convention, and lintian
@@ -5470,9 +5512,8 @@ class AptBackend:
 			               VALIDATE_PYPROJECT_NO_NETWORK="1",
 			               CARGO_HOME=os.path.join(srcdir, "debian",
 			                                       "cargo-home"),
-			               PYTHONPATH=os.path.join(srcdir, "debian",
-			                                       "pypi-build")
-			               + (":" + PYPI_TREE if from_pypi else ""))
+			               PYTHONPATH=pypi_build_path(meta, from_pypi,
+			                                          srcdir))
 			if from_pypi:
 				environ["PATH"] = PYPI_BIN + ":" + environ.get("PATH", "")
 			print(f"{ARROW} Asking {meta['backend']} what {meta['name']}"

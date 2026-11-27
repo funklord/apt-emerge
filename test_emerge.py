@@ -748,6 +748,17 @@ class TestPypiDebianFiles(unittest.TestCase):
 		self.assertEqual(em.pypi_build_shortfalls(meta, archive, self.env), [
 			("flit_core>=3.12,<4", "flit", "3.10.1-1"),
 			("scikit-build-core", "python3-scikit-build-core", None)])
+		# bookworm's hatchling cannot be told to skip classifiers.
+		archive = {"python3-hatchling": "1.12.2-1"}.get
+		self.assertEqual(em.pypi_build_shortfalls(
+			{"requires_build": ["hatchling", "hatch-vcs"]}, archive,
+			self.env), [("hatchling>=1.26.0", "python3-hatchling",
+			             "1.12.2-1"),
+			            ("hatch-vcs", "python3-hatch-vcs", None)])
+		# A stated bound above the floor is said once.
+		self.assertEqual(em.pypi_build_shortfalls(
+			{"requires_build": ["hatchling>=1.27"]}, archive, self.env),
+			[("hatchling>=1.27", "python3-hatchling", "1.12.2-1")])
 
 	def test_a_backend_built_from_pypi_is_depended_on_and_imported_first(self):
 		meta = {"name": "packaging", "version": "26.4", "summary": "",
@@ -802,6 +813,31 @@ class TestPypiDebianFiles(unittest.TestCase):
 		meta["requires_build"] = ["hatchling"]
 		control = em.pypi_debian_files(meta, env=self.env)[0]["control"]
 		self.assertNotIn("cargo", control)
+
+	def test_setuptools_imports_what_it_vendors_first(self):
+		# bookworm's packaging 23.0 shadowed the 24.2 setuptools needs.
+		meta = {"name": "setuptools", "version": "84.2.1", "summary": "",
+		        "requires_dist": [], "requires_build": []}
+		meta["backend_path"] = ["."]
+		self.assertEqual(em.pypi_build_path(meta, [], "/s"),
+		                 f"/s/debian/pypi-build:{em.PYPI_TREE}:"
+		                 "/s/setuptools/_vendor")
+		# hatchling builds itself and imports its own dependencies.
+		meta = dict(meta, name="hatchling", backend_path=["src"])
+		self.assertEqual(em.pypi_build_path(meta, [], "/s"),
+		                 f"/s/debian/pypi-build:{em.PYPI_TREE}")
+		del meta["backend_path"]
+		meta["name"] = "msgpack"
+		self.assertEqual(em.pypi_build_path(meta, [], "/s"),
+		                 "/s/debian/pypi-build")
+		self.assertEqual(
+			em.pypi_build_path(meta, ["setuptools>=78.1.1",
+			                          'x; python_version < "3"'], "/s"),
+			f"/s/debian/pypi-build:{em.PYPI_TREE}:"
+			f"{em.PYPI_TREE}/setuptools/_vendor")
+		rules = em.pypi_debian_files(meta, env=self.env,
+		                             from_pypi=["setuptools>=78.1.1"])[0]
+		self.assertIn(f"/setuptools/_vendor\n", rules["rules"])
 
 	def test_a_backend_from_pypi_runs_its_own_commands(self):
 		# maturin's module runs the `maturin` command it installed.
@@ -897,7 +933,11 @@ class TestPypiDebianFiles(unittest.TestCase):
 		try:
 			import pyproject_hooks  # noqa: F401 -- what the build brings
 		except ImportError:
-			self.skipTest("python3-pyproject-hooks is not installed")
+			try:
+				import pep517  # noqa: F401 -- its name on bookworm
+			except ImportError:
+				self.skipTest("neither python3-pyproject-hooks nor"
+				              " python3-pep517 is installed")
 		# A backend that decides its dependency when it runs, as a
 		# setup.py passing install_requires does.
 		backend = (
