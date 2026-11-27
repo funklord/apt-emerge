@@ -3141,7 +3141,14 @@ holder's request. None requires work here; two are already satisfied.
   therefore earned, and is one of only two real CI failures in the
   workspace.
 
-## Open: CI installs the built package and fails, unobserved for days
+## Closed: CI installs the built package and fails, unobserved for days
+
+**Closed: fixed by `58d130d` (2026-09-01), "ci: the package job installs
+from build/deb, where make deb puts it".** The job looked for the
+package where `make deb` no longer wrote it. Every run from that commit
+on is green, the package job with its install, dispatch, man page and
+lintian steps included (re-read with `gh run list`, 2026-11-27). The
+report as it was found:
 
 **`gh` CI access works from this tree now**, and the first thing it
 shows is a real failure. Recorded here rather than sent, because no
@@ -3192,7 +3199,19 @@ Logs could not be retrieved: `gh run view --log-failed` and
 names above are the whole of what was recovered. A fresh run will have
 logs.
 
-## Open: the integration suite fails 6 of 48 under apt 3
+## Closed: the integration suite fails 6 of 48 under apt 3
+
+**Closed: fixed by `d4000de` (2026-09-02).** The host's
+`/etc/apt/apt.conf.d` was the one apt directory the suite had not
+redirected; `apt_isolation_config` now points `Dir::Etc::parts` at
+scratch from `APT_CONFIG`, so etckeeper's and needrestart's hooks are
+never loaded. `_rootless_apt_works` now builds, scans and installs a
+package into a scratch root, as item 1 below asks, and a host whose
+own package state apt cannot satisfy is a skip. The suite has passed
+48 of 48 since, most recently in a debian:trixie container on
+2026-11-27. Not followed up: why the failing test showed none of apt's
+output (the paragraph below opening *One thing remains genuinely
+unexplained*). The investigation as it was recorded:
 
 **Mechanism found 2026-08-31: the skip guard tests for binaries, not for
 the capability it names.** Written by the guidelines tree, which has no
@@ -3325,7 +3344,11 @@ Recorded rather than fixed because the merge path is this project's
 core and the fix belongs to a session working here, not to a survey
 passing through.
 
-## The style-gate tests have not run since the tooling directory was renamed
+## Closed: the style-gate tests did not run after the tooling directory was renamed
+
+**Closed: fixed by `8bacf58` (2026-11-26).** `TestStyleGate.GATE` names
+`tool/style_gate.py`, and the five tests run rather than skip. The
+report as it arrived, kept for the shape it names:
 
 Reported from claude-guidelines 2026-09-03, from a sweep of all seventeen
 trees for gates that report success having checked nothing. Recorded, not
